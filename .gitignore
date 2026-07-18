@@ -1,0 +1,5 @@
+/target
+
+# CA private key — machine-local secret, never commit. Regenerate with the
+# openssl commands in the README if you clone fresh.
+/src/ca/ca.key
