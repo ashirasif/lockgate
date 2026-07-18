@@ -1,3 +1,5 @@
+mod command;
+mod input;
 mod tui;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
