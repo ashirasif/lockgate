@@ -14,7 +14,7 @@ use ratatui::{
 };
 
 use crate::command::Command;
-use crate::input::{Action, Input, Mode, Motion, Scroll};
+use crate::input::{Action, Input, Mode, Motion, Scroll, Window};
 
 /// Take over the terminal and run the UI until the user quits.
 pub async fn run(engine: Arc<Engine>) -> std::io::Result<()> {
@@ -50,6 +50,15 @@ struct App {
     viewport: usize,
     /// `:set` toggles, e.g. `rnu` for relative line numbers.
     options: HashMap<String, bool>,
+
+    /// The window currently on screen. The tab strip shows the rest.
+    window: Window,
+    /// Vertical scroll of the active non-Proxy window's content. Reset whenever
+    /// the window changes, since a line offset means nothing across windows.
+    content_scroll: u16,
+    /// Lines the active window last rendered, so `G` and downward scrolling can
+    /// stop at the end instead of running off into blank space.
+    content_len: u16,
 }
 
 impl App {
@@ -69,6 +78,9 @@ impl App {
             search: String::new(),
             viewport: 10,
             options: HashMap::new(),
+            window: Window::default(),
+            content_scroll: 0,
+            content_len: 0,
         }
     }
 
@@ -131,7 +143,12 @@ impl App {
     /// The single place where an intent becomes a change to the app.
     fn apply(&mut self, action: Action) {
         match action {
-            Action::Move { motion, count } => self.move_cursor(motion, count),
+            // In Proxy the cursor walks the history; in the other windows there
+            // is no row cursor, so the same motions scroll the content instead.
+            Action::Move { motion, count } if self.window == Window::Proxy => {
+                self.move_cursor(motion, count)
+            }
+            Action::Move { motion, count } => self.scroll_content(motion, count),
             // Nothing scrolls independently of the cursor yet; ratatui keeps
             // the selection visible for us. Recorded so `zz` is not silent.
             Action::Scroll(scroll) => self.note(match scroll {
@@ -166,7 +183,40 @@ impl App {
             }
             Action::Resend => self.resend_selected(),
             Action::Command(line) => self.run_command(&line),
+            Action::Window(window) => self.show_window(window),
+            Action::WindowStep(direction) => self.show_window(self.window.step(direction)),
         }
+    }
+
+    /// Switch windows. Scrolling is per-window, so leaving one abandons its
+    /// offset — you always arrive at the top of the window you asked for.
+    fn show_window(&mut self, window: Window) {
+        if window != self.window {
+            self.window = window;
+            self.content_scroll = 0;
+            self.note(window.label());
+        }
+    }
+
+    /// The non-Proxy windows have no row cursor, so `j`/`k`/`<C-d>`/`gg`/`G`
+    /// scroll their rendered content. The offset is clamped at draw time once
+    /// the real line count is known.
+    fn scroll_content(&mut self, motion: Motion, count: Option<usize>) {
+        let step = count.unwrap_or(1) as u16;
+        let page = self.viewport.max(1) as u16;
+        let last = self.content_len.saturating_sub(1);
+        self.content_scroll = match motion {
+            Motion::Down => self.content_scroll.saturating_add(step),
+            Motion::Up => self.content_scroll.saturating_sub(step),
+            Motion::Top => count.map_or(0, |n| n.saturating_sub(1) as u16),
+            Motion::Bottom => last,
+            Motion::HalfPageDown => self.content_scroll.saturating_add(page / 2),
+            Motion::HalfPageUp => self.content_scroll.saturating_sub(page / 2),
+            Motion::PageDown => self.content_scroll.saturating_add(page),
+            Motion::PageUp => self.content_scroll.saturating_sub(page),
+            _ => self.content_scroll,
+        }
+        .min(last);
     }
 
     fn run_command(&mut self, line: &str) {
@@ -337,13 +387,106 @@ impl App {
         });
     }
 
+    /// The Automate window's body: the base set to run against, and a live
+    /// breakdown of everything captured so far.
+    fn automate_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+
+        section(&mut lines, "BASE SET");
+        let base: Vec<&FlowSummary> =
+            self.selected_rows().filter_map(|row| self.flows.get(row)).collect();
+        if base.is_empty() {
+            field(&mut lines, "—", "no flow selected in Proxy (P)");
+        } else {
+            for flow in &base {
+                lines.push(Line::from(format!("  #{}  {}  {}", flow.id, flow.method, flow.uri)));
+            }
+            lines.push(Line::styled(
+                "  <Space>r replays this set through the Repeater",
+                Style::new().fg(Color::DarkGray),
+            ));
+        }
+
+        section(&mut lines, "STATUS");
+        let mut classes = std::collections::BTreeMap::<&str, usize>::new();
+        for flow in &self.flows {
+            let class = match flow.status.map(|s| s.as_u16()) {
+                Some(200..300) => "2xx",
+                Some(300..400) => "3xx",
+                Some(400..500) => "4xx",
+                Some(500..) => "5xx",
+                Some(_) => "other",
+                None => "pending",
+            };
+            *classes.entry(class).or_default() += 1;
+        }
+        field(&mut lines, "total", self.flows.len().to_string());
+        for (class, count) in &classes {
+            field(&mut lines, class, count.to_string());
+        }
+
+        section(&mut lines, "BY HOST");
+        let mut hosts = std::collections::BTreeMap::<String, usize>::new();
+        for flow in &self.flows {
+            let host = flow.uri.host().unwrap_or("—").to_string();
+            *hosts.entry(host).or_default() += 1;
+        }
+        // Busiest first; ties fall back to host name for a stable order.
+        let mut hosts: Vec<_> = hosts.into_iter().collect();
+        hosts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (host, count) in hosts.iter().take(8) {
+            field(&mut lines, host, count.to_string());
+        }
+
+        section(&mut lines, "RUNNER");
+        lines.push(Line::styled(
+            "  Intruder-style runs are not wired up yet.",
+            Style::new().fg(Color::DarkGray),
+        ));
+        lines
+    }
+
     // --- rendering ---
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [body, status_bar] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+        // Chrome above and below; the middle belongs to the active window.
+        let [tabs, body, status_bar] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        self.draw_tabs(frame, tabs);
+        match self.window {
+            Window::Proxy => self.draw_proxy(frame, body),
+            Window::Repeater => self.draw_repeater(frame, body),
+            Window::Inspect => self.draw_inspect(frame, body),
+            Window::Automate => self.draw_automate(frame, body),
+        }
+        self.draw_status(frame, status_bar);
+    }
+
+    /// Mason's tool strip: each window a chip, `Name (key)`, active one lit.
+    fn draw_tabs(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = vec![Span::raw(" ")];
+        for window in Window::ALL {
+            let chip = format!(" {} ({}) ", window.label(), window.key());
+            let style = if window == self.window {
+                Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            spans.push(Span::styled(chip, style));
+            spans.push(Span::raw(" "));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The home window: HTTP history above, request/response detail below.
+    fn draw_proxy(&mut self, frame: &mut Frame, area: Rect) {
         let [history, detail] =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
         // Burp-style: request on the left, response on the right.
         let [request, response] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -352,7 +495,94 @@ impl App {
         self.draw_history(frame, history);
         self.draw_request(frame, request);
         self.draw_response(frame, response);
-        self.draw_status(frame, status_bar);
+    }
+
+    /// Repeater: one flow, full width — request left, response right — and
+    /// `<Space>r` to fire it again. The selection in Proxy is what loads here.
+    fn draw_repeater(&mut self, frame: &mut Frame, area: Rect) {
+        let [banner, panes] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        self.viewport = panes.height.saturating_sub(2) as usize;
+
+        let Some(flow) = self.detail.clone() else {
+            self.content_len = 0;
+            frame.render_widget(
+                empty_pane(" Repeater ", "no flow selected — pick one in Proxy (P)"),
+                area,
+            );
+            return;
+        };
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" #{} ", flow.id), Style::new().fg(Color::Black).bg(Color::Cyan)),
+                Span::raw(format!("  {} {}", flow.request.method, flow.request.uri)),
+                Span::styled("   <Space>r send", Style::new().fg(Color::DarkGray)),
+            ])),
+            banner,
+        );
+
+        let request = message_lines(
+            Line::styled(
+                format!("{} {}", flow.request.method, flow.request.uri),
+                Style::new().bold().fg(Color::Cyan),
+            ),
+            &flow.request.headers,
+            &flow.request.body,
+        );
+        let response = match &flow.response {
+            None => vec![Line::styled("(pending)", Style::new().fg(Color::Yellow))],
+            Some(resp) => message_lines(
+                Line::styled(resp.status.to_string(), Style::new().bold().fg(status_color(resp.status))),
+                &resp.headers,
+                &resp.body,
+            ),
+        };
+        // Both panes share one scroll offset; the taller one sets the bound.
+        self.content_len = request.len().max(response.len()) as u16;
+        let scroll = self.content_scroll;
+
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(panes);
+        frame.render_widget(pane(request, " Request ").scroll((scroll, 0)), left);
+        frame.render_widget(pane(response, " Response ").scroll((scroll, 0)), right);
+    }
+
+    /// Inspect: the selected flow taken apart — request line, query params,
+    /// headers, cookies, body size, then the response and its timing.
+    fn draw_inspect(&mut self, frame: &mut Frame, area: Rect) {
+        self.viewport = area.height.saturating_sub(2) as usize;
+
+        let Some(flow) = self.detail.clone() else {
+            self.content_len = 0;
+            frame.render_widget(
+                empty_pane(" Inspect ", "no flow selected — pick one in Proxy (P)"),
+                area,
+            );
+            return;
+        };
+
+        let lines = inspect_lines(&flow);
+        self.content_len = lines.len() as u16;
+        frame.render_widget(
+            pane(lines, " Inspect ").scroll((self.content_scroll, 0)),
+            area,
+        );
+    }
+
+    /// Automate: the base request set (the Proxy selection) an attack would run
+    /// against, plus a live breakdown of captured traffic. The runner itself is
+    /// not wired yet — `<Space>r` replays the base set in the meantime.
+    fn draw_automate(&mut self, frame: &mut Frame, area: Rect) {
+        self.viewport = area.height.saturating_sub(2) as usize;
+
+        let lines = self.automate_lines();
+        self.content_len = lines.len() as u16;
+        frame.render_widget(
+            pane(lines, " Automate ").scroll((self.content_scroll, 0)),
+            area,
+        );
     }
 
     fn draw_history(&mut self, frame: &mut Frame, area: Rect) {
@@ -494,13 +724,125 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "j/k gg/G {} n/N m'  ·  <Space>r resend  ·  :resend :set rnu :q";
+const HELP: &str =
+    "P/R/I/A windows  gt/gT cycle  ·  j/k gg/G {} n/N m'  ·  <Space>r resend  ·  :resend :set rnu :q";
 
 /// A bordered, wrapping pane — the shared shell for Request and Response.
 fn pane(lines: Vec<Line<'static>>, title: &'static str) -> Paragraph<'static> {
     Paragraph::new(lines)
         .block(Block::bordered().title(title))
         .wrap(Wrap { trim: false })
+}
+
+/// A bordered pane with a single muted message — used when a window has nothing
+/// to show because no flow is selected.
+fn empty_pane(title: &'static str, message: &'static str) -> Paragraph<'static> {
+    Paragraph::new(Line::styled(message, Style::new().fg(Color::DarkGray)))
+        .block(Block::bordered().title(title))
+}
+
+/// A section header inside the Inspect / Automate panes.
+fn section(lines: &mut Vec<Line<'static>>, title: &str) {
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::styled(title.to_string(), Style::new().bold().fg(Color::Cyan)));
+}
+
+/// A right-aligned label and its value, so fields line up in a column.
+fn field(lines: &mut Vec<Line<'static>>, label: &str, value: impl Into<String>) {
+    lines.push(Line::from(vec![
+        Span::styled(format!("{label:>13}  "), Style::new().fg(Color::DarkGray)),
+        Span::raw(value.into()),
+    ]));
+}
+
+/// Take a flow apart into a scannable report: where the request is going, what
+/// it carries, and what came back.
+fn inspect_lines(flow: &Flow) -> Vec<Line<'static>> {
+    let req = &flow.request;
+    let mut lines = Vec::new();
+
+    section(&mut lines, "REQUEST");
+    field(&mut lines, "method", req.method.to_string());
+    field(&mut lines, "scheme", req.uri.scheme_str().unwrap_or("—").to_string());
+    let host = req
+        .uri
+        .host()
+        .map(str::to_owned)
+        .or_else(|| header(&req.headers, "host"))
+        .unwrap_or_else(|| "—".to_string());
+    field(&mut lines, "host", host);
+    if let Some(port) = req.uri.port_u16() {
+        field(&mut lines, "port", port.to_string());
+    }
+    field(&mut lines, "path", req.uri.path().to_string());
+    field(&mut lines, "version", format!("{:?}", req.version));
+
+    if let Some(query) = req.uri.query() {
+        section(&mut lines, "QUERY");
+        for (key, value) in parse_pairs(query, '&') {
+            field(&mut lines, &key, value);
+        }
+    }
+
+    if let Some(cookies) = header(&req.headers, "cookie") {
+        section(&mut lines, "COOKIES");
+        for (key, value) in parse_pairs(&cookies, ';') {
+            field(&mut lines, &key, value);
+        }
+    }
+
+    section(&mut lines, "REQUEST HEADERS");
+    header_lines(&mut lines, &req.headers);
+    field(&mut lines, "body", format!("{} bytes", req.body.len()));
+
+    section(&mut lines, "RESPONSE");
+    match &flow.response {
+        None => field(&mut lines, "status", "(pending)"),
+        Some(resp) => {
+            field(&mut lines, "status", resp.status.to_string());
+            field(&mut lines, "version", format!("{:?}", resp.version));
+            if let Some(end) = flow.ended_at {
+                let ms = (end - flow.started_at) as f64 / 1000.0;
+                field(&mut lines, "duration", format!("{ms:.1} ms"));
+            }
+            section(&mut lines, "RESPONSE HEADERS");
+            header_lines(&mut lines, &resp.headers);
+            field(&mut lines, "body", format!("{} bytes", resp.body.len()));
+        }
+    }
+    lines
+}
+
+/// A header value as an owned `String`, case-insensitively, or `None`.
+fn header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn header_lines(lines: &mut Vec<Line<'static>>, headers: &HeaderMap) {
+    if headers.is_empty() {
+        field(lines, "—", "(none)");
+        return;
+    }
+    for (name, value) in headers {
+        field(lines, name.as_str(), value.to_str().unwrap_or("<binary>").to_string());
+    }
+}
+
+/// Split `a=1&b=2` style text into pairs, tolerating a missing `=`.
+fn parse_pairs(text: &str, separator: char) -> Vec<(String, String)> {
+    text.split(separator)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| match part.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (part.to_string(), String::new()),
+        })
+        .collect()
 }
 
 /// Start line, then headers, then a blank line and the body preview.
@@ -771,6 +1113,97 @@ mod tests {
             titled.find("Request") < titled.find("Response"),
             "request pane should be left of response: {titled}"
         );
+    }
+
+    /// The tab strip is always on screen and shows every window with its key.
+    #[test]
+    fn tab_strip_lists_every_window() {
+        let mut app = App::new(engine_with(1));
+        app.refresh();
+        let out = render(&mut app);
+        for chip in ["Proxy (P)", "Repeater (R)", "Inspect (I)", "Automate (A)"] {
+            assert!(out.contains(chip), "missing tab {chip}:\n{out}");
+        }
+    }
+
+    /// A single uppercase key switches windows, and the body follows.
+    #[test]
+    fn shortcut_keys_switch_the_active_window() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        assert_eq!(app.window, Window::Proxy);
+
+        press(&mut app, "R");
+        assert_eq!(app.window, Window::Repeater);
+        assert!(render(&mut app).contains("Repeater"));
+
+        press(&mut app, "I");
+        assert_eq!(app.window, Window::Inspect);
+        assert!(render(&mut app).contains("REQUEST HEADERS"), "{}", render(&mut app));
+
+        press(&mut app, "A");
+        assert_eq!(app.window, Window::Automate);
+        assert!(render(&mut app).contains("BY HOST"), "{}", render(&mut app));
+
+        // Proxy's history table only shows on the Proxy window.
+        assert!(!render(&mut app).contains("HTTP History"));
+        press(&mut app, "P");
+        assert_eq!(app.window, Window::Proxy);
+        assert!(render(&mut app).contains("HTTP History"));
+    }
+
+    #[test]
+    fn gt_cycles_through_the_windows() {
+        let mut app = App::new(engine_with(1));
+        app.refresh();
+        press(&mut app, "gt");
+        assert_eq!(app.window, Window::Repeater);
+        press(&mut app, "gT");
+        assert_eq!(app.window, Window::Proxy);
+    }
+
+    /// Inspect pulls a request apart: query params and headers become fields.
+    #[test]
+    fn inspect_decomposes_the_selected_flow() {
+        let engine = Engine::new();
+        engine.record_request(CapturedRequest {
+            method: hudsucker::hyper::Method::GET,
+            uri: Uri::from_static("http://example.com/search?q=admin&page=2"),
+            version: Version::HTTP_11,
+            headers: {
+                let mut h = HeaderMap::new();
+                h.insert("x-token", "secret".parse().unwrap());
+                h
+            },
+            body: Bytes::new(),
+        });
+        let mut app = App::new(engine);
+        app.refresh();
+        press(&mut app, "I");
+        let out = render(&mut app);
+        assert!(out.contains("QUERY"), "{out}");
+        assert!(out.contains("admin"), "{out}");
+        assert!(out.contains("x-token"), "{out}");
+    }
+
+    /// Outside Proxy the motions scroll the content instead of a row cursor,
+    /// and the selection stays put so the inspected flow doesn't change.
+    #[test]
+    fn motions_scroll_content_off_the_proxy_window() {
+        let mut app = App::new(engine_with(20));
+        app.refresh();
+        let selected = app.selected_id();
+        press(&mut app, "A");
+        // A frame is drawn between keypresses in the real loop; that draw is
+        // what measures the content so downward scrolling knows its bound.
+        render(&mut app);
+        press(&mut app, "3j");
+        assert_eq!(app.content_scroll, 3);
+        assert_eq!(app.selected_id(), selected, "scrolling must not move the selection");
+        // Switching windows starts you back at the top.
+        press(&mut app, "P");
+        press(&mut app, "A");
+        assert_eq!(app.content_scroll, 0);
     }
 
     #[test]

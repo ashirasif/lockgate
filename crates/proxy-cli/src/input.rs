@@ -66,6 +66,57 @@ pub enum Scroll {
     Bottom,
 }
 
+/// A top-level window. Vim would call these tabs; Burp calls them tools. Only
+/// one is on screen at a time, and the tab strip across the top shows the rest.
+///
+/// The interpretation of every other key still belongs to the window that
+/// receives it — this enum only names the window, it carries no behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Window {
+    /// The HTTP history and its request/response detail. The home window.
+    #[default]
+    Proxy,
+    /// Replay a single request and read the fresh response.
+    Repeater,
+    /// A decomposed view of one flow — headers, params, cookies, timing.
+    Inspect,
+    /// Batch and automation scaffolding built on top of a base request set.
+    Automate,
+}
+
+impl Window {
+    /// Left-to-right tab order, and the set `gt` / `gT` cycle through.
+    pub const ALL: [Window; 4] =
+        [Window::Proxy, Window::Repeater, Window::Inspect, Window::Automate];
+
+    /// The name shown in the tab strip.
+    pub fn label(self) -> &'static str {
+        match self {
+            Window::Proxy => "Proxy",
+            Window::Repeater => "Repeater",
+            Window::Inspect => "Inspect",
+            Window::Automate => "Automate",
+        }
+    }
+
+    /// The single key that jumps straight here, shown in the tab strip.
+    pub fn key(self) -> char {
+        match self {
+            Window::Proxy => 'P',
+            Window::Repeater => 'R',
+            Window::Inspect => 'I',
+            Window::Automate => 'A',
+        }
+    }
+
+    /// The next / previous window in tab order, wrapping — `gt` / `gT`.
+    pub fn step(self, direction: isize) -> Window {
+        let i = Self::ALL.iter().position(|&w| w == self).unwrap_or(0) as isize;
+        let len = Self::ALL.len() as isize;
+        Self::ALL[(i + direction).rem_euclid(len) as usize]
+    }
+}
+
 /// What the input layer decided the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -85,6 +136,10 @@ pub enum Action {
     Search { pattern: String, backward: bool },
     /// `<Space>r` — replay the selection through the Repeater.
     Resend,
+    /// `P` / `R` / `I` / `A` — jump straight to a named window.
+    Window(Window),
+    /// `gt` / `gT` — cycle to the next / previous window in tab order.
+    WindowStep(isize),
 }
 
 /// One entry in the keymap. Kept free of counts and arguments so the table can
@@ -102,6 +157,9 @@ enum Bind {
     /// Opens the bottom prompt in `Command` mode, seeded with this character.
     Prompt(char),
     Resend,
+    Window(Window),
+    /// Cycle windows by `+1` (`gt`) or `-1` (`gT`).
+    WindowStep(isize),
 }
 
 /// The keymap is data, not control flow, so that `:map` can later rewrite it
@@ -145,6 +203,16 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     ("?", Bind::Prompt('?')),
     // Leader. Application verbs live here so they never shadow vim's own keys.
     ("<Space>r", Bind::Resend),
+    // Windows. In a text editor these uppercase keys are Replace / Insert /
+    // Append — but this is a proxy, there is nothing to edit in place, so we
+    // spend them on the one navigation a proxy needs constantly: jumping between
+    // tools. `gt` / `gT` still cycle the way vim cycles tabs.
+    ("P", Bind::Window(Window::Proxy)),
+    ("R", Bind::Window(Window::Repeater)),
+    ("I", Bind::Window(Window::Inspect)),
+    ("A", Bind::Window(Window::Automate)),
+    ("gt", Bind::WindowStep(1)),
+    ("gT", Bind::WindowStep(-1)),
     // `ZZ` quits; `q` is left free because vim spends it on macro recording.
     ("ZZ", Bind::Prompt('\0')),
 ];
@@ -252,6 +320,8 @@ impl Input {
                 return None;
             }
             Bind::Resend => Action::Resend,
+            Bind::Window(window) => Action::Window(window),
+            Bind::WindowStep(direction) => Action::WindowStep(direction),
         })
     }
 
@@ -542,5 +612,28 @@ mod tests {
     fn zz_quits_without_shadowing_z_motions() {
         assert_eq!(last("ZZ"), Action::Command("q".into()));
         assert_eq!(last("zz"), Action::Scroll(Scroll::Center));
+    }
+
+    #[test]
+    fn uppercase_keys_jump_to_windows() {
+        assert_eq!(last("P"), Action::Window(Window::Proxy));
+        assert_eq!(last("R"), Action::Window(Window::Repeater));
+        assert_eq!(last("I"), Action::Window(Window::Inspect));
+        assert_eq!(last("A"), Action::Window(Window::Automate));
+    }
+
+    /// `gt` / `gT` cycle tabs, and must not disturb `gg`, whose prefix they share.
+    #[test]
+    fn gt_cycles_windows_without_shadowing_gg() {
+        assert_eq!(last("gt"), Action::WindowStep(1));
+        assert_eq!(last("gT"), Action::WindowStep(-1));
+        assert_eq!(last("gg"), Action::Move { motion: Motion::Top, count: None });
+    }
+
+    #[test]
+    fn windows_cycle_and_wrap_in_tab_order() {
+        assert_eq!(Window::Proxy.step(1), Window::Repeater);
+        assert_eq!(Window::Automate.step(1), Window::Proxy, "last wraps to first");
+        assert_eq!(Window::Proxy.step(-1), Window::Automate, "first wraps to last");
     }
 }
