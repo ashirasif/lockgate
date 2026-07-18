@@ -10,11 +10,11 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
 use crate::command::Command;
-use crate::input::{Action, Input, Mode, Motion, Scroll, Window};
+use crate::input::{Action, Input, Mode, Motion, PaletteKey, Scroll, Window};
 
 /// Take over the terminal and run the UI until the user quits.
 pub async fn run(engine: Arc<Engine>) -> std::io::Result<()> {
@@ -59,6 +59,12 @@ struct App {
     /// Lines the active window last rendered, so `G` and downward scrolling can
     /// stop at the end instead of running off into blank space.
     content_len: u16,
+
+    /// The Cmd-K palette's filter text. Only meaningful while the input layer
+    /// is in `Palette` mode, which is what tells us the palette is open.
+    palette_query: String,
+    /// Which filtered command is highlighted.
+    palette_selected: usize,
 }
 
 impl App {
@@ -81,6 +87,8 @@ impl App {
             window: Window::default(),
             content_scroll: 0,
             content_len: 0,
+            palette_query: String::new(),
+            palette_selected: 0,
         }
     }
 
@@ -185,7 +193,88 @@ impl App {
             Action::Command(line) => self.run_command(&line),
             Action::Window(window) => self.show_window(window),
             Action::WindowStep(direction) => self.show_window(self.window.step(direction)),
+            Action::Palette(key) => self.palette(key),
         }
+    }
+
+    /// Drive the Cmd-K palette. The input layer already flipped the mode; here
+    /// we only maintain the filter and selection, and on `Accept` we look up the
+    /// highlighted command and run it through `apply` like any other intent.
+    fn palette(&mut self, key: PaletteKey) {
+        match key {
+            PaletteKey::Open => {
+                self.palette_query.clear();
+                self.palette_selected = 0;
+            }
+            PaletteKey::Char(c) => {
+                self.palette_query.push(c);
+                self.palette_selected = 0;
+            }
+            PaletteKey::Backspace => {
+                self.palette_query.pop();
+                self.palette_selected = 0;
+            }
+            PaletteKey::Up => self.palette_selected = self.palette_selected.saturating_sub(1),
+            PaletteKey::Down => {
+                let last = self.palette_matches().len().saturating_sub(1);
+                self.palette_selected = (self.palette_selected + 1).min(last);
+            }
+            PaletteKey::Accept => {
+                if let Some((_, action)) =
+                    self.palette_matches().into_iter().nth(self.palette_selected)
+                {
+                    self.apply(action);
+                }
+            }
+            PaletteKey::Cancel => {}
+        }
+    }
+
+    /// Every command the palette can run, built fresh each keystroke so labels
+    /// and targets track the current state (which window you're in, whether a
+    /// toggle is on). Each entry is just an existing [`Action`] with a name.
+    fn palette_command_catalog(&self) -> Vec<(String, Action)> {
+        let mut commands = Vec::new();
+        for window in Window::ALL {
+            if window != self.window {
+                commands.push((format!("Go to {}", window.label()), Action::Window(window)));
+            }
+        }
+        commands.push(("Resend selection".into(), Action::Resend));
+        commands.push((
+            "Go to first request".into(),
+            Action::Move { motion: Motion::Top, count: None },
+        ));
+        commands.push((
+            "Go to last request".into(),
+            Action::Move { motion: Motion::Bottom, count: None },
+        ));
+        // The toggle reads its own state so the label says what will happen.
+        let (rnu_label, rnu_cmd) = if self.option("rnu") {
+            ("Disable relative line numbers", "set nornu")
+        } else {
+            ("Enable relative line numbers", "set rnu")
+        };
+        commands.push((rnu_label.into(), Action::Command(rnu_cmd.into())));
+        commands.push(("Show help".into(), Action::Command("help".into())));
+        commands.push(("Quit".into(), Action::Command("q".into())));
+        commands
+    }
+
+    /// The catalog filtered by the query and ranked best-match first. An empty
+    /// query keeps every command in its natural order.
+    fn palette_matches(&self) -> Vec<(String, Action)> {
+        let mut scored: Vec<(i32, usize, String, Action)> = self
+            .palette_command_catalog()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, (label, action))| {
+                fuzzy_score(&self.palette_query, &label).map(|score| (score, i, label, action))
+            })
+            .collect();
+        // Best score wins; original order breaks ties so the list stays stable.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, _, label, action)| (label, action)).collect()
     }
 
     /// Switch windows. Scrolling is per-window, so leaving one abandons its
@@ -465,6 +554,60 @@ impl App {
             Window::Automate => self.draw_automate(frame, body),
         }
         self.draw_status(frame, status_bar);
+        // Drawn last so it floats above whichever window is behind it.
+        if self.input.mode() == Mode::Palette {
+            self.draw_palette(frame);
+        }
+    }
+
+    /// A Telescope-style overlay: a filter prompt over a ranked command list,
+    /// centred on the screen with everything behind it cleared.
+    fn draw_palette(&self, frame: &mut Frame) {
+        let area = centered_rect(frame.area(), 60, 60);
+        frame.render_widget(Clear, area);
+
+        let [prompt, list] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+
+        let matches = self.palette_matches();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  ", Style::new().fg(Color::Cyan)),
+                Span::raw(format!("{}█", self.palette_query)),
+            ]))
+            .block(
+                Block::bordered()
+                    .title(" Command Palette ")
+                    .title_bottom(format!(" {} ", match matches.len() {
+                        1 => "1 match".to_string(),
+                        n => format!("{n} matches"),
+                    })),
+            ),
+            prompt,
+        );
+
+        let rows: Vec<Line> = if matches.is_empty() {
+            vec![Line::styled("  no matching command", Style::new().fg(Color::DarkGray))]
+        } else {
+            matches
+                .iter()
+                .enumerate()
+                .map(|(i, (label, _))| {
+                    if i == self.palette_selected {
+                        Line::from(vec![
+                            Span::styled("▶ ", Style::new().fg(Color::Cyan)),
+                            Span::styled(
+                                label.clone(),
+                                Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
+                            ),
+                        ])
+                    } else {
+                        Line::from(format!("  {label}"))
+                    }
+                })
+                .collect()
+        };
+        frame.render_widget(Paragraph::new(rows).block(Block::bordered()), list);
     }
 
     /// Mason's tool strip: each window a chip, `Name (key)`, active one lit.
@@ -695,6 +838,7 @@ impl App {
             Mode::Normal => Color::Cyan,
             Mode::Visual => Color::Magenta,
             Mode::Command => Color::Yellow,
+            Mode::Palette => Color::Green,
         });
 
         let position = if self.flows.is_empty() {
@@ -725,7 +869,42 @@ impl App {
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
 const HELP: &str =
-    "P/R/I/A windows  gt/gT cycle  ·  j/k gg/G {} n/N m'  ·  <Space>r resend  ·  :resend :set rnu :q";
+    "^k palette  ·  P/R/I/A windows  gt/gT cycle  ·  j/k gg/G {} n/N m'  ·  <Space>r resend  ·  :q";
+
+/// Score how well `query` fuzzy-matches `text`, or `None` if it doesn't. Every
+/// query char must appear in order; contiguous runs and an early first hit score
+/// higher, so "grep" ranks "Go to Repeater" above a scattered coincidence. An
+/// empty query matches everything with a neutral score.
+fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let haystack: Vec<char> = text.to_lowercase().chars().collect();
+    let mut score = 0;
+    let mut from = 0;
+    let mut previous: Option<usize> = None;
+    for needle in query.to_lowercase().chars() {
+        let found = haystack[from..].iter().position(|&c| c == needle)? + from;
+        // Reward adjacency (a real substring) and matching near the start.
+        score += if previous == Some(found.saturating_sub(1)) { 8 } else { 1 };
+        score -= found as i32 / 4;
+        previous = Some(found);
+        from = found + 1;
+    }
+    Some(score)
+}
+
+/// A rectangle `pct_x` × `pct_y` percent of `area`, centred within it.
+fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let width = area.width * pct_x / 100;
+    let height = area.height * pct_y / 100;
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
 
 /// A bordered, wrapping pane — the shared shell for Request and Response.
 fn pane(lines: Vec<Line<'static>>, title: &'static str) -> Paragraph<'static> {
@@ -886,7 +1065,7 @@ mod tests {
     use ratatui::{
         Terminal,
         backend::TestBackend,
-        crossterm::event::{KeyCode, KeyEvent},
+        crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     };
 
     /// Render to an in-memory buffer, one `String` per terminal row. Keeping
@@ -943,6 +1122,15 @@ mod tests {
             }
             app.refresh();
         }
+    }
+
+    /// Feed one arbitrary key event (for the ones `press` can't spell: Ctrl
+    /// combos, Enter, Escape).
+    fn key(app: &mut App, event: KeyEvent) {
+        if let Some(action) = app.input.feed(event) {
+            app.apply(action);
+        }
+        app.refresh();
     }
 
     fn engine_with(count: usize) -> Arc<Engine> {
@@ -1204,6 +1392,68 @@ mod tests {
         press(&mut app, "P");
         press(&mut app, "A");
         assert_eq!(app.content_scroll, 0);
+    }
+
+    /// Ctrl-K opens the palette; it floats above the window and lists commands.
+    #[test]
+    fn palette_opens_over_the_window_and_lists_commands() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.mode(), Mode::Palette);
+        let out = render(&mut app);
+        assert!(out.contains("Command Palette"), "{out}");
+        assert!(out.contains("Go to Repeater"), "{out}");
+        assert!(out.contains("Quit"), "{out}");
+    }
+
+    /// Typing filters the list; Enter runs the highlighted command — here,
+    /// switching windows — and closes the palette.
+    #[test]
+    fn palette_filters_and_runs_the_chosen_command() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        press(&mut app, "inspect");
+        // The filter has narrowed to the one obvious match.
+        let matches = app.palette_matches();
+        assert_eq!(matches.first().map(|(l, _)| l.as_str()), Some("Go to Inspect"));
+
+        key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.input.mode(), Mode::Normal, "Enter closes the palette");
+        assert_eq!(app.window, Window::Inspect, "the chosen command ran");
+    }
+
+    #[test]
+    fn palette_escape_dismisses_without_running_anything() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        press(&mut app, "quit");
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.input.mode(), Mode::Normal);
+        assert!(!app.should_quit, "Escape must not run the highlighted Quit");
+    }
+
+    /// Ctrl-n walks the selection down the filtered list.
+    #[test]
+    fn palette_selection_moves_with_ctrl_n() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.palette_selected, 0);
+        key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.palette_selected, 1);
+    }
+
+    #[test]
+    fn fuzzy_score_requires_order_and_prefers_contiguous() {
+        assert!(fuzzy_score("", "anything").is_some(), "empty query matches all");
+        assert!(fuzzy_score("xyz", "Go to Proxy").is_none(), "missing chars fail");
+        // A contiguous substring should beat the same letters scattered.
+        let contiguous = fuzzy_score("proxy", "Go to Proxy").unwrap();
+        let scattered = fuzzy_score("proxy", "Prod runs on x, y").unwrap();
+        assert!(contiguous > scattered, "{contiguous} !> {scattered}");
     }
 
     #[test]

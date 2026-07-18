@@ -22,6 +22,9 @@ pub enum Mode {
     Visual,
     /// Typing into the `:` / `/` / `?` prompt at the bottom of the screen.
     Command,
+    /// The Cmd-K command palette is open: keys filter and pick from a list
+    /// instead of moving a cursor.
+    Palette,
 }
 
 impl Mode {
@@ -31,6 +34,7 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Visual => "VISUAL",
             Mode::Command => "COMMAND",
+            Mode::Palette => "PALETTE",
         }
     }
 }
@@ -117,6 +121,25 @@ impl Window {
     }
 }
 
+/// A keystroke while the command palette is open. The palette's *contents* are
+/// the app's business — this layer only reports what the user did to it, the
+/// same way it reports a motion without knowing what a "line" is here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteKey {
+    /// The palette just opened; the app should reset its query and selection.
+    Open,
+    /// A character typed into the filter.
+    Char(char),
+    Backspace,
+    /// Move the highlight up / down the filtered list.
+    Up,
+    Down,
+    /// Run the highlighted command.
+    Accept,
+    /// Dismiss without running anything.
+    Cancel,
+}
+
 /// What the input layer decided the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -140,6 +163,8 @@ pub enum Action {
     Window(Window),
     /// `gt` / `gT` — cycle to the next / previous window in tab order.
     WindowStep(isize),
+    /// Something happened to the Cmd-K palette (opened, filtered, picked…).
+    Palette(PaletteKey),
 }
 
 /// One entry in the keymap. Kept free of counts and arguments so the table can
@@ -160,6 +185,8 @@ enum Bind {
     Window(Window),
     /// Cycle windows by `+1` (`gt`) or `-1` (`gT`).
     WindowStep(isize),
+    /// Open the Cmd-K command palette.
+    Palette,
 }
 
 /// The keymap is data, not control flow, so that `:map` can later rewrite it
@@ -213,6 +240,10 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     ("A", Bind::Window(Window::Automate)),
     ("gt", Bind::WindowStep(1)),
     ("gT", Bind::WindowStep(-1)),
+    // Command palette. `<D-k>` is Cmd-K, which most terminals swallow before it
+    // reaches us, so `<C-k>` is bound as the one that works everywhere.
+    ("<D-k>", Bind::Palette),
+    ("<C-k>", Bind::Palette),
     // `ZZ` quits; `q` is left free because vim spends it on macro recording.
     ("ZZ", Bind::Prompt('\0')),
 ];
@@ -256,8 +287,37 @@ impl Input {
     pub fn feed(&mut self, key: KeyEvent) -> Option<Action> {
         match self.mode {
             Mode::Command => self.feed_command(key),
+            Mode::Palette => self.feed_palette(key),
             Mode::Normal | Mode::Visual => self.feed_normal(key),
         }
+    }
+
+    // --- command palette ---
+
+    /// While the palette is open every key is a palette gesture: printable keys
+    /// filter, `<C-n>`/`<C-p>` (or the arrows, or `<C-j>`/`<C-k>`) move, Enter
+    /// runs, Escape dismisses. The app owns the list; we only report the gesture.
+    fn feed_palette(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let gesture = match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                PaletteKey::Cancel
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                PaletteKey::Accept
+            }
+            KeyCode::Backspace => PaletteKey::Backspace,
+            KeyCode::Up => PaletteKey::Up,
+            KeyCode::Down => PaletteKey::Down,
+            // Telescope's motions: Ctrl holds them apart from typed letters.
+            KeyCode::Char('n' | 'j') if ctrl => PaletteKey::Down,
+            KeyCode::Char('p' | 'k') if ctrl => PaletteKey::Up,
+            KeyCode::Char(c) if !ctrl => PaletteKey::Char(c),
+            _ => return None,
+        };
+        Some(Action::Palette(gesture))
     }
 
     // --- normal / visual ---
@@ -322,6 +382,11 @@ impl Input {
             Bind::Resend => Action::Resend,
             Bind::Window(window) => Action::Window(window),
             Bind::WindowStep(direction) => Action::WindowStep(direction),
+            // Enter palette mode and tell the app to start with a clean filter.
+            Bind::Palette => {
+                self.mode = Mode::Palette;
+                Action::Palette(PaletteKey::Open)
+            }
         })
     }
 
@@ -421,8 +486,12 @@ fn single_char(token: &str) -> Option<char> {
 /// so modifiers like a bare Shift press don't disturb a pending sequence.
 fn encode(key: KeyEvent) -> Option<String> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Cmd on macOS. vim spells it `<D-…>`; whether it ever arrives is up to the
+    // terminal, but if it does we want it to mean the same as the fallback.
+    let cmd = key.modifiers.contains(KeyModifiers::SUPER);
     Some(match key.code {
         KeyCode::Char(' ') if !ctrl => "<Space>".into(),
+        KeyCode::Char(c) if cmd => format!("<D-{}>", c.to_ascii_lowercase()),
         KeyCode::Char(c) if ctrl => format!("<C-{}>", c.to_ascii_lowercase()),
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Esc => "<Esc>".into(),
@@ -635,5 +704,51 @@ mod tests {
         assert_eq!(Window::Proxy.step(1), Window::Repeater);
         assert_eq!(Window::Automate.step(1), Window::Proxy, "last wraps to first");
         assert_eq!(Window::Proxy.step(-1), Window::Automate, "first wraps to last");
+    }
+
+    /// Both Cmd-K and the Ctrl-K fallback open the palette and enter its mode.
+    #[test]
+    fn cmd_k_and_ctrl_k_open_the_palette() {
+        for key in [
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER),
+            ctrl('k'),
+        ] {
+            let mut input = Input::new();
+            assert_eq!(input.feed(key), Some(Action::Palette(PaletteKey::Open)));
+            assert_eq!(input.mode(), Mode::Palette);
+        }
+    }
+
+    /// Once open, printable keys filter and Enter runs the highlighted command.
+    #[test]
+    fn palette_filters_then_accepts() {
+        let mut input = Input::new();
+        input.feed(ctrl('k'));
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Char('r'))),
+            Some(Action::Palette(PaletteKey::Char('r')))
+        );
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Enter)),
+            Some(Action::Palette(PaletteKey::Accept))
+        );
+        assert_eq!(input.mode(), Mode::Normal, "Enter closes the palette");
+    }
+
+    #[test]
+    fn palette_navigates_with_ctrl_and_arrows_and_escapes() {
+        let mut input = Input::new();
+        input.feed(ctrl('k'));
+        assert_eq!(input.feed(ctrl('n')), Some(Action::Palette(PaletteKey::Down)));
+        assert_eq!(input.feed(ctrl('p')), Some(Action::Palette(PaletteKey::Up)));
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Down)),
+            Some(Action::Palette(PaletteKey::Down))
+        );
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Esc)),
+            Some(Action::Palette(PaletteKey::Cancel))
+        );
+        assert_eq!(input.mode(), Mode::Normal);
     }
 }
