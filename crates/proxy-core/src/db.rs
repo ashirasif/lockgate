@@ -31,7 +31,7 @@ use rusqlite::Connection;
 pub const INLINE_BODY_LIMIT: usize = 5 * 1024 * 1024;
 
 /// Bumped whenever `MIGRATIONS` grows. Persisted in SQLite's `user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Applied in order, starting from whatever `user_version` the file is at.
 /// Append only — never edit a statement that has already shipped.
@@ -228,6 +228,47 @@ const MIGRATIONS: &[&str] = &[
       sort_order INTEGER NOT NULL DEFAULT 0
     );
     "#,
+    // v2 — scope rules become conjunctions.
+    //
+    // v1 gave each rule a single (kind, pattern), so rules could only ever OR
+    // together: "host *.linear.app" and "path /api" meant linear.app *or*
+    // anything under /api anywhere, when what scoping a sitemap directory needs
+    // is the intersection. A rule is now a set of optional constraints that must
+    // all hold, which is also how Burp models scope (protocol/host/port/file).
+    //
+    // Dropping rather than migrating rows: nothing ever wrote to the v1 table.
+    r#"
+    DROP TABLE scope_rule;
+
+    CREATE TABLE scope_rule (
+      id           INTEGER PRIMARY KEY,
+      scope_id     INTEGER NOT NULL REFERENCES scope(id) ON DELETE CASCADE,
+      action       TEXT NOT NULL,   -- include | exclude
+
+      -- Each constraint is optional; NULL means "any". A rule matches a request
+      -- only when every non-NULL constraint matches it.
+      host_kind    TEXT,            -- glob | regex | cidr
+      host_pattern TEXT,
+      port         INTEGER,
+      path_prefix  TEXT,
+
+      enabled      INTEGER NOT NULL DEFAULT 1,
+      sort_order   INTEGER NOT NULL DEFAULT 0,
+      -- Set when the rule came from ticking a sitemap node, so the UI can show
+      -- that checkbox state honestly and unticking can remove the rule.
+      from_node_id INTEGER REFERENCES sitemap_node(id) ON DELETE SET NULL,
+
+      -- host_kind and host_pattern are meaningful only together.
+      CHECK ((host_kind IS NULL) = (host_pattern IS NULL))
+    );
+    CREATE INDEX scope_rule_scope ON scope_rule(scope_id);
+    CREATE INDEX scope_rule_node  ON scope_rule(from_node_id);
+
+    -- Needed for port constraints to be evaluable at all. Backfilled from the
+    -- scheme default, which is what the old rows would have used implicitly.
+    ALTER TABLE flow ADD COLUMN port INTEGER;
+    UPDATE flow SET port = CASE scheme WHEN 'https' THEN 443 ELSE 80 END;
+    "#,
 ];
 
 /// Where a project's files live.
@@ -331,4 +372,93 @@ pub fn next_flow_id(conn: &Connection) -> rusqlite::Result<u64> {
         r.get::<_, i64>(0)
     })
     .map(|id| id as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Projects created before the conjunction rewrite must upgrade in place,
+    /// not just work when created fresh. Applies v1 alone, then migrates.
+    #[test]
+    fn upgrades_a_v1_project_to_v2() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+
+        // A v1 flow, written the way the old code did: no port column existed.
+        conn.execute(
+            "INSERT INTO capture_run (id, started_at) VALUES (1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flow (id, run_id, source, started_at, method, uri,
+                               http_version, req_headers, host, scheme, path)
+             VALUES (1, 1, 'proxy', 0, 'GET', 'https://x.com/a', 'HTTP/1.1',
+                     X'', 'x.com', 'https', '/a'),
+                    (2, 1, 'proxy', 0, 'GET', 'http://y.com/b', 'HTTP/1.1',
+                     X'', 'y.com', 'http', '/b')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn, MIGRATIONS, SCHEMA_VERSION).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+
+        // Existing rows keep their data and get a port backfilled from scheme.
+        let ports: Vec<i64> = conn
+            .prepare("SELECT port FROM flow ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ports, vec![443, 80], "port must be backfilled per scheme");
+
+        // scope_rule is the new conjunction shape.
+        conn.execute("INSERT INTO scope (id, name) VALUES (1, 's')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO scope_rule (scope_id, action, host_kind, host_pattern, path_prefix)
+             VALUES (1, 'include', 'glob', '*.x.com', '/api')",
+            [],
+        )
+        .unwrap();
+
+        // The CHECK must reject a half-specified host constraint.
+        assert!(
+            conn.execute(
+                "INSERT INTO scope_rule (scope_id, action, host_kind) VALUES (1, 'include', 'glob')",
+                [],
+            )
+            .is_err(),
+            "host_kind without host_pattern should violate the CHECK"
+        );
+    }
+
+    /// Migrating twice must be a no-op, not a re-application.
+    #[test]
+    fn migration_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn, MIGRATIONS, SCHEMA_VERSION).unwrap();
+        migrate(&conn, MIGRATIONS, SCHEMA_VERSION).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// A file written by a newer binary must be refused, not misread.
+    #[test]
+    fn refuses_a_future_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", 99i64).unwrap();
+        assert!(migrate(&conn, MIGRATIONS, SCHEMA_VERSION).is_err());
+    }
 }

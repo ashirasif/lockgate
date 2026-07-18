@@ -1,6 +1,6 @@
 # Data model & feature inventory
 
-Status: **decided.** §15 records the locked answers. Schema v1 implements
+Status: **decided.** §15 records the locked answers. Schema v2 implements
 projects, capture runs, flows, bodies with spill, sitemap, scope, notes,
 findings, and saved filters; the remaining rows in §14 are not built yet.
 
@@ -127,7 +127,7 @@ Two levers, both additive:
 
 ---
 
-## 4. Scope — **v1**
+## 4. Scope — **have**
 
 Assets like `*.linear.app`, `google.com`. Scope is a **view filter**: selecting a
 scope in the proxy history shows only that asset's resources. It also gates
@@ -140,16 +140,29 @@ CREATE TABLE scope (
   is_active INTEGER NOT NULL DEFAULT 0
 );
 
+-- A rule is a CONJUNCTION: every non-NULL constraint must match, NULL means
+-- "any". This is how Burp models scope (protocol/host/port/file).
 CREATE TABLE scope_rule (
-  id         INTEGER PRIMARY KEY,
-  scope_id   INTEGER NOT NULL REFERENCES scope(id) ON DELETE CASCADE,
-  kind       TEXT NOT NULL,  -- host_glob | host_regex | cidr | path_prefix | port
-  pattern    TEXT NOT NULL,
-  action     TEXT NOT NULL,  -- include | exclude
-  enabled    INTEGER NOT NULL DEFAULT 1,
-  sort_order INTEGER NOT NULL
+  id           INTEGER PRIMARY KEY,
+  scope_id     INTEGER NOT NULL REFERENCES scope(id) ON DELETE CASCADE,
+  action       TEXT NOT NULL,   -- include | exclude
+  host_kind    TEXT,            -- glob | regex | cidr
+  host_pattern TEXT,
+  port         INTEGER,
+  path_prefix  TEXT,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  sort_order   INTEGER NOT NULL DEFAULT 0,
+  from_node_id INTEGER REFERENCES sitemap_node(id) ON DELETE SET NULL,
+  CHECK ((host_kind IS NULL) = (host_pattern IS NULL))
 );
 ```
+
+> **Schema v1 got this wrong.** Rules originally carried a single
+> `(kind, pattern)`, so they could only OR together: host `*.linear.app` plus
+> path `/api` meant linear.app *or* anything under `/api` on any host. Scoping a
+> sitemap directory needs the intersection, so **v2** rewrote the table.
+> `flow.port` was added in the same migration — without it a port constraint was
+> unevaluable, since `flow` only ever stored the host.
 
 **Named scopes rather than one global list**, because you routinely want "all of
 the client's assets" and "just the one app I'm testing right now" and to switch
@@ -166,9 +179,23 @@ between them. `is_active` selects; the rest stay.
 it would mean rewriting millions of rows on every rule edit. It is evaluated at
 query time against `flow.host`.
 
-Storage is not the hard part — evaluation is. Rules compile to an in-memory
-matcher at load and on edit. **Not yet implemented:** nothing reads `scope_rule`
-today.
+Rules compile to an in-memory `Matcher` (`scope.rs`) at load and on edit; the
+database is never consulted per request.
+
+Matching details worth knowing:
+
+- **Host globs are case-insensitive**; `*` matches any run of characters, `?`
+  exactly one. `*.linear.app` does **not** cover the apex `linear.app` — there is
+  no label for `*` to consume before the dot. Add the apex explicitly.
+- **Path prefixes respect segment boundaries**: `/api` covers `/api/v1` but not
+  `/apikeys`. A raw string prefix would silently over-scope.
+- **Ports are always resolved** from the scheme when absent, so a `:443`
+  constraint means the same whether or not the client wrote the port out.
+- **CIDR matches IP-literal hosts only**, and never across v4/v6. A hostname is
+  never "inside" a network even if it resolves there.
+- **A malformed pattern is an error, not a skip.** Silently dropping a broken
+  rule would widen scope if it happened to be an exclude. `add_rule` validates
+  before writing, so the database cannot hold an uncompilable rule.
 
 ---
 
@@ -473,9 +500,9 @@ than pretending selective encryption helps.
 | Organise | Notes (markdown) | schema only |
 | Organise | Flow comments + highlights | schema only |
 | Organise | Findings + evidence | schema only |
-| Navigate | Scope (named, include/exclude) | schema only |
+| Navigate | Scope (named, conjunction rules) | have |
 | Navigate | Sitemap (materialised tree) | have |
-| Navigate | Sitemap ↔ scope linkage | schema only |
+| Navigate | Sitemap ↔ scope linkage | have |
 | Navigate | Structured filter language | schema only |
 | Navigate | Full-text body search | dropped for now |
 | Act | Replay collections + drafts | v2 |
@@ -506,6 +533,7 @@ than pretending selective encryption helps.
 ### Still open
 
 - **CVSS version**: the column exists but nothing enforces 3.1 vs 4.0 yet.
-- **Scope rule matching** is specified but not implemented — no matcher compiles
-  `scope_rule` rows into a predicate yet.
+- **No scope UI.** `Engine::list_flows_in_scope` filters correctly, but the TUI
+  still calls `list_flows`, and nothing lets you create a scope or tick a
+  sitemap node yet.
 - **Ctrl-C** does not flush; only a clean exit from the TUI does.

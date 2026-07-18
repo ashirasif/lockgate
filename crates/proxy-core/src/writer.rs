@@ -210,14 +210,14 @@ fn write_batch(
                 request,
             } => {
                 let body_id = intern_body(&tx, paths, &request.body)?;
-                let (scheme, host, path) = target_parts(&request);
+                let (scheme, host, port, path) = target_parts(&request);
 
                 tx.execute(
                     "INSERT INTO flow (
                         id, run_id, source, parent_id, started_at,
                         method, uri, http_version, req_headers, req_body_id,
-                        host, scheme, path
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                        host, scheme, path, port
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                     params![
                         id as i64,
                         run_id,
@@ -232,6 +232,7 @@ fn write_batch(
                         &host,
                         scheme,
                         &path,
+                        port,
                     ],
                 )?;
 
@@ -412,7 +413,11 @@ fn encode_headers(headers: &HeaderMap) -> Vec<u8> {
 /// Derived once, here, rather than recomputed at read time: if the fallback
 /// guesses wrong the wrong value is at least visible in the data instead of
 /// hidden inside a function.
-fn target_parts(req: &CapturedRequest) -> (String, String, String) {
+///
+/// The port is always resolved, falling back to the scheme default, so a scope
+/// rule constraining a port means the same thing whether or not the client
+/// wrote `:443` out.
+fn target_parts(req: &CapturedRequest) -> (String, String, u16, String) {
     let uri: &Uri = &req.uri;
     let path = uri
         .path_and_query()
@@ -421,17 +426,25 @@ fn target_parts(req: &CapturedRequest) -> (String, String, String) {
 
     if let Some(host) = uri.host() {
         let scheme = uri.scheme_str().unwrap_or("http").to_string();
-        return (scheme, host.to_string(), path);
+        let port = uri
+            .port_u16()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        return (scheme, host.to_string(), port, path);
     }
 
     // Origin-form target: the host only exists in the `Host` header. We assume
     // https because plain-HTTP requests reach us in absolute-form and would
     // have taken the branch above.
-    let host = req
-        .headers
-        .get(HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    ("https".to_string(), host, path)
+    let raw = req.headers.get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    // A Host header may carry a port ("example.com:8443"); split it back out so
+    // it lands in `port` rather than corrupting `host`.
+    let (host, port) = match raw.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(port) => (h.to_string(), port),
+            // Not a port — most likely a bare IPv6 literal.
+            Err(_) => (raw.to_string(), 443),
+        },
+        None => (raw.to_string(), 443),
+    };
+    ("https".to_string(), host, port, path)
 }

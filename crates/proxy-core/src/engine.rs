@@ -1,11 +1,15 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use rusqlite::Connection;
 
 use hudsucker::hyper::header::HOST;
 
 use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary, now_micros};
 use crate::store::FlowStore;
+use tracing::error;
 use crate::db::ProjectPaths;
+use crate::scope::{Matcher, Target};
 use crate::writer::{Source, WriteEvent, WriteHandle};
 
 /// The seam. Owns all proxy state and defines every verb the frontends
@@ -17,6 +21,11 @@ pub struct Engine {
     http: reqwest::Client,
     /// `None` when running purely in memory (tests, `Engine::new`).
     writer: Option<WriteHandle>,
+    /// A second connection for reads. The writer owns its own on a blocking
+    /// thread, and WAL mode lets readers run concurrently with it. `Connection`
+    /// is `Send` but not `Sync`, hence the mutex; every read locks briefly and
+    /// never holds the guard across an await.
+    read: Option<Mutex<Connection>>,
 }
 
 #[derive(Debug)]
@@ -40,6 +49,7 @@ impl Engine {
             store: FlowStore::new(),
             http: reqwest::Client::new(),
             writer: None,
+            read: None,
         })
     }
 
@@ -52,10 +62,13 @@ impl Engine {
     pub fn open_project(root: &Path) -> rusqlite::Result<Arc<Self>> {
         let paths = ProjectPaths::new(root);
         let (writer, next_id) = crate::writer::spawn(&paths, now_micros())?;
+        // Opened after the writer, so the schema is already migrated.
+        let read = crate::db::open(&paths.db())?;
         Ok(Arc::new(Self {
             store: FlowStore::with_next_id(next_id),
             http: reqwest::Client::new(),
             writer: Some(writer),
+            read: Some(Mutex::new(read)),
         }))
     }
 
@@ -118,6 +131,53 @@ impl Engine {
         self.store.list()
     }
 
+    /// Run `f` against the project database. `None` for in-memory engines.
+    ///
+    /// The closure form keeps the guard from escaping, so a caller cannot hold
+    /// the connection lock across an await by accident.
+    pub fn with_db<T>(&self, f: impl FnOnce(&Connection) -> T) -> Option<T> {
+        let conn = self.read.as_ref()?.lock().unwrap();
+        Some(f(&conn))
+    }
+
+    /// The compiled matcher for the active scope, or unrestricted if no scope is
+    /// active or the engine has no database.
+    pub fn scope_matcher(&self) -> Matcher {
+        self.with_db(crate::scope::active_matcher)
+            .transpose()
+            .unwrap_or_else(|e| {
+                // A scope that will not compile must not silently widen the
+                // view, but it also must not take the UI down: report it and
+                // fall back to showing everything, which is at least visible.
+                error!(error = %e, "active scope failed to compile");
+                None
+            })
+            .unwrap_or_default()
+    }
+
+    /// History filtered to the active scope.
+    ///
+    /// Scope is applied here rather than stored on each flow: it is mutable, so
+    /// a column would mean rewriting every row whenever a rule changes.
+    pub fn list_flows_in_scope(&self) -> Vec<FlowSummary> {
+        let matcher = self.scope_matcher();
+        let flows = self.store.list();
+        if matcher.is_unrestricted() {
+            return flows;
+        }
+        flows
+            .into_iter()
+            .filter(|flow| {
+                let (host, port, path) = summary_target(flow);
+                matcher.matches(&Target {
+                    host: &host,
+                    port,
+                    path: &path,
+                })
+            })
+            .collect()
+    }
+
     pub fn get_flow(&self, id: FlowId) -> Option<Flow> {
         self.store.get(id)
     }
@@ -174,4 +234,16 @@ fn target_url(req: &CapturedRequest) -> Option<String> {
         .map(|pq| pq.as_str())
         .unwrap_or("/");
     Some(format!("https://{host}{path}"))
+}
+
+/// Pull the scope-relevant parts out of a summary row.
+///
+/// The port is resolved from the scheme when the URI omits it, matching what the
+/// writer stores, so a port rule means the same thing either way.
+fn summary_target(flow: &FlowSummary) -> (String, u16, String) {
+    let host = flow.uri.host().unwrap_or_default().to_string();
+    let https = flow.uri.scheme_str() != Some("http");
+    let port = flow.uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+    let path = flow.uri.path().to_string();
+    (host, port, path)
 }
