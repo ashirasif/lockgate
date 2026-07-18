@@ -2,4 +2,7 @@
 
 # CA private key — machine-local secret, never commit. Regenerate with the
 # openssl commands in the README if you clone fresh.
-/src/ca/ca.key
+/crates/proxy-core/src/ca/ca.key
+
+# runtime log (TUI redirects tracing here)
+proxy.log

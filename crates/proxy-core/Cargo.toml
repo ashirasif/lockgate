@@ -1,0 +1,13 @@
+[package]
+name = "proxy-core"
+version.workspace = true
+edition.workspace = true
+
+# Note what is NOT here: no ratatui, no UI anything. The seam is now enforced
+# by cargo, not by discipline.
+[dependencies]
+hudsucker = { workspace = true }
+http-body-util = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

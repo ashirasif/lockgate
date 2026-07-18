@@ -1,0 +1,16 @@
+[package]
+name = "proxy-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "proxy"
+path = "src/main.rs"
+
+[dependencies]
+proxy-core = { workspace = true }
+hudsucker = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
