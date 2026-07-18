@@ -21,8 +21,19 @@ impl FlowStore {
         Self::default()
     }
 
+    /// Resume id allocation from `next_id` — used when reopening a database so
+    /// fresh flows do not collide with the ones already stored.
+    pub fn with_next_id(next_id: FlowId) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                flows: Vec::new(),
+                next_id,
+            }),
+        }
+    }
+
     /// Record an outgoing request, returning its new id.
-    pub fn add_request(&self, request: CapturedRequest) -> FlowId {
+    pub fn add_request(&self, request: CapturedRequest, started_at: i64) -> FlowId {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id;
         inner.next_id += 1;
@@ -30,15 +41,18 @@ impl FlowStore {
             id,
             request,
             response: None,
+            started_at,
+            ended_at: None,
         });
         id
     }
 
     /// Attach a response to a previously recorded request. No-op if the id is gone.
-    pub fn attach_response(&self, id: FlowId, response: CapturedResponse) {
+    pub fn attach_response(&self, id: FlowId, response: CapturedResponse, ended_at: i64) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(flow) = inner.flows.iter_mut().find(|f| f.id == id) {
             flow.response = Some(response);
+            flow.ended_at = Some(ended_at);
         }
     }
 

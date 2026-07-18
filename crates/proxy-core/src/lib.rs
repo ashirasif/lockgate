@@ -4,13 +4,18 @@
 //! (TUI, MCP) depend on it, never the other way around.
 
 pub mod ca;
+pub mod db;
 pub mod engine;
 pub mod model;
 pub mod proxy;
+pub mod registry;
 pub mod server;
 pub mod store;
+pub mod writer;
 
+pub use db::ProjectPaths;
 pub use engine::{Engine, ResendError};
+pub use registry::{Project, Registry};
 pub use model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary};
 pub use proxy::ProxyHandler;
 pub use server::serve;

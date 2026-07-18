@@ -30,6 +30,21 @@ pub struct Flow {
     pub id: FlowId,
     pub request: CapturedRequest,
     pub response: Option<CapturedResponse>,
+    /// Unix microseconds. Stored rather than inferred from row order, which
+    /// does not survive a restart.
+    pub started_at: i64,
+    /// `None` while in flight — or forever, if the connection dropped.
+    pub ended_at: Option<i64>,
+}
+
+/// Unix microseconds. Saturates at the epoch rather than panicking if the
+/// system clock is set before 1970.
+pub fn now_micros() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 /// A cheap row for list views (TUI/MCP) that don't need full bodies.
