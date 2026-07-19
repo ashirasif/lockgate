@@ -293,8 +293,14 @@ impl ProjectPaths {
     /// Sharded by the first byte of the digest: a flat directory of hundreds of
     /// thousands of blobs is slow to list and unpleasant on some filesystems.
     pub fn blob(&self, sha256: &[u8]) -> PathBuf {
+        Self::blob_in(&self.blobs(), sha256)
+    }
+
+    /// The blob path under an explicit `blobs/` root. Same sharding as `blob`,
+    /// for callers (reads) that hold the root directly rather than a `ProjectPaths`.
+    pub fn blob_in(blobs_root: &Path, sha256: &[u8]) -> PathBuf {
         let hex = hex(sha256);
-        self.blobs().join(&hex[0..2]).join(&hex)
+        blobs_root.join(&hex[0..2]).join(&hex)
     }
 }
 

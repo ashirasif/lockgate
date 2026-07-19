@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proxy-core", "crates/proxy-cli"]
+members = ["crates/proxy-core", "crates/proxy-cli", "crates/proxy-mcp"]
 
 # Versions are declared once here; member crates opt in with
 # `dep = { workspace = true }` so they can never drift apart.

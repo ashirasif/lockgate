@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 proxy-core = { workspace = true }
+proxy-mcp = { path = "../proxy-mcp" }
 hudsucker = { workspace = true }
 ratatui = { workspace = true }
 tokio = { workspace = true }

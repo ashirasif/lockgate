@@ -11,11 +11,13 @@ use hudsucker::hyper::{HeaderMap, Uri};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
 
 use crate::db::{INLINE_BODY_LIMIT, ProjectPaths};
-use crate::model::{CapturedRequest, CapturedResponse, FlowId};
+use crate::finding::NewFinding;
+use crate::model::{CapturedRequest, CapturedResponse, FlowId, now_micros};
 
 /// How many events to fold into a single transaction. Purely a bound on how
 /// much work one failed batch can lose.
@@ -89,8 +91,48 @@ pub enum WriteEvent {
         ended_at: i64,
         response: CapturedResponse,
     },
+    /// Set a flow's triage comment and/or highlight. `None` leaves that column
+    /// unchanged; `Some` sets it (an empty string clears it to the empty string).
+    ///
+    /// The reply carries the number of rows changed, so the caller can tell an
+    /// applied annotation from an unknown flow id. If the batch fails to commit
+    /// the sender is dropped, which the caller observes as a closed channel.
+    Annotate {
+        id: FlowId,
+        comment: Option<String>,
+        highlight: Option<String>,
+        reply: oneshot::Sender<u64>,
+    },
+    /// Author a finding. The reply carries the new finding's id, released only
+    /// once the row is durably committed.
+    CreateFinding {
+        finding: Box<NewFinding>,
+        reply: oneshot::Sender<i64>,
+    },
     /// Commit whatever is already queued, then stop. Sent by `shutdown`.
     Stop,
+}
+
+/// A reply that must not be answered until the batch that produced it commits:
+/// handing back a finding id (or an annotation ack) before the write is durable
+/// would let a reader chase a row that a rollback then erased.
+enum Pending {
+    Annotate(oneshot::Sender<u64>, u64),
+    Finding(oneshot::Sender<i64>, i64),
+}
+
+impl Pending {
+    fn fulfil(self) {
+        // A gone receiver just means the caller stopped waiting; nothing to do.
+        match self {
+            Pending::Annotate(tx, rows) => {
+                let _ = tx.send(rows);
+            }
+            Pending::Finding(tx, id) => {
+                let _ = tx.send(id);
+            }
+        }
+    }
 }
 
 /// Handle held by `Engine`.
@@ -200,6 +242,12 @@ fn write_batch(
 ) -> Result<(), WriteError> {
     let tx = conn.transaction()?;
 
+    // Replies held back until the commit below succeeds. If any `?` below fires,
+    // or the commit fails, this vec drops with its senders unanswered, and every
+    // waiting caller sees a closed channel — the correct signal that its write
+    // did not land.
+    let mut pending: Vec<Pending> = Vec::new();
+
     for event in batch {
         match event {
             WriteEvent::Request {
@@ -271,13 +319,63 @@ fn write_batch(
                 )?;
             }
 
+            WriteEvent::Annotate {
+                id,
+                comment,
+                highlight,
+                reply,
+            } => {
+                let rows = annotate(&tx, id, comment.as_deref(), highlight.as_deref())?;
+                pending.push(Pending::Annotate(reply, rows as u64));
+            }
+
+            WriteEvent::CreateFinding { finding, reply } => {
+                let finding_id = crate::finding::insert(&tx, &finding, now_micros())?;
+                pending.push(Pending::Finding(reply, finding_id));
+            }
+
             // Nothing to write; it only exists to break the drain loop.
             WriteEvent::Stop => {}
         }
     }
 
     tx.commit()?;
+
+    // Durable now: release every held-back reply.
+    for reply in pending {
+        reply.fulfil();
+    }
     Ok(())
+}
+
+/// Update a flow's triage columns in place, touching only the ones provided.
+/// Returns the number of rows changed (0 for an unknown id).
+fn annotate(
+    conn: &Connection,
+    id: FlowId,
+    comment: Option<&str>,
+    highlight: Option<&str>,
+) -> rusqlite::Result<usize> {
+    // Build the SET list from whichever columns were supplied, so passing only a
+    // comment does not blank an existing highlight.
+    let mut sets: Vec<&str> = Vec::new();
+    let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+    if let Some(comment) = &comment {
+        sets.push("comment = ?");
+        binds.push(comment);
+    }
+    if let Some(highlight) = &highlight {
+        sets.push("highlight = ?");
+        binds.push(highlight);
+    }
+    if sets.is_empty() {
+        return Ok(0);
+    }
+
+    let id = id as i64;
+    binds.push(&id);
+    let sql = format!("UPDATE flow SET {} WHERE id = ?", sets.join(", "));
+    conn.execute(&sql, rusqlite::params_from_iter(binds))
 }
 
 /// Insert a body if we have not seen these exact bytes before, returning its id.

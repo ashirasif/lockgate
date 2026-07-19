@@ -6,8 +6,10 @@
 pub mod ca;
 pub mod db;
 pub mod engine;
+pub mod finding;
 pub mod model;
 pub mod proxy;
+pub mod read;
 pub mod registry;
 pub mod scope;
 pub mod server;
@@ -16,6 +18,8 @@ pub mod writer;
 
 pub use db::ProjectPaths;
 pub use engine::{Engine, ResendError};
+pub use finding::{Finding, NewFinding};
+pub use read::{BodySlice, FlowDetail, FlowQuery, FlowRow, Side, SitemapNode};
 pub use registry::{Project, Registry};
 pub use scope::{Action, HostKind, Matcher, RuleSpec, Scope, ScopeRule, Target};
 pub use model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary};

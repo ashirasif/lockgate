@@ -11,6 +11,11 @@ use tracing::{error, info, warn};
 
 const LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000);
 
+/// The MCP server binds here; clients connect to `http://127.0.0.1:3001/mcp`.
+/// Loopback only, so captured traffic is never exposed off the machine. A port
+/// beside the proxy's, not stdio, because the TUI owns this process's stdio.
+const MCP_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3001);
+
 /// How long to wait for the writer to drain before giving up on it.
 ///
 /// A stuck writer must not make the process unkillable: ignoring a `kill` sends
@@ -89,6 +94,16 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(async move {
         if let Err(e) = proxy_core::serve(proxy_engine, LISTEN_ADDR).await {
             error!(error = %e, "proxy stopped");
+        }
+    });
+
+    // MCP server shares the same engine, in-process, so there is one SQLite
+    // writer. A failure here (e.g. the port is taken) must not take the proxy or
+    // TUI down: log it and carry on without the MCP.
+    let mcp_engine = engine.clone();
+    tokio::spawn(async move {
+        if let Err(e) = proxy_mcp::serve(mcp_engine, MCP_ADDR).await {
+            error!(error = %e, "MCP server stopped");
         }
     });
 
