@@ -13,7 +13,6 @@ pub mod read;
 pub mod registry;
 pub mod scope;
 pub mod server;
-pub mod store;
 pub mod writer;
 
 pub use db::ProjectPaths;

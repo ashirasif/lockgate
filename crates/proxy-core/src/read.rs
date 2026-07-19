@@ -1,19 +1,275 @@
-//! DB-backed reads for frontends (TUI, MCP).
+//! The database-backed read path for every frontend.
 //!
-//! Capture writes go through the writer task; these are the other direction —
-//! the queries a frontend runs against history. They read from the project
-//! database (not the in-memory store) so they see every capture run, not just
-//! the current one, which is what an agent doing recon on a project expects.
+//! History lives in the project database, never in memory, so both frontends
+//! reconstruct what they need from SQLite here. Two audiences share this module:
 //!
-//! Everything here returns plain owned data (strings, ints, bytes) rather than
-//! `http` types, so the shapes serialise straight to JSON without a frontend
-//! having to know about `Uri`/`HeaderMap`.
+//! - the **TUI**, which wants `model` types (`FlowSummary`, `Flow` with real
+//!   `http` headers and body bytes) — the inverse of `writer.rs`, where
+//!   `decode_header_map` undoes `encode_headers` and `load_body` undoes
+//!   `intern_body`;
+//! - the **MCP**, which wants plain owned data (strings, ints, byte windows)
+//!   that serialises straight to JSON, with bodies fetched as bounded slices so
+//!   a metadata read never drags a 10MB body inline.
+//!
+//! Parsing is deliberately total — a stored method, URI, or version that no
+//! longer round-trips falls back to a sane default rather than failing the whole
+//! read. The bytes were written from valid values, so this is a guard, not a
+//! path we expect to take.
 
 use std::path::Path;
 
+use hudsucker::hyper::body::Bytes;
+use hudsucker::hyper::header::{HeaderName, HeaderValue};
+use hudsucker::hyper::{HeaderMap, Method, StatusCode, Uri, Version};
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
+use tracing::warn;
 
 use crate::db::ProjectPaths;
+use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary};
+use crate::scope::{Matcher, Target};
+
+// ===================================================================
+// TUI reads: reconstruct `model` types from the database.
+// ===================================================================
+
+/// Lightweight history rows in id order, which is also capture order.
+pub fn list_flows(conn: &Connection) -> rusqlite::Result<Vec<FlowSummary>> {
+    conn.prepare("SELECT id, method, uri, status FROM flow ORDER BY id")?
+        .query_map([], |r| {
+            Ok(summary(
+                r.get(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?
+        .collect()
+}
+
+/// The same rows, filtered to the active scope.
+///
+/// Scope is matched against the derived `host` / `port` / `path` columns rather
+/// than the raw `uri`, because a MITM'd HTTPS request stores its target in
+/// origin-form (`/path`) with the host only in a header — the columns already
+/// resolved that at write time.
+pub fn list_flows_in_scope(
+    conn: &Connection,
+    matcher: &Matcher,
+) -> rusqlite::Result<Vec<FlowSummary>> {
+    if matcher.is_unrestricted() {
+        return list_flows(conn);
+    }
+
+    let mut stmt =
+        conn.prepare("SELECT id, method, uri, status, host, port, path FROM flow ORDER BY id")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            summary(
+                r.get(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ),
+            r.get::<_, String>(4)?,
+            r.get::<_, Option<i64>>(5)?.unwrap_or(0) as u16,
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (summary, host, port, path) = row?;
+        if matcher.matches(&Target {
+            host: &host,
+            port,
+            path: &path,
+        }) {
+            out.push(summary);
+        }
+    }
+    Ok(out)
+}
+
+/// A full flow, bodies included — for the detail pane and for Repeater resends,
+/// which need the original request to replay it.
+pub fn get_flow(
+    conn: &Connection,
+    paths: &ProjectPaths,
+    id: FlowId,
+) -> rusqlite::Result<Option<Flow>> {
+    let row = conn
+        .query_row(
+            "SELECT method, uri, http_version, req_headers, req_body_id,
+                    status, resp_headers, resp_body_id, started_at, ended_at
+               FROM flow WHERE id = ?1",
+            [id as i64],
+            |r| {
+                Ok(ReconRow {
+                    method: r.get(0)?,
+                    uri: r.get(1)?,
+                    version: r.get(2)?,
+                    req_headers: r.get(3)?,
+                    req_body_id: r.get(4)?,
+                    status: r.get(5)?,
+                    resp_headers: r.get(6)?,
+                    resp_body_id: r.get(7)?,
+                    started_at: r.get(8)?,
+                    ended_at: r.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+
+    let Some(row) = row else { return Ok(None) };
+
+    let request = CapturedRequest {
+        method: parse_method(&row.method),
+        uri: parse_uri(&row.uri),
+        version: parse_version(&row.version),
+        headers: decode_header_map(&row.req_headers),
+        body: load_body(conn, paths, row.req_body_id)?,
+    };
+
+    let response = match parse_status(row.status) {
+        Some(status) => Some(CapturedResponse {
+            status,
+            // The response's HTTP version is not stored separately; reuse the
+            // request's, which it matches in practice. Nothing displays it, so a
+            // column for it would be pure schema churn.
+            version: parse_version(&row.version),
+            headers: decode_header_map(row.resp_headers.as_deref().unwrap_or_default()),
+            body: load_body(conn, paths, row.resp_body_id)?,
+        }),
+        None => None,
+    };
+
+    Ok(Some(Flow {
+        id,
+        request,
+        response,
+        started_at: row.started_at,
+        ended_at: row.ended_at,
+    }))
+}
+
+struct ReconRow {
+    method: String,
+    uri: String,
+    version: String,
+    req_headers: Vec<u8>,
+    req_body_id: Option<i64>,
+    status: Option<i64>,
+    resp_headers: Option<Vec<u8>>,
+    resp_body_id: Option<i64>,
+    started_at: i64,
+    ended_at: Option<i64>,
+}
+
+fn summary(id: i64, method: String, uri: String, status: Option<i64>) -> FlowSummary {
+    FlowSummary {
+        id: id as FlowId,
+        method: parse_method(&method),
+        uri: parse_uri(&uri),
+        status: parse_status(status),
+    }
+}
+
+/// Load body bytes for a `body` row id. `None` (no body) and a missing spilled
+/// blob both read as empty — the alternative, failing the flow read outright,
+/// helps no one looking at old history.
+fn load_body(
+    conn: &Connection,
+    paths: &ProjectPaths,
+    body_id: Option<i64>,
+) -> rusqlite::Result<Bytes> {
+    let Some(body_id) = body_id else {
+        return Ok(Bytes::new());
+    };
+
+    let row = conn
+        .query_row(
+            "SELECT storage, sha256, data FROM body WHERE id = ?1",
+            [body_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((storage, sha256, data)) = row else {
+        return Ok(Bytes::new());
+    };
+
+    match storage.as_str() {
+        "inline" => Ok(Bytes::from(data.unwrap_or_default())),
+        "file" => match std::fs::read(paths.blob(&sha256)) {
+            Ok(bytes) => Ok(Bytes::from(bytes)),
+            Err(e) => {
+                warn!(error = %e, "spilled body blob is unreadable; showing empty");
+                Ok(Bytes::new())
+            }
+        },
+        // "evicted", or anything a newer writer introduces: nothing to return.
+        _ => Ok(Bytes::new()),
+    }
+}
+
+fn parse_method(s: &str) -> Method {
+    Method::from_bytes(s.as_bytes()).unwrap_or(Method::GET)
+}
+
+fn parse_uri(s: &str) -> Uri {
+    s.parse().unwrap_or_default()
+}
+
+fn parse_status(status: Option<i64>) -> Option<StatusCode> {
+    status.and_then(|n| StatusCode::from_u16(n as u16).ok())
+}
+
+fn parse_version(s: &str) -> Version {
+    match s {
+        "HTTP/0.9" => Version::HTTP_09,
+        "HTTP/1.0" => Version::HTTP_10,
+        "HTTP/2.0" => Version::HTTP_2,
+        "HTTP/3.0" => Version::HTTP_3,
+        // Includes "HTTP/1.1" and anything unrecognised.
+        _ => Version::HTTP_11,
+    }
+}
+
+/// Rebuild a `HeaderMap` from the `name: value\r\n` block `encode_headers`
+/// wrote, preserving order and duplicates. Lines that no longer parse are
+/// skipped rather than fatal.
+fn decode_header_map(blob: &[u8]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for line in blob.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = &line[..colon];
+        let value = &line[colon + 1..];
+        // `encode_headers` writes exactly one space after the colon.
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        if let (Ok(name), Ok(value)) =
+            (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+        {
+            headers.append(name, value);
+        }
+    }
+    headers
+}
+
+// ===================================================================
+// MCP reads: plain owned data, JSON-shaped, bodies as bounded slices.
+// ===================================================================
 
 /// Which half of a flow a body request refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +318,7 @@ pub struct BodySlice {
     /// inline | file | evicted | none. `none` distinguishes an empty/absent body
     /// from one deliberately reclaimed (`evicted`); `bytes` is empty for both.
     pub storage: String,
+    /// The requested window `[offset, offset+limit)`.
     pub bytes: Vec<u8>,
 }
 
@@ -123,9 +380,9 @@ fn row_to_flow(r: &rusqlite::Row) -> rusqlite::Result<FlowRow> {
 
 /// A page of flows, newest first.
 ///
-/// `limit` is clamped by the caller; here we just apply it. Newest-first because
-/// "what just happened" is the common recon question, and offset paging over a
-/// descending id is stable as long as new rows only ever append.
+/// Newest-first because "what just happened" is the common recon question, and
+/// offset paging over a descending id is stable as long as new rows only ever
+/// append.
 pub fn flows(
     conn: &Connection,
     q: &FlowQuery,
@@ -196,11 +453,11 @@ pub fn flow_detail(conn: &Connection, id: i64) -> rusqlite::Result<Option<FlowDe
                     row,
                     http_version,
                     parent_id,
-                    req_headers: decode_headers(&req_headers),
+                    req_headers: header_pairs(&req_headers),
                     req_body_len: req_body_len.unwrap_or(0),
                     resp_headers: resp_headers
                         .as_deref()
-                        .map(decode_headers)
+                        .map(header_pairs)
                         .unwrap_or_default(),
                     resp_body_len: resp_body_len.unwrap_or(0),
                 })
@@ -348,28 +605,68 @@ pub fn sitemap(
     .collect()
 }
 
-/// Decode a stored header block (`name: value\r\n` repeated) back into pairs.
+/// Decode a stored header block into `(name, value)` pairs for JSON.
 ///
-/// Names are already lowercased and original casing is gone (see `writer.rs`).
-/// Values that were not valid UTF-8 come back lossily rather than dropping the
-/// header, so a malformed value stays visible instead of vanishing.
-fn decode_headers(blob: &[u8]) -> Vec<(String, String)> {
-    blob.split(|&b| b == b'\n')
-        .filter_map(|line| {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.is_empty() {
-                return None;
-            }
-            let pos = line.iter().position(|&b| b == b':')?;
-            let name = String::from_utf8_lossy(&line[..pos]).trim().to_string();
-            // Skip the ": " separator; tolerate a bare ":" with no space.
-            let value_start = if line.get(pos + 1) == Some(&b' ') {
-                pos + 2
-            } else {
-                pos + 1
-            };
-            let value = String::from_utf8_lossy(&line[value_start..]).to_string();
-            Some((name, value))
+/// Built on `decode_header_map` so the two decoders cannot drift; the map form
+/// already preserves order and duplicates, which `iter` then walks in order.
+fn header_pairs(blob: &[u8]) -> Vec<(String, String)> {
+    decode_header_map(blob)
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headers_round_trip_through_encode_decode() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.append("set-cookie", "a=1".parse().unwrap());
+        headers.append("set-cookie", "b=2".parse().unwrap());
+
+        let encoded = crate::writer::encode_headers(&headers);
+        let decoded = decode_header_map(&encoded);
+
+        assert_eq!(decoded.get("content-type").unwrap(), "application/json");
+        let cookies: Vec<_> = decoded.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies, vec!["a=1", "b=2"], "order and duplicates preserved");
+    }
+
+    #[test]
+    fn header_pairs_preserve_order_and_duplicates() {
+        let mut headers = HeaderMap::new();
+        headers.append("set-cookie", "a=1".parse().unwrap());
+        headers.append("set-cookie", "b=2".parse().unwrap());
+        let encoded = crate::writer::encode_headers(&headers);
+
+        let pairs = header_pairs(&encoded);
+        assert_eq!(
+            pairs,
+            vec![
+                ("set-cookie".to_string(), "a=1".to_string()),
+                ("set-cookie".to_string(), "b=2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn versions_round_trip() {
+        for v in [
+            Version::HTTP_09,
+            Version::HTTP_10,
+            Version::HTTP_11,
+            Version::HTTP_2,
+            Version::HTTP_3,
+        ] {
+            assert_eq!(parse_version(&format!("{v:?}")), v);
+        }
+    }
 }

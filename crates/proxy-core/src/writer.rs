@@ -234,7 +234,9 @@ fn run(
     }
 }
 
-fn write_batch(
+/// Apply a batch of events in one transaction. Shared by the async writer loop
+/// and `Engine`'s synchronous in-memory path, so both persist identically.
+pub(crate) fn write_batch(
     conn: &mut Connection,
     paths: &ProjectPaths,
     run_id: i64,
@@ -495,7 +497,7 @@ fn upsert_node(
 /// Serialise a header block back to its wire form, preserving order and
 /// duplicates. Original casing is *not* preserved: `HeaderMap` lowercases names
 /// on parse, so it is already gone before we see it.
-fn encode_headers(headers: &HeaderMap) -> Vec<u8> {
+pub(crate) fn encode_headers(headers: &HeaderMap) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, value) in headers {
         out.extend_from_slice(name.as_str().as_bytes());

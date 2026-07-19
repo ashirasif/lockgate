@@ -335,6 +335,17 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// A migrated in-memory database, backing `Engine::new`. Nothing survives the
+/// process, and there is no WAL (it is meaningless for `:memory:`): the engine
+/// writes to it synchronously on one connection, so the record→read contract the
+/// tests rely on holds without a background writer.
+pub fn open_memory() -> rusqlite::Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    migrate(&conn, MIGRATIONS, SCHEMA_VERSION)?;
+    Ok(conn)
+}
+
 pub(crate) fn migrate(
     conn: &Connection,
     migrations: &[&str],

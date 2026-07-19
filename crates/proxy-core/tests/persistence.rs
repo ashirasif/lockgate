@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use hudsucker::hyper::{HeaderMap, Method, StatusCode, Uri, Version, body::Bytes};
 use proxy_core::{CapturedRequest, CapturedResponse, Engine};
 
@@ -237,6 +239,105 @@ async fn large_bodies_spill_to_disk() {
         blobs[0].extension().is_none_or(|e| e != "tmp"),
         "temp file was left behind: {blobs:?}"
     );
+}
+
+/// The refactor's payoff: reads come from SQLite, so a fresh engine over an
+/// existing project sees the prior run's history — and reconstructs each flow
+/// (headers, duplicates, bodies, status) faithfully through the `Engine` API the
+/// TUI and MCP use, not just as raw rows.
+#[tokio::test]
+async fn reads_reconstruct_flows_across_a_reopen() {
+    let path = temp_project("read-reopen");
+
+    let id = {
+        let engine = Engine::open_project(&path).unwrap();
+        let id = engine.record_request(request("http://example.com/a?q=1", "hello"));
+        engine.record_response(id, response("<html/>"));
+        engine.shutdown().await;
+        id
+    };
+
+    // A brand-new engine, as if the app were relaunched on the same project.
+    let engine = Engine::open_project(&path).unwrap();
+
+    let summaries = engine.list_flows();
+    assert_eq!(summaries.len(), 1, "prior-run history should be visible");
+    let summary = &summaries[0];
+    assert_eq!(summary.id, id);
+    assert_eq!(summary.method, Method::POST);
+    assert_eq!(summary.status, Some(StatusCode::OK));
+
+    let flow = engine.get_flow(id).expect("flow reconstructs from disk");
+    assert_eq!(flow.request.method, Method::POST);
+    assert_eq!(
+        flow.request.uri,
+        "http://example.com/a?q=1".parse::<Uri>().unwrap()
+    );
+    assert_eq!(flow.request.body, Bytes::from_static(b"hello"));
+
+    // Duplicate request headers survive reconstruction, in order.
+    let dup: Vec<_> = flow.request.headers.get_all("x-dup").iter().collect();
+    assert_eq!(dup, vec!["one", "two"], "duplicate headers must round-trip");
+
+    let resp = flow.response.expect("response reconstructs");
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.body, Bytes::from_static(b"<html/>"));
+    assert_eq!(
+        resp.headers.get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+
+    engine.shutdown().await;
+}
+
+/// A body too large to inline lives in `blobs/`; the read path must fetch it
+/// back from disk, not just from the SQLite row.
+#[tokio::test]
+async fn reads_reconstruct_spilled_bodies() {
+    let path = temp_project("read-spill");
+    let big = "x".repeat(6 * 1024 * 1024);
+
+    let id = {
+        let engine = Engine::open_project(&path).unwrap();
+        let id = engine.record_request(request("http://example.com/download", "req"));
+        engine.record_response(id, response(&big));
+        engine.shutdown().await;
+        id
+    };
+
+    let engine = Engine::open_project(&path).unwrap();
+    let flow = engine.get_flow(id).expect("flow reconstructs");
+    let resp = flow.response.expect("response reconstructs");
+    assert_eq!(resp.body.len(), big.len(), "spilled body read back from blobs/");
+    assert_eq!(resp.body, Bytes::from(big));
+
+    engine.shutdown().await;
+}
+
+/// A response that never arrived reads back as an in-flight flow, not a
+/// fabricated empty response.
+#[tokio::test]
+async fn reads_leave_pending_flows_without_a_response() {
+    let path = temp_project("read-pending");
+    let engine = Engine::open_project(&path).unwrap();
+
+    let id = engine.record_request(request("http://example.com/slow", "req"));
+
+    // No shutdown — poll the engine's own reader until the request commits.
+    let mut flow = None;
+    for _ in 0..100 {
+        if let Some(f) = engine.get_flow(id) {
+            flow = Some(f);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let flow = flow.expect("request should reach the reader");
+    assert!(flow.response.is_none(), "no response was recorded");
+    assert!(flow.ended_at.is_none(), "an in-flight flow has no end time");
+
+    engine.shutdown().await;
 }
 
 /// The sitemap is materialised as a host -> dir -> leaf tree by the writer,

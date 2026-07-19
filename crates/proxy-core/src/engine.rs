@@ -1,54 +1,70 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
 use hudsucker::hyper::header::HOST;
 
-use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary, now_micros};
-use crate::store::FlowStore;
-use tokio::sync::oneshot;
-use tracing::error;
 use crate::db::ProjectPaths;
 use crate::finding::{Finding, NewFinding};
+use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary, now_micros};
 use crate::read::{self, BodySlice, FlowDetail, FlowQuery, FlowRow, Side, SitemapNode};
 use crate::scope::{Matcher, Target};
-use crate::writer::{Source, WriteEvent, WriteHandle};
+use crate::writer::{Source, WriteEvent, WriteHandle, write_batch};
+use tokio::sync::oneshot;
+use tracing::error;
 
 /// The seam. Owns all proxy state and defines every verb the frontends
 /// (proxy handlers, TUI, MCP) are allowed to perform. Frontends hold an
-/// `Arc<Engine>` and call these methods — they never touch the store directly.
+/// `Arc<Engine>` and call these methods — they never touch persistence directly.
+///
+/// History lives in the project database, not in memory: the engine keeps no
+/// captured bodies resident, so a long session's memory is bounded by the id
+/// counter, not by how much traffic flowed. Reads reconstruct flows from SQLite
+/// (see `read.rs`); every write goes through `Persist`.
 pub struct Engine {
-    store: FlowStore,
+    /// Flow ids are handed out here, synchronously — the proxy handler needs an
+    /// id the instant a request arrives, long before it reaches the disk.
+    next_id: AtomicU64,
     /// One reused client (and its connection pool) for all Repeater resends.
     http: reqwest::Client,
-    /// `None` when running purely in memory (tests, `Engine::new`).
-    writer: Option<WriteHandle>,
-    /// A second connection for reads. The writer owns its own on a blocking
-    /// thread, and WAL mode lets readers run concurrently with it. `Connection`
-    /// is `Send` but not `Sync`, hence the mutex; every read locks briefly and
-    /// never holds the guard across an await.
-    read: Option<Mutex<Connection>>,
-    /// Where the project's files live. Held so body reads can locate spilled
-    /// blobs (`blobs/`); `None` for in-memory engines.
-    paths: Option<ProjectPaths>,
+    persist: Persist,
 }
 
-/// A write that goes through the single writer task failed to land.
+/// How captured traffic is stored, and where reads come from.
+enum Persist {
+    /// Production. Writes go to the background writer (capture never waits on the
+    /// disk); reads use a second WAL connection that runs concurrently with it.
+    /// `Connection` is `Send` but not `Sync`, hence the mutex — every read locks
+    /// briefly and never holds the guard across an await.
+    Async {
+        writer: WriteHandle,
+        read: Mutex<Connection>,
+        paths: ProjectPaths,
+    },
+    /// In-memory, for `Engine::new` and tests. A single connection written
+    /// *synchronously*, so a recorded flow is visible to the very next read with
+    /// no runtime or background writer in play — which is the contract the
+    /// synchronous `record → read → assert` tests depend on.
+    Memory {
+        conn: Mutex<Connection>,
+        run_id: i64,
+        paths: ProjectPaths,
+    },
+}
+
+/// A write routed through persistence did not commit. Every write goes through
+/// the one writer, so the only failure a caller sees is the reply channel
+/// closing before the batch committed.
 #[derive(Debug)]
 pub enum WriteError {
-    /// The engine is in-memory (tests, `Engine::new`): there is no project to
-    /// write to.
-    NoProject,
-    /// The writer rejected or dropped the event before it committed — the write
-    /// did not happen.
     Dropped,
 }
 
 impl std::fmt::Display for WriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteError::NoProject => write!(f, "no project database is open"),
             WriteError::Dropped => write!(f, "the write did not commit"),
         }
     }
@@ -75,20 +91,27 @@ impl From<reqwest::Error> for ResendError {
 }
 
 impl Engine {
-    /// In-memory only: nothing survives the process.
+    /// In-memory only: nothing survives the process. Backed by an in-memory
+    /// database written synchronously, so reads see writes immediately.
     pub fn new() -> Arc<Self> {
+        let conn = crate::db::open_memory().expect("open in-memory project database");
+        let run_id = crate::db::begin_run(&conn, now_micros()).expect("begin capture run");
         Arc::new(Self {
-            store: FlowStore::new(),
+            next_id: AtomicU64::new(0),
             http: reqwest::Client::new(),
-            writer: None,
-            read: None,
-            paths: None,
+            persist: Persist::Memory {
+                conn: Mutex::new(conn),
+                run_id,
+                // A body large enough to spill (>5MB) would land here; tests
+                // never produce one, so this directory is never created.
+                paths: ProjectPaths::new(std::env::temp_dir()),
+            },
         })
     }
 
     /// Back this engine with a project on disk, creating and migrating it as
-    /// needed. Flows still land in memory first; the database is written behind
-    /// a channel so capture never waits on the disk.
+    /// needed. The database is written behind a channel so capture never waits
+    /// on the disk, and read concurrently through a second WAL connection.
     ///
     /// Opening a project starts a new `capture_run` within it; history from
     /// previous runs stays and flow ids continue past it.
@@ -98,11 +121,13 @@ impl Engine {
         // Opened after the writer, so the schema is already migrated.
         let read = crate::db::open(&paths.db())?;
         Ok(Arc::new(Self {
-            store: FlowStore::with_next_id(next_id),
+            next_id: AtomicU64::new(next_id),
             http: reqwest::Client::new(),
-            writer: Some(writer),
-            read: Some(Mutex::new(read)),
-            paths: Some(paths),
+            persist: Persist::Async {
+                writer,
+                read: Mutex::new(read),
+                paths,
+            },
         }))
     }
 
@@ -118,33 +143,44 @@ impl Engine {
         source: Source,
         parent_id: Option<FlowId>,
     ) -> FlowId {
+        // Allocated before the row exists on disk: `handle_request` needs the id
+        // synchronously to correlate the response that follows.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let started_at = now_micros();
-        // The id is allocated in memory because `handle_request` needs it
-        // synchronously, long before the writer task reaches the disk.
-        let id = self.store.add_request(request.clone(), started_at);
-
-        if let Some(writer) = &self.writer {
-            writer.send(WriteEvent::Request {
-                id,
-                source,
-                parent_id,
-                started_at,
-                request,
-            });
-        }
+        self.write(WriteEvent::Request {
+            id,
+            source,
+            parent_id,
+            started_at,
+            request,
+        });
         id
     }
 
     pub fn record_response(&self, id: FlowId, response: CapturedResponse) {
         let ended_at = now_micros();
-        self.store.attach_response(id, response.clone(), ended_at);
+        self.write(WriteEvent::Response {
+            id,
+            ended_at,
+            response,
+        });
+    }
 
-        if let Some(writer) = &self.writer {
-            writer.send(WriteEvent::Response {
-                id,
-                ended_at,
-                response,
-            });
+    /// Persist one event: enqueued for the background writer in production, or
+    /// applied synchronously to the in-memory database in tests.
+    fn write(&self, event: WriteEvent) {
+        match &self.persist {
+            Persist::Async { writer, .. } => writer.send(event),
+            Persist::Memory {
+                conn, run_id, paths, ..
+            } => {
+                let mut conn = conn.lock().unwrap();
+                if let Err(e) = write_batch(&mut conn, paths, *run_id, vec![event]) {
+                    // Matches the async writer's stance: a lost event beats a
+                    // panic on the capture path.
+                    error!(error = %e, "failed to persist event");
+                }
+            }
         }
     }
 
@@ -154,7 +190,7 @@ impl Engine {
     /// task, so anything still queued dies with the process otherwise. A no-op
     /// for in-memory engines, and safe to call more than once.
     pub async fn shutdown(&self) {
-        if let Some(writer) = &self.writer {
+        if let Persist::Async { writer, .. } = &self.persist {
             writer.shutdown().await;
         }
     }
@@ -162,20 +198,47 @@ impl Engine {
     // --- control verbs (called by TUI / MCP) ---
 
     pub fn list_flows(&self) -> Vec<FlowSummary> {
-        self.store.list()
+        self.read(read::list_flows)
     }
 
-    /// Run `f` against the project database. `None` for in-memory engines.
+    /// The connection reads go through: the dedicated WAL reader in production,
+    /// or the single in-memory connection in tests.
+    fn read_conn(&self) -> &Mutex<Connection> {
+        match &self.persist {
+            Persist::Async { read, .. } => read,
+            Persist::Memory { conn, .. } => conn,
+        }
+    }
+
+    fn paths(&self) -> &ProjectPaths {
+        match &self.persist {
+            Persist::Async { paths, .. } | Persist::Memory { paths, .. } => paths,
+        }
+    }
+
+    /// Run a read against the database, logging and returning the default on
+    /// error — a failed history query must not take a frontend down.
+    fn read<T: Default>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> T {
+        let conn = self.read_conn().lock().unwrap();
+        f(&conn).unwrap_or_else(|e| {
+            error!(error = %e, "database read failed");
+            T::default()
+        })
+    }
+
+    /// Run `f` against the project database.
     ///
     /// The closure form keeps the guard from escaping, so a caller cannot hold
-    /// the connection lock across an await by accident.
+    /// the connection lock across an await by accident. Always `Some` now that
+    /// even the in-memory engine is database-backed; the `Option` stays so
+    /// callers built around a possibly-absent database keep compiling.
     pub fn with_db<T>(&self, f: impl FnOnce(&Connection) -> T) -> Option<T> {
-        let conn = self.read.as_ref()?.lock().unwrap();
+        let conn = self.read_conn().lock().unwrap();
         Some(f(&conn))
     }
 
     /// The compiled matcher for the active scope, or unrestricted if no scope is
-    /// active or the engine has no database.
+    /// active.
     pub fn scope_matcher(&self) -> Matcher {
         self.with_db(crate::scope::active_matcher)
             .transpose()
@@ -191,29 +254,17 @@ impl Engine {
 
     /// History filtered to the active scope.
     ///
-    /// Scope is applied here rather than stored on each flow: it is mutable, so
-    /// a column would mean rewriting every row whenever a rule changes.
+    /// Scope is applied at read time rather than stored on each flow: it is
+    /// mutable, so a column would mean rewriting every row whenever a rule
+    /// changes.
     pub fn list_flows_in_scope(&self) -> Vec<FlowSummary> {
         let matcher = self.scope_matcher();
-        let flows = self.store.list();
-        if matcher.is_unrestricted() {
-            return flows;
-        }
-        flows
-            .into_iter()
-            .filter(|flow| {
-                let (host, port, path) = summary_target(flow);
-                matcher.matches(&Target {
-                    host: &host,
-                    port,
-                    path: &path,
-                })
-            })
-            .collect()
+        self.read(|conn| read::list_flows_in_scope(conn, &matcher))
     }
 
     pub fn get_flow(&self, id: FlowId) -> Option<Flow> {
-        self.store.get(id)
+        let paths = self.paths().clone();
+        self.read(|conn| read::get_flow(conn, &paths, id))
     }
 
     /// Replay a captured request straight at the target (not back through us),
@@ -222,7 +273,7 @@ impl Engine {
     /// The replay is itself recorded as a new flow carrying `parent_id = id`,
     /// so a send and its origin stay linked instead of the result vanishing.
     pub async fn resend(&self, id: FlowId) -> Result<CapturedResponse, ResendError> {
-        let flow = self.store.get(id).ok_or(ResendError::NotFound(id))?;
+        let flow = self.get_flow(id).ok_or(ResendError::NotFound(id))?;
         let req = flow.request;
         let url = target_url(&req).ok_or(ResendError::NoTarget)?;
 
@@ -269,85 +320,48 @@ impl Engine {
 
     // --- read verbs backed by the project database (used by the MCP) ---
     //
-    // These read history from SQLite rather than the in-memory store, so they
-    // span every capture run in the project, not just the current one. All
-    // return `None`/empty for an in-memory engine, which has no database.
+    // These read the same history the TUI verbs do, spanning every capture run
+    // in the project. They return plain owned data shaped for JSON.
 
     /// A page of flow rows (no bodies), newest first, matching `query`.
     pub fn query_flows(&self, query: &FlowQuery, offset: i64, limit: i64) -> Vec<FlowRow> {
-        self.with_db(|conn| read::flows(conn, query, offset, limit))
-            .transpose()
-            .unwrap_or_else(|e| {
-                error!(error = %e, "query_flows failed");
-                None
-            })
-            .unwrap_or_default()
+        self.read(|conn| read::flows(conn, query, offset, limit))
     }
 
     /// Full metadata for one flow (headers, body lengths), or `None` if there is
     /// no such flow. Bodies are fetched separately via [`Engine::body_slice`].
     pub fn flow_detail(&self, id: i64) -> Option<FlowDetail> {
-        self.with_db(|conn| read::flow_detail(conn, id))
-            .transpose()
-            .unwrap_or_else(|e| {
-                error!(error = %e, "flow_detail failed");
-                None
-            })
-            .flatten()
+        self.read(|conn| read::flow_detail(conn, id))
     }
 
     /// A window into a flow's request or response body. `None` if the flow does
     /// not exist; a `BodySlice` with `storage == "none"` if it exists but has no
     /// body on that side.
     pub fn body_slice(&self, id: i64, side: Side, offset: i64, limit: i64) -> Option<BodySlice> {
-        let blobs = self.paths.as_ref()?.blobs();
-        self.with_db(|conn| read::body_slice(conn, &blobs, id, side, offset, limit))
-            .transpose()
-            .unwrap_or_else(|e| {
-                error!(error = %e, "body_slice failed");
-                None
-            })
-            .flatten()
+        let blobs = self.paths().blobs();
+        self.read(|conn| read::body_slice(conn, &blobs, id, side, offset, limit))
     }
 
     /// Sitemap nodes, optionally scoped to one host, ordered parent-before-child.
     pub fn sitemap(&self, host: Option<&str>, offset: i64, limit: i64) -> Vec<SitemapNode> {
-        self.with_db(|conn| read::sitemap(conn, host, offset, limit))
-            .transpose()
-            .unwrap_or_else(|e| {
-                error!(error = %e, "sitemap failed");
-                None
-            })
-            .unwrap_or_default()
+        self.read(|conn| read::sitemap(conn, host, offset, limit))
     }
 
     /// Every finding in the project, newest first.
     pub fn list_findings(&self) -> Vec<Finding> {
-        self.with_db(crate::finding::list)
-            .transpose()
-            .unwrap_or_else(|e| {
-                error!(error = %e, "list_findings failed");
-                None
-            })
-            .unwrap_or_default()
+        self.read(crate::finding::list)
     }
 
     /// One finding by id, or `None` if absent.
     pub fn get_finding(&self, id: i64) -> Option<Finding> {
-        self.with_db(|conn| crate::finding::get(conn, id))
-            .transpose()
-            .unwrap_or_else(|e| {
-                error!(error = %e, "get_finding failed");
-                None
-            })
-            .flatten()
+        self.read(|conn| crate::finding::get(conn, id))
     }
 
-    // --- write verbs routed through the single writer task (used by the MCP) ---
+    // --- write verbs routed through persistence (used by the MCP) ---
     //
-    // Every database write in the process goes through the writer, so these hand
-    // the work off on the channel and await a reply that is released only once
-    // the batch commits. A closed reply channel means the write did not land.
+    // Every database write in the process goes through `write`, so these hand the
+    // work off and await a reply released only once the batch commits. A closed
+    // reply channel means the write did not land.
 
     /// Set a flow's triage comment and/or highlight. `None` leaves that field
     /// unchanged. Returns the number of rows changed — 0 for an unknown id.
@@ -357,9 +371,8 @@ impl Engine {
         comment: Option<String>,
         highlight: Option<String>,
     ) -> Result<u64, WriteError> {
-        let writer = self.writer.as_ref().ok_or(WriteError::NoProject)?;
         let (reply, rx) = oneshot::channel();
-        writer.send(WriteEvent::Annotate {
+        self.write(WriteEvent::Annotate {
             id,
             comment,
             highlight,
@@ -370,9 +383,8 @@ impl Engine {
 
     /// Author a finding, returning its new id once the row is durably committed.
     pub async fn create_finding(&self, finding: NewFinding) -> Result<i64, WriteError> {
-        let writer = self.writer.as_ref().ok_or(WriteError::NoProject)?;
         let (reply, rx) = oneshot::channel();
-        writer.send(WriteEvent::CreateFinding {
+        self.write(WriteEvent::CreateFinding {
             finding: Box::new(finding),
             reply,
         });
@@ -428,16 +440,4 @@ fn target_url(req: &CapturedRequest) -> Option<String> {
         .map(|pq| pq.as_str())
         .unwrap_or("/");
     Some(format!("https://{host}{path}"))
-}
-
-/// Pull the scope-relevant parts out of a summary row.
-///
-/// The port is resolved from the scheme when the URI omits it, matching what the
-/// writer stores, so a port rule means the same thing either way.
-fn summary_target(flow: &FlowSummary) -> (String, u16, String) {
-    let host = flow.uri.host().unwrap_or_default().to_string();
-    let https = flow.uri.scheme_str() != Some("http");
-    let port = flow.uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-    let path = flow.uri.path().to_string();
-    (host, port, path)
 }
