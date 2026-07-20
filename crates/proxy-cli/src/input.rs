@@ -25,6 +25,9 @@ pub enum Mode {
     /// The Cmd-K command palette is open: keys filter and pick from a list
     /// instead of moving a cursor.
     Palette,
+    /// Typing into an editable message buffer (a Repeater request, a held
+    /// item). Every printable key is text, as in vim.
+    Insert,
 }
 
 impl Mode {
@@ -35,6 +38,7 @@ impl Mode {
             Mode::Visual => "VISUAL",
             Mode::Command => "COMMAND",
             Mode::Palette => "PALETTE",
+            Mode::Insert => "INSERT",
         }
     }
 }
@@ -82,6 +86,10 @@ pub enum Window {
     Proxy,
     /// Replay a single request and read the fresh response.
     Repeater,
+    /// Traffic held in flight, awaiting forward or drop.
+    Intercept,
+    /// The tree of what has been seen: host, then path.
+    Sitemap,
     /// A decomposed view of one flow — headers, params, cookies, timing.
     Inspect,
     /// Batch and automation scaffolding built on top of a base request set.
@@ -90,9 +98,11 @@ pub enum Window {
 
 impl Window {
     /// Left-to-right tab order, and the set `gt` / `gT` cycle through.
-    pub const ALL: [Window; 4] = [
+    pub const ALL: [Window; 6] = [
         Window::Proxy,
+        Window::Intercept,
         Window::Repeater,
+        Window::Sitemap,
         Window::Inspect,
         Window::Automate,
     ];
@@ -101,17 +111,23 @@ impl Window {
     pub fn label(self) -> &'static str {
         match self {
             Window::Proxy => "Proxy",
+            Window::Intercept => "Intercept",
             Window::Repeater => "Repeater",
+            Window::Sitemap => "Sitemap",
             Window::Inspect => "Inspect",
             Window::Automate => "Automate",
         }
     }
 
     /// The single key that jumps straight here, shown in the tab strip.
+    ///
+    /// `C` for Intercept: `I` is Inspect, and vim spends `i` on insert.
     pub fn key(self) -> char {
         match self {
             Window::Proxy => 'P',
+            Window::Intercept => 'C',
             Window::Repeater => 'R',
+            Window::Sitemap => 'S',
             Window::Inspect => 'I',
             Window::Automate => 'A',
         }
@@ -142,6 +158,23 @@ pub enum PaletteKey {
     Accept,
     /// Dismiss without running anything.
     Cancel,
+}
+
+/// A keystroke while an editable buffer has focus. Like [`PaletteKey`], this
+/// reports the gesture without knowing what is being edited — the buffer itself
+/// is the app's business.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertKey {
+    Char(char),
+    Backspace,
+    Delete,
+    Newline,
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
 }
 
 /// What the input layer decided the user asked for.
@@ -175,6 +208,20 @@ pub enum Action {
     WindowStep(isize),
     /// Something happened to the Cmd-K palette (opened, filtered, picked…).
     Palette(PaletteKey),
+    /// A keystroke into the focused editable buffer.
+    Insert(InsertKey),
+    /// `<Space>f` / `<Space>d` — answer the selected held item.
+    Forward,
+    Drop,
+    /// `<Space>F` / `<Space>D` — answer every held item at once.
+    ForwardAll,
+    DropAll,
+    /// `<Space>i` — turn interception on or off.
+    ToggleIntercept,
+    /// `<Space>s` — snapshot the selection into the Repeater for editing.
+    SendToRepeater,
+    /// `<CR>` on a sitemap row — fold or unfold it.
+    Toggle,
 }
 
 /// One entry in the keymap. Kept free of counts and arguments so the table can
@@ -197,6 +244,13 @@ enum Bind {
     WindowStep(isize),
     /// Open the Cmd-K command palette.
     Palette,
+    Forward,
+    Drop,
+    ForwardAll,
+    DropAll,
+    ToggleIntercept,
+    SendToRepeater,
+    Toggle,
 }
 
 /// The keymap is data, not control flow, so that `:map` can later rewrite it
@@ -240,12 +294,27 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     ("?", Bind::Prompt('?')),
     // Leader. Application verbs live here so they never shadow vim's own keys.
     ("<Space>r", Bind::Resend),
+    ("<Space>s", Bind::SendToRepeater),
+    // Intercept verdicts. Lowercase answers one item, uppercase answers them
+    // all — the same shift-widens-the-scope shape as `<Space>r` over a visual
+    // selection.
+    ("<Space>f", Bind::Forward),
+    ("<Space>d", Bind::Drop),
+    ("<Space>F", Bind::ForwardAll),
+    ("<Space>D", Bind::DropAll),
+    ("<Space>i", Bind::ToggleIntercept),
+    // `i` starts insert, exactly as in vim — there is something to edit now.
+    ("i", Bind::Mode(Mode::Insert)),
+    ("<CR>", Bind::Toggle),
     // Windows. In a text editor these uppercase keys are Replace / Insert /
-    // Append — but this is a proxy, there is nothing to edit in place, so we
-    // spend them on the one navigation a proxy needs constantly: jumping between
-    // tools. `gt` / `gT` still cycle the way vim cycles tabs.
+    // Append — but jumping between tools is the navigation a proxy needs
+    // constantly, so they are spent here. `gt` / `gT` still cycle the way vim
+    // cycles tabs. Lowercase `i` stays vim's insert, which is why Intercept
+    // takes `C`.
     ("P", Bind::Window(Window::Proxy)),
+    ("C", Bind::Window(Window::Intercept)),
     ("R", Bind::Window(Window::Repeater)),
+    ("S", Bind::Window(Window::Sitemap)),
     ("I", Bind::Window(Window::Inspect)),
     ("A", Bind::Window(Window::Automate)),
     ("gt", Bind::WindowStep(1)),
@@ -298,8 +367,40 @@ impl Input {
         match self.mode {
             Mode::Command => self.feed_command(key),
             Mode::Palette => self.feed_palette(key),
+            Mode::Insert => self.feed_insert(key),
             Mode::Normal | Mode::Visual => self.feed_normal(key),
         }
+    }
+
+    // --- insert ---
+
+    /// While a buffer is being edited every printable key is text. Only Escape
+    /// leaves, which is the whole contract vim muscle memory expects.
+    fn feed_insert(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let gesture = match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                return Some(Action::ModeChange(Mode::Normal));
+            }
+            KeyCode::Backspace => InsertKey::Backspace,
+            KeyCode::Delete => InsertKey::Delete,
+            KeyCode::Enter => InsertKey::Newline,
+            KeyCode::Left => InsertKey::Left,
+            KeyCode::Right => InsertKey::Right,
+            KeyCode::Up => InsertKey::Up,
+            KeyCode::Down => InsertKey::Down,
+            KeyCode::Home => InsertKey::LineStart,
+            KeyCode::End => InsertKey::LineEnd,
+            // Readline's line motions, the two that are worth having in a box
+            // with no word motions.
+            KeyCode::Char('a') if ctrl => InsertKey::LineStart,
+            KeyCode::Char('e') if ctrl => InsertKey::LineEnd,
+            KeyCode::Tab => InsertKey::Char('\t'),
+            KeyCode::Char(c) if !ctrl => InsertKey::Char(c),
+            _ => return None,
+        };
+        Some(Action::Insert(gesture))
     }
 
     // --- command palette ---
@@ -394,6 +495,13 @@ impl Input {
                 return None;
             }
             Bind::Resend => Action::Resend,
+            Bind::Forward => Action::Forward,
+            Bind::Drop => Action::Drop,
+            Bind::ForwardAll => Action::ForwardAll,
+            Bind::DropAll => Action::DropAll,
+            Bind::ToggleIntercept => Action::ToggleIntercept,
+            Bind::SendToRepeater => Action::SendToRepeater,
+            Bind::Toggle => Action::Toggle,
             Bind::Window(window) => Action::Window(window),
             Bind::WindowStep(direction) => Action::WindowStep(direction),
             // Enter palette mode and tell the app to start with a clean filter.
@@ -759,9 +867,11 @@ mod tests {
     }
 
     /// The keys vim reserves must stay reserved, or muscle memory starts lying.
+    /// `i` has left this list: there are editable buffers now, and it does in
+    /// here exactly what it does in vim.
     #[test]
     fn vim_reserved_keys_are_unbound() {
-        for key in ["q", "r", "i", "x", "d", "c", "y", "p"] {
+        for key in ["q", "r", "x", "d", "c", "y", "p"] {
             let mut input = Input::new();
             assert!(
                 feed(&mut input, key).is_empty(),
@@ -779,9 +889,56 @@ mod tests {
     #[test]
     fn uppercase_keys_jump_to_windows() {
         assert_eq!(last("P"), Action::Window(Window::Proxy));
+        assert_eq!(last("C"), Action::Window(Window::Intercept));
         assert_eq!(last("R"), Action::Window(Window::Repeater));
+        assert_eq!(last("S"), Action::Window(Window::Sitemap));
         assert_eq!(last("I"), Action::Window(Window::Inspect));
         assert_eq!(last("A"), Action::Window(Window::Automate));
+    }
+
+    /// `i` is vim's insert, and must stay it — Intercept takes `C` precisely so
+    /// this key is free.
+    #[test]
+    fn i_enters_insert_mode_and_escape_leaves() {
+        let mut input = Input::new();
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Char('i'))),
+            Some(Action::ModeChange(Mode::Insert))
+        );
+        assert_eq!(input.mode(), Mode::Insert);
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Esc)),
+            Some(Action::ModeChange(Mode::Normal))
+        );
+        assert_eq!(input.mode(), Mode::Normal);
+    }
+
+    /// In Insert mode the keymap stops applying: `j` is a letter, not a motion.
+    #[test]
+    fn insert_mode_takes_printable_keys_as_text() {
+        let mut input = Input::new();
+        input.feed(KeyEvent::from(KeyCode::Char('i')));
+        for c in ['j', 'G', ':', ' '] {
+            assert_eq!(
+                input.feed(KeyEvent::from(KeyCode::Char(c))),
+                Some(Action::Insert(InsertKey::Char(c))),
+                "{c} should be text in insert mode"
+            );
+        }
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Enter)),
+            Some(Action::Insert(InsertKey::Newline))
+        );
+    }
+
+    #[test]
+    fn leader_answers_held_traffic() {
+        assert_eq!(last(" f"), Action::Forward);
+        assert_eq!(last(" d"), Action::Drop);
+        assert_eq!(last(" F"), Action::ForwardAll);
+        assert_eq!(last(" D"), Action::DropAll);
+        assert_eq!(last(" i"), Action::ToggleIntercept);
+        assert_eq!(last(" s"), Action::SendToRepeater);
     }
 
     /// `gt` / `gT` cycle tabs, and must not disturb `gg`, whose prefix they share.
@@ -800,7 +957,7 @@ mod tests {
 
     #[test]
     fn windows_cycle_and_wrap_in_tab_order() {
-        assert_eq!(Window::Proxy.step(1), Window::Repeater);
+        assert_eq!(Window::Proxy.step(1), Window::Intercept);
         assert_eq!(
             Window::Automate.step(1),
             Window::Proxy,

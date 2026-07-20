@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hudsucker::hyper::{HeaderMap, StatusCode};
-use proxy_core::{Engine, Flow, FlowSummary};
+use proxy_core::{
+    CapturedRequest, Engine, Flow, FlowSummary, Held, Pending, SitemapNode, TicketId,
+};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyEventKind},
@@ -14,7 +16,61 @@ use ratatui::{
 };
 
 use crate::command::Command;
-use crate::input::{Action, Input, Mode, Motion, PaletteKey, Scroll, Window};
+use crate::editor::TextBuffer;
+use crate::http_text;
+use crate::input::{Action, Input, InsertKey, Mode, Motion, PaletteKey, Scroll, Window};
+
+/// The Repeater's working copy of a request.
+///
+/// Loaded explicitly with `<Space>s` rather than mirrored from the Proxy cursor.
+/// Mirroring is what the Repeater used to do, and it cannot survive editing: the
+/// cursor moves on every tick of new traffic, and an edited buffer that a cursor
+/// move silently replaced would lose work with no way to get it back.
+#[derive(Default)]
+struct Repeater {
+    /// The flow this was loaded from, so replays keep their lineage.
+    origin: Option<u64>,
+    /// The request as editable wire text.
+    request: TextBuffer,
+    /// What the original looked like, to reparse edits against (for the scheme
+    /// and authority that origin-form text cannot carry).
+    original: Option<CapturedRequest>,
+    /// The last response, rendered. Shared because the send runs on its own task
+    /// so a slow target cannot freeze the UI.
+    response: Arc<Mutex<Option<String>>>,
+    /// Why the last send attempt did not leave — a parse error in the buffer.
+    error: Option<String>,
+}
+
+/// The Intercept window's view state. The queue itself lives on the engine.
+#[derive(Default)]
+struct InterceptView {
+    /// Row cursor into the queue as it was last rendered.
+    selected: usize,
+    /// The edit buffer for one held item, created on the first `i` and dropped
+    /// once the item is answered. Keyed by ticket so a queue that reorders
+    /// underneath the operator cannot silently retarget their edits.
+    editing: Option<(TicketId, TextBuffer)>,
+}
+
+/// The Sitemap window's view state.
+#[derive(Default)]
+struct SitemapView {
+    selected: usize,
+    /// Folded rows, by the same key `sitemap_rows` assigns. Collapsed rather
+    /// than expanded is stored so a newly-seen path shows up unfolded.
+    collapsed: HashSet<String>,
+}
+
+/// One rendered line of the sitemap tree.
+struct SitemapRow {
+    depth: usize,
+    label: String,
+    /// Identity for folding: stable across refreshes, unlike a row index.
+    key: String,
+    flow_count: i64,
+    has_children: bool,
+}
 
 /// Take over the terminal and run the UI until the user quits.
 pub async fn run(engine: Arc<Engine>) -> std::io::Result<()> {
@@ -65,6 +121,14 @@ struct App {
     palette_query: String,
     /// Which filtered command is highlighted.
     palette_selected: usize,
+
+    repeater: Repeater,
+    intercept: InterceptView,
+    sitemap: SitemapView,
+    /// The intercept queue as of this tick. Snapshotted in `refresh` so drawing
+    /// and key handling within one frame agree on what is held — re-reading the
+    /// live queue mid-frame could answer a ticket the operator never saw.
+    queue: Vec<Held>,
 }
 
 impl App {
@@ -89,6 +153,10 @@ impl App {
             content_len: 0,
             palette_query: String::new(),
             palette_selected: 0,
+            repeater: Repeater::default(),
+            intercept: InterceptView::default(),
+            sitemap: SitemapView::default(),
+            queue: Vec::new(),
         }
     }
 
@@ -124,6 +192,20 @@ impl App {
         }
 
         self.detail = self.selected_id().and_then(|id| self.engine.get_flow(id));
+
+        self.queue = self.engine.intercept().queue();
+        self.intercept.selected = self
+            .intercept
+            .selected
+            .min(self.queue.len().saturating_sub(1));
+        // An item answered (by us, by a timeout, by disabling interception)
+        // takes its edit buffer with it, rather than leaving edits that would
+        // silently attach to whichever item next takes that ticket's place.
+        if let Some((ticket, _)) = &self.intercept.editing {
+            if !self.queue.iter().any(|h| h.ticket == *ticket) {
+                self.intercept.editing = None;
+            }
+        }
     }
 
     fn selected_id(&self) -> Option<u64> {
@@ -151,10 +233,18 @@ impl App {
     /// The single place where an intent becomes a change to the app.
     fn apply(&mut self, action: Action) {
         match action {
-            // In Proxy the cursor walks the history; in the other windows there
-            // is no row cursor, so the same motions scroll the content instead.
+            // Windows with a row cursor move it; the rest have only scrollable
+            // content, so the same motions move the viewport instead.
             Action::Move { motion, count } if self.window == Window::Proxy => {
                 self.move_cursor(motion, count)
+            }
+            Action::Move { motion, count } if self.window == Window::Intercept => {
+                let last = self.queue.len().saturating_sub(1);
+                self.intercept.selected = step_row(self.intercept.selected, last, motion, count);
+            }
+            Action::Move { motion, count } if self.window == Window::Sitemap => {
+                let last = self.sitemap_rows().len().saturating_sub(1);
+                self.sitemap.selected = step_row(self.sitemap.selected, last, motion, count);
             }
             Action::Move { motion, count } => self.scroll_content(motion, count),
             // Nothing scrolls independently of the cursor yet; ratatui keeps
@@ -193,12 +283,233 @@ impl App {
                     None,
                 );
             }
+            // In the Repeater, `<Space>r` sends what is in the buffer — edits
+            // and all. Everywhere else it replays the Proxy selection.
+            Action::Resend if self.window == Window::Repeater => self.send_repeater(),
             Action::Resend => self.resend_selected(),
+            Action::SendToRepeater => self.load_repeater(),
+            Action::Insert(key) => self.edit(key),
+            Action::Forward => self.answer_held(true),
+            Action::Drop => self.answer_held(false),
+            Action::ForwardAll => {
+                let n = self.engine.intercept().forward_all();
+                self.note(&format!("forwarded {n} held item(s)"));
+            }
+            Action::DropAll => {
+                let n = self.engine.intercept().discard_all();
+                self.note(&format!("dropped {n} held item(s)"));
+            }
+            Action::ToggleIntercept => self.toggle_intercept(),
+            Action::Toggle => self.toggle_fold(),
             Action::Command(line) => self.run_command(&line),
             Action::Window(window) => self.show_window(window),
             Action::WindowStep(direction) => self.show_window(self.window.step(direction)),
             Action::Palette(key) => self.palette(key),
         }
+    }
+
+    // --- editing ---
+
+    /// Route a keystroke to whichever buffer the active window is editing.
+    /// Windows with nothing editable swallow it, so `i` there is inert rather
+    /// than scribbling into a buffer the operator cannot see.
+    fn edit(&mut self, key: InsertKey) {
+        let Some(buffer) = self.active_buffer() else {
+            return;
+        };
+        match key {
+            InsertKey::Char(c) => buffer.insert_char(c),
+            InsertKey::Newline => buffer.insert_newline(),
+            InsertKey::Backspace => buffer.backspace(),
+            InsertKey::Delete => buffer.delete(),
+            InsertKey::Left => buffer.left(),
+            InsertKey::Right => buffer.right(),
+            InsertKey::Up => buffer.up(),
+            InsertKey::Down => buffer.down(),
+            InsertKey::LineStart => buffer.line_start(),
+            InsertKey::LineEnd => buffer.line_end(),
+        }
+    }
+
+    /// The buffer `i` types into, if the active window has one.
+    ///
+    /// In Intercept this lazily forks an edit buffer off the highlighted item —
+    /// the first keystroke is what turns a held item into an edited one.
+    fn active_buffer(&mut self) -> Option<&mut TextBuffer> {
+        match self.window {
+            Window::Repeater => self
+                .repeater
+                .original
+                .is_some()
+                .then(|| &mut self.repeater.request),
+            Window::Intercept => {
+                let held = self.queue.get(self.intercept.selected)?;
+                let ticket = held.ticket;
+                if self.intercept.editing.as_ref().map(|(t, _)| *t) != Some(ticket) {
+                    let text = match &held.pending {
+                        Pending::Request(r) => http_text::render_request(r),
+                        Pending::Response(r) => http_text::render_response(r),
+                    };
+                    self.intercept.editing = Some((ticket, TextBuffer::from_text(&text)));
+                }
+                self.intercept.editing.as_mut().map(|(_, b)| b)
+            }
+            _ => None,
+        }
+    }
+
+    // --- intercept ---
+
+    fn toggle_intercept(&mut self) {
+        let intercept = self.engine.intercept();
+        let on = !intercept.is_enabled();
+        let released = intercept.set_enabled(on);
+        self.note(&if on {
+            "intercept ON — traffic will hold until forwarded".to_string()
+        } else {
+            format!("intercept OFF — released {released} held item(s)")
+        });
+    }
+
+    /// Answer the highlighted held item, forwarding any edits made to it.
+    fn answer_held(&mut self, forward: bool) {
+        let Some(held) = self.queue.get(self.intercept.selected) else {
+            self.note("nothing held");
+            return;
+        };
+        let ticket = held.ticket;
+
+        if !forward {
+            self.engine.intercept().discard(ticket);
+            self.intercept.editing = None;
+            self.note(&format!("dropped #{}", held.flow_id));
+            return;
+        }
+
+        // Only reparse if this item was actually edited; an untouched item
+        // forwards its original bytes rather than a re-rendered approximation.
+        let edited = match &self.intercept.editing {
+            Some((t, buffer)) if *t == ticket && buffer.is_dirty() => {
+                match reparse(&held.pending, &buffer.text()) {
+                    Ok(pending) => Some(pending),
+                    Err(e) => {
+                        // Refuse rather than silently forwarding the original:
+                        // sending something other than what is on screen is the
+                        // one thing an intercept editor must never do.
+                        self.note(&format!("not forwarded — {e}"));
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let flow_id = held.flow_id;
+        let was_edited = edited.is_some();
+        self.engine.intercept().forward(ticket, edited);
+        self.intercept.editing = None;
+        self.note(&if was_edited {
+            format!("forwarded #{flow_id} (edited)")
+        } else {
+            format!("forwarded #{flow_id}")
+        });
+    }
+
+    // --- sitemap ---
+
+    fn toggle_fold(&mut self) {
+        if self.window != Window::Sitemap {
+            return;
+        }
+        let rows = self.sitemap_rows();
+        let Some(row) = rows.get(self.sitemap.selected) else {
+            return;
+        };
+        if !row.has_children {
+            return;
+        }
+        if !self.sitemap.collapsed.remove(&row.key) {
+            self.sitemap.collapsed.insert(row.key.clone());
+        }
+    }
+
+    /// The sitemap flattened into display rows, honouring folds.
+    ///
+    /// The engine hands back a flat list with `parent_id` links; the tree is
+    /// rebuilt here. Hosts are synthesized as the top level — they are not nodes
+    /// in the table, but they are how an operator thinks about the tree.
+    fn sitemap_rows(&self) -> Vec<SitemapRow> {
+        // A generous page: the fold state is per-key, so paging would need to
+        // hold parents across pages anyway. Bounded so a huge project cannot
+        // stall a frame.
+        let nodes = self.engine.sitemap(None, 0, 5000);
+        build_sitemap_rows(&nodes, &self.sitemap.collapsed)
+    }
+
+    // --- repeater ---
+
+    /// Snapshot the Proxy selection into the Repeater as editable text.
+    fn load_repeater(&mut self) {
+        let Some(flow) = self.detail.clone() else {
+            self.note("no flow selected to send to the Repeater");
+            return;
+        };
+        let id = flow.id;
+        self.repeater = Repeater {
+            origin: Some(id),
+            request: TextBuffer::from_text(&http_text::render_request(&flow.request)),
+            original: Some(flow.request),
+            response: Arc::new(Mutex::new(None)),
+            error: None,
+        };
+        self.show_window(Window::Repeater);
+        self.note(&format!("#{id} → Repeater"));
+    }
+
+    /// Send what is in the Repeater buffer, edits included.
+    fn send_repeater(&mut self) {
+        let Some(original) = self.repeater.original.clone() else {
+            self.note("Repeater is empty — pick a flow in Proxy and press <Space>s");
+            return;
+        };
+        let request = match http_text::parse_request(&self.repeater.request.text(), &original) {
+            Ok(req) => req,
+            Err(e) => {
+                // Kept on the pane, not just the status line: a parse error is
+                // about the buffer, and belongs next to it.
+                self.repeater.error = Some(e.to_string());
+                self.note(&format!("not sent — {e}"));
+                return;
+            }
+        };
+        self.repeater.error = None;
+        self.repeater.request.clear_dirty();
+
+        let engine = self.engine.clone();
+        let status = self.status.clone();
+        let slot = self.repeater.response.clone();
+        let origin = self.repeater.origin;
+
+        self.note("sending…");
+        tokio::spawn(async move {
+            let message = match engine.send_request(request, origin).await {
+                Ok(sent) => {
+                    let text = http_text::render_response(&sent.response);
+                    *slot.lock().unwrap() = Some(text);
+                    format!(
+                        "sent → {} ({} bytes) as #{}",
+                        sent.response.status,
+                        sent.response.body.len(),
+                        sent.replay_id
+                    )
+                }
+                Err(e) => {
+                    *slot.lock().unwrap() = Some(format!("send failed: {e:?}"));
+                    format!("send failed: {e:?}")
+                }
+            };
+            *status.lock().unwrap() = message;
+        });
     }
 
     /// Drive the Cmd-K palette. The input layer already flipped the mode; here
@@ -247,6 +558,22 @@ impl App {
             }
         }
         commands.push(("Resend selection".into(), Action::Resend));
+        commands.push(("Send selection to Repeater".into(), Action::SendToRepeater));
+        // Reads its own state, so the label says what will happen rather than
+        // what is true — the same shape as the `rnu` toggle below.
+        commands.push((
+            if self.engine.intercept().is_enabled() {
+                "Turn intercept off".into()
+            } else {
+                "Turn intercept on".into()
+            },
+            Action::ToggleIntercept,
+        ));
+        if !self.queue.is_empty() {
+            let n = self.queue.len();
+            commands.push((format!("Forward all {n} held item(s)"), Action::ForwardAll));
+            commands.push((format!("Drop all {n} held item(s)"), Action::DropAll));
+        }
         commands.push((
             "Go to first request".into(),
             Action::Move {
@@ -593,7 +920,9 @@ impl App {
         self.draw_tabs(frame, tabs);
         match self.window {
             Window::Proxy => self.draw_proxy(frame, body),
+            Window::Intercept => self.draw_intercept(frame, body),
             Window::Repeater => self.draw_repeater(frame, body),
+            Window::Sitemap => self.draw_sitemap(frame, body),
             Window::Inspect => self.draw_inspect(frame, body),
             Window::Automate => self.draw_automate(frame, body),
         }
@@ -607,7 +936,10 @@ impl App {
     /// A Telescope-style overlay: a filter prompt over a ranked command list,
     /// centred on the screen with everything behind it cleared.
     fn draw_palette(&self, frame: &mut Frame) {
-        let area = centered_rect(frame.area(), 60, 60);
+        // Tall enough for the whole catalog: the list does not scroll, so an
+        // entry that falls off the bottom is simply unreachable. Two more
+        // windows made 60% too short for that to stay true.
+        let area = centered_rect(frame.area(), 60, 80);
         frame.render_widget(Clear, area);
 
         let [prompt, list] =
@@ -688,62 +1020,240 @@ impl App {
         self.draw_response(frame, response);
     }
 
-    /// Repeater: one flow, full width — request left, response right — and
-    /// `<Space>r` to fire it again. The selection in Proxy is what loads here.
+    /// Repeater: an editable request on the left, the response it produced on
+    /// the right. `i` edits, Escape leaves, `<Space>r` sends what is in the
+    /// buffer. Loaded explicitly with `<Space>s` from Proxy.
     fn draw_repeater(&mut self, frame: &mut Frame, area: Rect) {
         let [banner, panes] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
         self.viewport = panes.height.saturating_sub(2) as usize;
 
-        let Some(flow) = self.detail.clone() else {
+        if self.repeater.original.is_none() {
             self.content_len = 0;
             frame.render_widget(
-                empty_pane(" Repeater ", "no flow selected — pick one in Proxy (P)"),
+                empty_pane(
+                    " Repeater ",
+                    "empty — select a flow in Proxy (P) and press <Space>s",
+                ),
                 area,
             );
             return;
-        };
+        }
 
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" #{} ", flow.id),
-                    Style::new().fg(Color::Black).bg(Color::Cyan),
-                ),
-                Span::raw(format!("  {} {}", flow.request.method, flow.request.uri)),
-                Span::styled("   <Space>r send", Style::new().fg(Color::DarkGray)),
-            ])),
-            banner,
-        );
-
-        let request = message_lines(
-            Line::styled(
-                format!("{} {}", flow.request.method, flow.request.uri),
-                Style::new().bold().fg(Color::Cyan),
-            ),
-            &flow.request.headers,
-            &flow.request.body,
-        );
-        let response = match &flow.response {
-            None => vec![Line::styled("(pending)", Style::new().fg(Color::Yellow))],
-            Some(resp) => message_lines(
-                Line::styled(
-                    resp.status.to_string(),
-                    Style::new().bold().fg(status_color(resp.status)),
-                ),
-                &resp.headers,
-                &resp.body,
-            ),
-        };
-        // Both panes share one scroll offset; the taller one sets the bound.
-        self.content_len = request.len().max(response.len()) as u16;
-        let scroll = self.content_scroll;
+        let editing = self.input.mode() == Mode::Insert;
+        let dirty = self.repeater.request.is_dirty();
+        let mut chips = vec![Span::styled(
+            match self.repeater.origin {
+                Some(id) => format!(" from #{id} "),
+                None => " new ".to_string(),
+            },
+            Style::new().fg(Color::Black).bg(Color::Cyan),
+        )];
+        if dirty {
+            chips.push(Span::styled(" edited ", Style::new().fg(Color::Yellow)));
+        }
+        chips.push(Span::styled(
+            if editing {
+                "  <Esc> stop editing".to_string()
+            } else {
+                "  i edit   <Space>r send".to_string()
+            },
+            Style::new().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(chips)), banner);
 
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(panes);
-        frame.render_widget(pane(request, " Request ").scroll((scroll, 0)), left);
-        frame.render_widget(pane(response, " Response ").scroll((scroll, 0)), right);
+
+        let title = if dirty { " Request* " } else { " Request " };
+        frame.render_widget(
+            buffer_pane(&self.repeater.request, title, editing).scroll((self.content_scroll, 0)),
+            left,
+        );
+
+        let response = self.repeater.response.lock().unwrap().clone();
+        let mut lines: Vec<Line> = match &self.repeater.error {
+            Some(e) => vec![Line::styled(
+                format!("cannot send: {e}"),
+                Style::new().fg(Color::Red),
+            )],
+            None => match &response {
+                None => vec![Line::styled(
+                    "(not sent yet — <Space>r)",
+                    Style::new().fg(Color::DarkGray),
+                )],
+                Some(text) => text.lines().map(|l| Line::from(l.to_string())).collect(),
+            },
+        };
+        // The request pane owns the scroll bound; the response follows it, so a
+        // long response still needs the buffer to be at least as tall.
+        self.content_len = self.repeater.request.lines().len().max(lines.len()).max(1) as u16;
+        if lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        frame.render_widget(
+            pane(lines, " Response ").scroll((self.content_scroll, 0)),
+            right,
+        );
+    }
+
+    /// Intercept: the queue on the left, the highlighted item on the right.
+    /// `f`/`d` answer one, `F`/`D` answer all, `i` edits before forwarding.
+    fn draw_intercept(&mut self, frame: &mut Frame, area: Rect) {
+        let [banner, panes] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        self.viewport = panes.height.saturating_sub(2) as usize;
+
+        let on = self.engine.intercept().is_enabled();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if on { " ON " } else { " OFF " },
+                    Style::new()
+                        .fg(Color::Black)
+                        .bg(if on { Color::Red } else { Color::DarkGray })
+                        .bold(),
+                ),
+                Span::raw(format!("  {} held", self.queue.len())),
+                Span::styled(
+                    "   <Space>i toggle   <Space>f forward   <Space>d drop   <Space>F/D all",
+                    Style::new().fg(Color::DarkGray),
+                ),
+            ])),
+            banner,
+        );
+
+        let [list, detail] =
+            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .areas(panes);
+
+        if self.queue.is_empty() {
+            self.content_len = 0;
+            frame.render_widget(
+                empty_pane(
+                    " Queue ",
+                    if on {
+                        "nothing held yet — traffic will queue here"
+                    } else {
+                        "intercept is off — press <Space>i to hold traffic"
+                    },
+                ),
+                list,
+            );
+            frame.render_widget(empty_pane(" Held Item ", "nothing to inspect"), detail);
+            return;
+        }
+
+        let rows: Vec<Line> = self
+            .queue
+            .iter()
+            .enumerate()
+            .map(|(i, held)| {
+                let (dir, arrow, summary) = match &held.pending {
+                    Pending::Request(r) => (
+                        "REQ",
+                        "→",
+                        format!(
+                            "{} {}",
+                            r.method,
+                            r.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
+                        ),
+                    ),
+                    Pending::Response(r) => {
+                        ("RES", "←", format!("{} ({} bytes)", r.status, r.body.len()))
+                    }
+                };
+                let text = format!(" {arrow} #{:<4} {dir}  {summary}", held.flow_id);
+                if i == self.intercept.selected {
+                    Line::styled(text, Style::new().fg(Color::Black).bg(Color::Cyan).bold())
+                } else {
+                    Line::from(text)
+                }
+            })
+            .collect();
+        frame.render_widget(pane(rows, " Queue ").scroll((self.content_scroll, 0)), list);
+
+        // The edit buffer wins when it belongs to the highlighted item, so what
+        // is on screen is always exactly what forwarding would send.
+        let held = &self.queue[self.intercept.selected];
+        let editing = self.input.mode() == Mode::Insert;
+        match &self.intercept.editing {
+            Some((ticket, buffer)) if *ticket == held.ticket => {
+                self.content_len = buffer.lines().len() as u16;
+                let title = if buffer.is_dirty() {
+                    " Held Item* "
+                } else {
+                    " Held Item "
+                };
+                frame.render_widget(
+                    buffer_pane(buffer, title, editing).scroll((self.content_scroll, 0)),
+                    detail,
+                );
+            }
+            _ => {
+                let text = match &held.pending {
+                    Pending::Request(r) => http_text::render_request(r),
+                    Pending::Response(r) => http_text::render_response(r),
+                };
+                let lines: Vec<Line> = text.lines().map(|l| Line::from(l.to_string())).collect();
+                self.content_len = lines.len() as u16;
+                frame.render_widget(
+                    pane(lines, " Held Item ").scroll((self.content_scroll, 0)),
+                    detail,
+                );
+            }
+        }
+    }
+
+    /// Sitemap: the tree of what has been seen, host then path. `<CR>` folds.
+    fn draw_sitemap(&mut self, frame: &mut Frame, area: Rect) {
+        self.viewport = area.height.saturating_sub(2) as usize;
+
+        let rows = self.sitemap_rows();
+        self.content_len = rows.len() as u16;
+        if rows.is_empty() {
+            frame.render_widget(empty_pane(" Sitemap ", "nothing captured yet"), area);
+            return;
+        }
+        let selected = self.sitemap.selected.min(rows.len() - 1);
+
+        // Keep the selection on screen: this window scrolls by content offset
+        // rather than through a stateful widget, so nothing does it for us.
+        let height = self.viewport.max(1);
+        if selected < self.content_scroll as usize {
+            self.content_scroll = selected as u16;
+        } else if selected >= self.content_scroll as usize + height {
+            self.content_scroll = (selected + 1 - height) as u16;
+        }
+
+        let lines: Vec<Line> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let indent = "  ".repeat(row.depth);
+                let marker = if !row.has_children {
+                    " "
+                } else if self.sitemap.collapsed.contains(&row.key) {
+                    "▸"
+                } else {
+                    "▾"
+                };
+                let text = format!(" {indent}{marker} {}  ({})", row.label, row.flow_count);
+                if i == selected {
+                    Line::styled(text, Style::new().fg(Color::Black).bg(Color::Cyan).bold())
+                } else if row.depth == 0 {
+                    Line::styled(text, Style::new().bold().fg(Color::Cyan))
+                } else {
+                    Line::from(text)
+                }
+            })
+            .collect();
+
+        frame.render_widget(
+            pane(lines, &format!(" Sitemap ({}) ", rows.len())).scroll((self.content_scroll, 0)),
+            area,
+        );
     }
 
     /// Inspect: the selected flow taken apart — request line, query params,
@@ -893,6 +1403,8 @@ impl App {
             Mode::Visual => Color::Magenta,
             Mode::Command => Color::Yellow,
             Mode::Palette => Color::Green,
+            // Red, because in Insert mode every key changes something.
+            Mode::Insert => Color::Red,
         });
 
         let position = if self.flows.is_empty() {
@@ -922,8 +1434,111 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str =
-    "^k palette  ·  P/R/I/A windows  gt/gT cycle  ·  j/k gg/G {} n/N m'  ·  <Space>r resend  ·  :q";
+const HELP: &str = "^k palette · P/C/R/S/I/A windows, gt/gT cycle · <Space>s→Repeater, i edit, <Space>r send · <Space>i intercept, f/d answer (F/D all) · :q";
+
+/// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
+/// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
+/// their movement — `move_cursor` stays specific to the flow table.
+fn step_row(current: usize, last: usize, motion: Motion, count: Option<usize>) -> usize {
+    let step = count.unwrap_or(1) as isize;
+    let target = match motion {
+        Motion::Down => current as isize + step,
+        Motion::Up => current as isize - step,
+        Motion::Top => count.map_or(0, |n| n.saturating_sub(1)) as isize,
+        Motion::Bottom => count.map_or(last as isize, |n| n.saturating_sub(1) as isize),
+        Motion::HalfPageDown => current as isize + step * 10,
+        Motion::HalfPageUp => current as isize - step * 10,
+        Motion::PageDown => current as isize + step * 20,
+        Motion::PageUp => current as isize - step * 20,
+        _ => current as isize,
+    };
+    target.clamp(0, last as isize) as usize
+}
+
+/// Reparse edited text as the same kind of message it started as. The queue
+/// entry's direction is what decides, never the text — otherwise a mangled
+/// start line could turn a held response into a request.
+fn reparse(original: &Pending, text: &str) -> Result<Pending, http_text::ParseError> {
+    Ok(match original {
+        Pending::Request(r) => Pending::Request(http_text::parse_request(text, r)?),
+        Pending::Response(r) => Pending::Response(http_text::parse_response(text, r)?),
+    })
+}
+
+/// Rebuild the sitemap tree from the flat node list and flatten it back into
+/// display rows, skipping anything under a fold.
+///
+/// Nodes whose parent fell outside the fetched page are treated as roots rather
+/// than dropped: an orphan is a paging artefact, and silently hiding a path an
+/// operator has actually seen is worse than showing it one level too shallow.
+fn build_sitemap_rows(nodes: &[SitemapNode], collapsed: &HashSet<String>) -> Vec<SitemapRow> {
+    let present: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+    let mut children: HashMap<i64, Vec<&SitemapNode>> = HashMap::new();
+    let mut roots: HashMap<&str, Vec<&SitemapNode>> = HashMap::new();
+
+    for node in nodes {
+        match node.parent_id {
+            Some(parent) if present.contains(&parent) => {
+                children.entry(parent).or_default().push(node)
+            }
+            _ => roots.entry(node.host.as_str()).or_default().push(node),
+        }
+    }
+
+    let mut hosts: Vec<&str> = roots.keys().copied().collect();
+    hosts.sort_unstable();
+
+    let mut rows = Vec::new();
+    for host in hosts {
+        let host_key = format!("host:{host}");
+        let host_roots = roots.get(host).map(Vec::as_slice).unwrap_or(&[]);
+        let folded = collapsed.contains(&host_key);
+        rows.push(SitemapRow {
+            depth: 0,
+            label: host.to_string(),
+            key: host_key,
+            // A host's count is the traffic across everything beneath it.
+            flow_count: host_roots.iter().map(|n| n.flow_count).sum(),
+            has_children: !host_roots.is_empty(),
+        });
+        if folded {
+            continue;
+        }
+        let mut sorted = host_roots.to_vec();
+        sorted.sort_by(|a, b| a.path.cmp(&b.path));
+        for node in sorted {
+            push_sitemap_node(&mut rows, node, &children, collapsed, 1);
+        }
+    }
+    rows
+}
+
+fn push_sitemap_node(
+    rows: &mut Vec<SitemapRow>,
+    node: &SitemapNode,
+    children: &HashMap<i64, Vec<&SitemapNode>>,
+    collapsed: &HashSet<String>,
+    depth: usize,
+) {
+    let key = format!("node:{}", node.id);
+    let kids = children.get(&node.id).map(Vec::as_slice).unwrap_or(&[]);
+    let folded = collapsed.contains(&key);
+    rows.push(SitemapRow {
+        depth,
+        label: node.name.clone(),
+        key,
+        flow_count: node.flow_count,
+        has_children: !kids.is_empty(),
+    });
+    if folded {
+        return;
+    }
+    let mut sorted = kids.to_vec();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    for kid in sorted {
+        push_sitemap_node(rows, kid, children, collapsed, depth + 1);
+    }
+}
 
 /// Score how well `query` fuzzy-matches `text`, or `None` if it doesn't. Every
 /// query char must appear in order; contiguous runs and an early first hit score
@@ -965,10 +1580,53 @@ fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 }
 
 /// A bordered, wrapping pane — the shared shell for Request and Response.
-fn pane(lines: Vec<Line<'static>>, title: &'static str) -> Paragraph<'static> {
+fn pane(lines: Vec<Line<'static>>, title: impl Into<String>) -> Paragraph<'static> {
     Paragraph::new(lines)
-        .block(Block::bordered().title(title))
+        .block(Block::bordered().title(title.into()))
         .wrap(Wrap { trim: false })
+}
+
+/// A pane showing an editable buffer, with the cursor drawn as a block when the
+/// buffer has focus.
+///
+/// Deliberately *not* wrapped, unlike [`pane`]. A wrapped line occupies more
+/// than one screen row, which would put the cursor somewhere other than where
+/// the buffer says it is — and a text editor whose cursor lies about its
+/// position is worse than one that scrolls sideways.
+fn buffer_pane(buffer: &TextBuffer, title: impl Into<String>, focused: bool) -> Paragraph<'static> {
+    let cursor = buffer.cursor();
+    let lines: Vec<Line<'static>> = buffer
+        .lines()
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            if !focused || i != cursor.line {
+                return Line::from(text.clone());
+            }
+            // Split the line around the cursor so it can be inverted in place.
+            // Past the last character there is nothing to invert, so a space
+            // stands in for the cell.
+            let chars: Vec<char> = text.chars().collect();
+            let col = cursor.col.min(chars.len());
+            let before: String = chars[..col].iter().collect();
+            let (at, after) = match chars.get(col) {
+                Some(c) => (c.to_string(), chars[col + 1..].iter().collect::<String>()),
+                None => (" ".to_string(), String::new()),
+            };
+            Line::from(vec![
+                Span::raw(before),
+                Span::styled(at, Style::new().fg(Color::Black).bg(Color::White)),
+                Span::raw(after),
+            ])
+        })
+        .collect();
+
+    let border = if focused {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::new()
+    };
+    Paragraph::new(lines).block(Block::bordered().title(title.into()).border_style(border))
 }
 
 /// A bordered pane with a single muted message — used when a window has nothing
@@ -1421,7 +2079,7 @@ mod tests {
         let mut app = App::new(engine_with(1));
         app.refresh();
         press(&mut app, "gt");
-        assert_eq!(app.window, Window::Repeater);
+        assert_eq!(app.window, Window::Intercept);
         press(&mut app, "gT");
         assert_eq!(app.window, Window::Proxy);
     }
@@ -1568,5 +2226,208 @@ mod tests {
         let mut app = App::new(engine);
         app.refresh();
         assert!(render(&mut app).contains("(pending)"));
+    }
+
+    // --- repeater ---
+
+    /// The Repeater is loaded explicitly and then stops tracking the Proxy
+    /// cursor. This is the whole reason it owns a buffer: moving the cursor
+    /// after loading must not throw away what you were editing.
+    #[test]
+    fn repeater_loads_on_demand_and_then_ignores_the_cursor() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        assert!(
+            render(&mut app).contains("HTTP History (3)"),
+            "fixture should have loaded"
+        );
+
+        press(&mut app, " s");
+        assert_eq!(app.window, Window::Repeater);
+        let loaded = app.repeater.origin;
+        assert!(loaded.is_some());
+
+        // Go back and move the cursor; the Repeater must not follow.
+        press(&mut app, "Pj");
+        assert_eq!(app.repeater.origin, loaded, "the buffer should be pinned");
+    }
+
+    #[test]
+    fn repeater_is_empty_until_something_is_sent_to_it() {
+        let mut app = App::new(engine_with(1));
+        app.refresh();
+        press(&mut app, "R");
+        assert!(
+            render(&mut app).contains("<Space>s"),
+            "should say how to load"
+        );
+    }
+
+    /// `i` types into the buffer instead of being interpreted as a motion, and
+    /// the edit is visible.
+    #[test]
+    fn repeater_buffer_takes_typed_text() {
+        let mut app = App::new(engine_with(1));
+        app.refresh();
+        press(&mut app, " s");
+
+        key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        assert_eq!(app.input.mode(), Mode::Insert);
+        press(&mut app, "XY");
+        assert!(
+            app.repeater.request.text().starts_with("XY"),
+            "typed text should land at the cursor: {:?}",
+            app.repeater.request.text()
+        );
+        assert!(app.repeater.request.is_dirty());
+        // The pane marks itself edited so the operator can see it diverged.
+        assert!(render(&mut app).contains("Request*"));
+
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.input.mode(), Mode::Normal);
+    }
+
+    /// A buffer that no longer parses must refuse to send and say why, rather
+    /// than quietly sending the pre-edit request.
+    #[test]
+    fn repeater_reports_an_unsendable_buffer() {
+        let mut app = App::new(engine_with(1));
+        app.refresh();
+        press(&mut app, " s");
+        app.repeater.request = TextBuffer::from_text("GET /x HTTP/1.1\nbroken-header\n\n");
+        app.repeater.request.insert_char(' ');
+
+        app.send_repeater();
+        assert!(app.repeater.error.is_some(), "should refuse to send");
+        assert!(render(&mut app).contains("cannot send"));
+    }
+
+    // --- intercept ---
+
+    #[test]
+    fn intercept_starts_off_and_toggles() {
+        let mut app = App::new(Engine::new());
+        app.refresh();
+        press(&mut app, "C");
+        assert!(render(&mut app).contains("OFF"));
+
+        press(&mut app, " i");
+        assert!(app.engine.intercept().is_enabled());
+        assert!(render(&mut app).contains("ON"));
+
+        press(&mut app, " i");
+        assert!(!app.engine.intercept().is_enabled());
+    }
+
+    #[test]
+    fn intercept_shows_held_items_and_answers_them() {
+        let engine = Engine::new();
+        engine.intercept().set_enabled(true);
+        let mut app = App::new(engine.clone());
+
+        // Hold something from another task, as the proxy handler would.
+        let held = tokio::runtime::Runtime::new().unwrap();
+        let _guard = held.enter();
+        let e = engine.clone();
+        held.spawn(async move {
+            e.intercept()
+                .hold_request(42, get_request("http://example.com/secret"))
+                .await
+        });
+        // Give the spawned hold a moment to reach the queue.
+        for _ in 0..100 {
+            if !engine.intercept().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        app.refresh();
+        press(&mut app, "C");
+        let out = render(&mut app);
+        assert!(out.contains("#42"), "the held flow should be listed: {out}");
+        assert!(out.contains("/secret"), "{out}");
+
+        press(&mut app, " f");
+        assert!(engine.intercept().is_empty(), "forwarding should answer it");
+    }
+
+    // --- sitemap ---
+
+    fn node(id: i64, parent: Option<i64>, host: &str, path: &str, name: &str) -> SitemapNode {
+        SitemapNode {
+            id,
+            parent_id: parent,
+            kind: "dir".into(),
+            host: host.into(),
+            path: path.into(),
+            name: name.into(),
+            first_seen: 0,
+            last_seen: 0,
+            flow_count: 1,
+            origin: "observed".into(),
+            comment: None,
+            highlight: None,
+        }
+    }
+
+    #[test]
+    fn sitemap_nests_paths_under_their_host() {
+        let nodes = vec![
+            node(1, None, "a.test", "/api", "api"),
+            node(2, Some(1), "a.test", "/api/v1", "v1"),
+            node(3, None, "b.test", "/x", "x"),
+        ];
+        let rows = build_sitemap_rows(&nodes, &HashSet::new());
+        let shape: Vec<(usize, &str)> = rows.iter().map(|r| (r.depth, r.label.as_str())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, "a.test"),
+                (1, "api"),
+                (2, "v1"),
+                (0, "b.test"),
+                (1, "x"),
+            ]
+        );
+    }
+
+    #[test]
+    fn folding_a_node_hides_its_descendants() {
+        let nodes = vec![
+            node(1, None, "a.test", "/api", "api"),
+            node(2, Some(1), "a.test", "/api/v1", "v1"),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert("node:1".to_string());
+        let rows = build_sitemap_rows(&nodes, &collapsed);
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["a.test", "api"], "v1 should be folded away");
+
+        collapsed.insert("host:a.test".to_string());
+        let rows = build_sitemap_rows(&nodes, &collapsed);
+        assert_eq!(rows.len(), 1, "folding the host hides everything under it");
+    }
+
+    /// A node whose parent fell outside the fetched page must still appear.
+    /// Dropping it would silently hide a path that was actually observed.
+    #[test]
+    fn orphaned_nodes_are_shown_as_roots() {
+        let nodes = vec![node(2, Some(999), "a.test", "/api/v1", "v1")];
+        let rows = build_sitemap_rows(&nodes, &HashSet::new());
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["a.test", "v1"]);
+    }
+
+    #[test]
+    fn sitemap_window_renders_captured_paths() {
+        let engine = Engine::new();
+        engine.record_request(get_request("http://example.com/foo/bar"));
+        let mut app = App::new(engine);
+        app.refresh();
+        press(&mut app, "S");
+        let out = render(&mut app);
+        assert!(out.contains("example.com"), "{out}");
+        assert!(out.contains("foo"), "{out}");
     }
 }
