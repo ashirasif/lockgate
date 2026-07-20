@@ -18,6 +18,9 @@ pub enum Command {
     },
     /// `:12` — a bare line number jumps to that flow.
     Goto(usize),
+    /// `:pretty` — reformat the body of the message being edited. The same
+    /// thing `gq` does, reachable when the buffer does not have focus.
+    Pretty,
     Help,
     Unknown(String),
 }
@@ -40,6 +43,7 @@ impl Command {
             "q" | "quit" => Command::Quit,
             "resend" | "rep" | "repeat" => Command::Resend,
             "h" | "help" => Command::Help,
+            "pretty" | "pp" | "format" => Command::Pretty,
             "set" => parse_set(rest),
             _ => Command::Unknown(name.to_string()),
         })

@@ -3,6 +3,8 @@ mod command;
 mod editor;
 mod http_text;
 mod input;
+mod pretty;
+mod syntax;
 mod tui;
 mod vim;
 

@@ -612,7 +612,7 @@ impl App {
         self.content_scroll = 0;
         // Materialise the buffer now so the cursor is visible on arrival.
         self.preview_buffer(requests);
-        self.note("preview — e for $EDITOR, i to insert, <Esc> back");
+        self.note("preview — ^g for $EDITOR, gq to format, i to insert, <Esc> back");
     }
 
     /// Step back out of a buffer, which is what makes window keys reachable
@@ -691,6 +691,17 @@ impl App {
                 ..
             } | Command::VisualOperate(Operator::Yank)
         );
+
+        // Handled before the buffer is borrowed, because reformatting reports
+        // to the status line and that needs `self` back.
+        if let Command::Simple {
+            cmd: Simple::Format,
+            ..
+        } = cmd
+        {
+            self.format_buffer();
+            return;
+        }
 
         let Some(buffer) = self.active_buffer() else {
             return;
@@ -807,6 +818,8 @@ impl App {
                 // Dot-repeat needs a record of the last change, which this
                 // subset does not keep. Saying so beats doing nothing silently.
                 Simple::Repeat => {}
+                // Taken above, before the buffer was borrowed.
+                Simple::Format => unreachable!("handled before the buffer borrow"),
             },
         }
 
@@ -832,8 +845,35 @@ impl App {
                 ..
             }
         ) {
-            self.note("`.` repeat is not implemented — use e for $EDITOR");
+            self.note("`.` repeat is not implemented — use ^g for $EDITOR");
         }
+    }
+
+    /// Pretty-print the body of the buffer under the cursor.
+    ///
+    /// One checkpoint, so `u` puts the body back exactly as it was — which is
+    /// what makes this safe to try on a request you care about. Failures are
+    /// reported with the reason rather than leaving the operator wondering
+    /// whether the key registered.
+    fn format_buffer(&mut self) {
+        let note = match self.active_buffer() {
+            None => "nothing to format here".to_string(),
+            Some(buffer) => {
+                let current = buffer.text();
+                match crate::pretty::pretty_message(&current) {
+                    // Saying so beats a checkpoint and a no-op edit that makes
+                    // the buffer look dirty for no reason.
+                    Ok(formatted) if formatted == current => "already formatted".to_string(),
+                    Ok(formatted) => {
+                        buffer.checkpoint();
+                        buffer.set_text(&formatted);
+                        "body reformatted — u to undo".to_string()
+                    }
+                    Err(e) => format!("cannot format: {e}"),
+                }
+            }
+        };
+        self.note(&note);
     }
 
     /// Put a yank on the system clipboard, reporting rather than failing.
@@ -1253,6 +1293,7 @@ impl App {
                 self.options.insert(option.clone(), value);
                 self.note(&format!("set {option}={value}"));
             }
+            Command::Pretty => self.format_buffer(),
             Command::Help => self.note(HELP),
             Command::Unknown(name) => self.note(&format!("E492: not an editor command: {name}")),
         }
@@ -1653,7 +1694,7 @@ impl App {
             if editing {
                 "  vim keys   <Esc> leave".to_string()
             } else {
-                "  <CR> edit   e $EDITOR   <Space>r send".to_string()
+                "  <CR> edit   ^g $EDITOR   gq format   <Space>r send".to_string()
             },
             muted(),
         ));
@@ -1683,7 +1724,7 @@ impl App {
             )],
             None => match &response {
                 None => vec![Line::styled("(not sent yet — <Space>r)", muted())],
-                Some(text) => text.lines().map(|l| Line::from(l.to_string())).collect(),
+                Some(text) => crate::syntax::highlighted_lines(text),
             },
         };
         // The request pane owns the scroll bound; the response follows it, so a
@@ -1734,7 +1775,7 @@ impl App {
                     if self.intercept.pane == Pane::Preview {
                         "   vim: w/W b/B f{c} v/V ciw di\" 2dd  yy→clipboard  u   <Esc> back"
                     } else {
-                        "   <CR> open  e $EDITOR  f forward  d drop  F/D all  ^w pane  <Space>i hold"
+                        "   <CR> open  ^g $EDITOR  gq format  f forward  d drop  F/D all  ^w pane"
                     },
                     muted(),
                 ),
@@ -1901,7 +1942,7 @@ impl App {
             }
             _ => {
                 let text = render_pending(&item.pending);
-                let lines: Vec<Line> = text.lines().map(|l| Line::from(l.to_string())).collect();
+                let lines: Vec<Line> = crate::syntax::highlighted_lines(&text);
                 if focused {
                     self.content_len = lines.len() as u16;
                 }
@@ -2128,7 +2169,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · e $EDITOR · Intercept: <Space>i hold, ^w pane, f/d answer · :q";
+const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Intercept: <Space>i hold, ^w pane, f/d answer · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -2421,68 +2462,41 @@ fn buffer_pane(
     border: Style,
 ) -> Paragraph<'static> {
     let cursor = buffer.cursor();
+    // Syntax first, then the interactive decoration on top. Layering this way
+    // keeps the two concerns apart: the highlighter never has to know a cursor
+    // exists, and `patch` lets a selection shade the background while leaving
+    // the token's own foreground colour intact.
+    let syntax = crate::syntax::highlight(buffer.lines());
+    // Two cursors, because they mean different things: white where the next key
+    // inserts text, cyan where it only moves.
+    let cursor_bg = if inserting { Color::White } else { Color::Cyan };
+    let cursor_style = Style::new().fg(Color::Black).bg(cursor_bg);
+    let selected = Style::new().bg(Color::Rgb(60, 60, 100));
+    let has_selection = buffer.has_selection();
+
     let lines: Vec<Line<'static>> = buffer
         .lines()
         .iter()
+        .zip(syntax)
         .enumerate()
-        .map(|(i, text)| {
-            let i_line = i;
-            if !focused {
-                return Line::from(text.clone());
-            }
-            if i != cursor.line {
-                // Other lines still need selection shading (V over many lines).
-                if !buffer.has_selection() {
-                    return Line::from(text.clone());
+        .map(|(line, (text, mut styles))| {
+            if focused {
+                // Per-cell so the selection and the cursor can overlap: the
+                // cursor sits inside its own selection, and must stay visible
+                // there.
+                for (col, style) in styles.iter_mut().enumerate() {
+                    if line == cursor.line && col == cursor.col {
+                        *style = style.patch(cursor_style);
+                    } else if has_selection && buffer.in_selection(Cursor { line, col }) {
+                        *style = style.patch(selected);
+                    }
                 }
-                let selected = Style::new().bg(Color::Rgb(60, 60, 100));
-                return Line::from(
-                    text.chars()
-                        .enumerate()
-                        .map(|(col, c)| {
-                            let style = if buffer.in_selection(Cursor { line: i_line, col }) {
-                                selected
-                            } else {
-                                Style::new()
-                            };
-                            Span::styled(c.to_string(), style)
-                        })
-                        .collect::<Vec<_>>(),
-                );
             }
-            // Split the line around the cursor so it can be inverted in place.
+            let mut spans = crate::syntax::coalesce(text, &styles);
             // Past the last character there is nothing to invert, so a space
             // stands in for the cell.
-            let chars: Vec<char> = text.chars().collect();
-            let col = cursor.col.min(chars.len());
-            // Two cursors, because they mean different things: white where the
-            // next key inserts text, cyan where it only moves.
-            let cursor_bg = if inserting { Color::White } else { Color::Cyan };
-            let selected = Style::new().bg(Color::Rgb(60, 60, 100));
-
-            // Per-cell so the selection and the cursor can overlap: the cursor
-            // sits inside its own selection, and must stay visible there.
-            let mut spans = Vec::new();
-            for (i, c) in chars.iter().enumerate() {
-                let style = if i == col {
-                    Style::new().fg(Color::Black).bg(cursor_bg)
-                } else if buffer.in_selection(Cursor {
-                    line: i_line,
-                    col: i,
-                }) {
-                    selected
-                } else {
-                    Style::new()
-                };
-                spans.push(Span::styled(c.to_string(), style));
-            }
-            // Past the last character there is nothing to invert, so a space
-            // stands in for the cell.
-            if col >= chars.len() {
-                spans.push(Span::styled(
-                    " ",
-                    Style::new().fg(Color::Black).bg(cursor_bg),
-                ));
+            if focused && line == cursor.line && cursor.col >= text.chars().count() {
+                spans.push(Span::styled(" ", cursor_style));
             }
             Line::from(spans)
         })
@@ -2518,14 +2532,21 @@ fn field(lines: &mut Vec<Line<'static>>, label: &str, value: impl Into<String>) 
 
 /// Start line, then headers, then a blank line and the body preview.
 fn message_lines(start: Line<'static>, headers: &HeaderMap, body: &[u8]) -> Vec<Line<'static>> {
+    let header_text: Vec<String> = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap_or("<binary>")))
+        .collect();
+    let body = if body.is_empty() {
+        String::new()
+    } else {
+        preview(body)
+    };
+
     let mut lines = vec![start];
-    lines.extend(headers.iter().map(|(name, value)| {
-        Line::from(format!("{name}: {}", value.to_str().unwrap_or("<binary>")))
-    }));
-    if !body.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(preview(body)));
-    }
+    lines.extend(crate::syntax::highlighted_head_and_body(
+        &header_text,
+        &body,
+    ));
     lines
 }
 
@@ -3650,12 +3671,60 @@ mod tests {
         assert_eq!(lines[1], "GET /req-path HTTP/1.1", "P puts above");
     }
 
-    /// `e` stages the focused buffer for the external editor. The handoff
+    /// Formatting must be one undoable step: the whole point is that it is safe
+    /// to try on a request you care about.
+    #[test]
+    fn gq_reformats_a_json_body_and_undo_puts_it_back() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        let original = "POST /a HTTP/1.1\nContent-Type: application/json\n\n{\"a\":[1,2]}";
+        app.active_buffer().unwrap().set_text(original);
+
+        press(&mut app, "gq");
+        let formatted = app.preview_buffer(true).unwrap().text();
+        assert!(
+            formatted.ends_with("{\n  \"a\": [\n    1,\n    2\n  ]\n}"),
+            "body should be indented: {formatted}"
+        );
+        assert!(
+            formatted.starts_with("POST /a HTTP/1.1\n"),
+            "the head must be untouched: {formatted}"
+        );
+
+        press(&mut app, "u");
+        assert_eq!(
+            app.preview_buffer(true).unwrap().text(),
+            original,
+            "one checkpoint, so one undo restores the original exactly"
+        );
+    }
+
+    /// A body that is not JSON is left alone and the reason is reported —
+    /// silently mangling a payload would be the worst outcome here.
+    #[test]
+    fn gq_leaves_a_non_json_body_alone() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        let original = "POST /a HTTP/1.1\nHost: x\n\nnot json at all";
+        app.active_buffer().unwrap().set_text(original);
+
+        press(&mut app, "gq");
+        assert_eq!(app.preview_buffer(true).unwrap().text(), original);
+        let status = app.status.lock().unwrap().clone();
+        assert!(status.contains("cannot format"), "should say why: {status}");
+    }
+
+    /// `<C-g>` stages the focused buffer for the external editor. The handoff
     /// itself needs a real terminal, so the test stops at the staging.
     #[test]
-    fn e_stages_the_held_item_for_the_external_editor() {
+    fn ctrl_g_stages_the_held_item_for_the_external_editor() {
         let (_engine, mut app, _rt) = app_with_both_legs_held();
-        press(&mut app, "e");
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
 
         let job = app.pending_edit.as_ref().expect("an edit should be staged");
         assert!(

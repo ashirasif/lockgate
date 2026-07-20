@@ -77,6 +77,23 @@ impl TextBuffer {
         self.lines.join("\n")
     }
 
+    /// Replace the whole buffer, keeping the cursor as close to where it was as
+    /// the new text allows.
+    ///
+    /// Deliberately does *not* checkpoint: the caller decides whether the
+    /// replacement is one undoable step, and a wholesale rewrite that could not
+    /// be undone would be the worst kind of edit to offer.
+    pub fn set_text(&mut self, text: &str) {
+        self.lines = text.split('\n').map(str::to_string).collect();
+        self.anchor = None;
+        // Reformatting changes the line count, so the old position may no
+        // longer exist. Clamping beats resetting to the top, which would throw
+        // away the operator's place in a long body.
+        self.cursor.line = self.cursor.line.min(self.lines.len().saturating_sub(1));
+        self.clamp_col();
+        self.mark_dirty();
+    }
+
     pub fn lines(&self) -> &[String] {
         &self.lines
     }

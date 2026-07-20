@@ -296,11 +296,13 @@ enum Bind {
 /// two things you do to it are forward and drop. A key that is unambiguous in
 /// one window can be spent there without costing anything anywhere else.
 const WINDOW_MAP: &[(Window, &str, Bind)] = &[
-    // Hand the buffer to the operator's real editor. `e` is end-of-word in vim,
-    // but these windows have no word motions to shadow — and this is the key
-    // that gets you the editor that does.
-    (Window::Intercept, "e", Bind::ExternalEdit),
-    (Window::Repeater, "e", Bind::ExternalEdit),
+    // Hand the buffer to the operator's real editor. `<C-g>` rather than `e`:
+    // the preview panes grew real vim motions, and `e` is end-of-word there. A
+    // key that means "jump a word" inside the buffer and "launch nvim" one
+    // keystroke outside it is a trap, so external edit moved somewhere no
+    // motion can claim — and the same chord now works in both places.
+    (Window::Intercept, "<C-g>", Bind::ExternalEdit),
+    (Window::Repeater, "<C-g>", Bind::ExternalEdit),
     (Window::Intercept, "f", Bind::Forward),
     (Window::Intercept, "d", Bind::Drop),
     (Window::Intercept, "F", Bind::ForwardAll),
@@ -473,6 +475,11 @@ impl Input {
         let parsed = match key.code {
             KeyCode::Esc => self.vim.feed_escape(),
             KeyCode::Char('r') if ctrl => self.vim.feed_redo(),
+            // Escape hatch to the real editor, from inside the buffer. The
+            // grammar never sees it: a focused buffer takes every key, so
+            // without this arm there would be no way to reach `$EDITOR` short
+            // of leaving the preview first.
+            KeyCode::Char('g') if ctrl => return Some(Action::ExternalEdit),
             KeyCode::Char(c) if !ctrl => self.vim.feed(c),
             // Arrows are the same motions by another name.
             KeyCode::Left => self.vim.feed('h'),

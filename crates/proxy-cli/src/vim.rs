@@ -131,6 +131,14 @@ pub enum Simple {
     /// `.`
     Repeat,
     JoinLines,
+    /// `gq` — pretty-print the message body.
+    ///
+    /// Vim's `gq` is an operator that takes a motion, but there is only one
+    /// sensible scope here: a JSON body is a single syntactic unit, and
+    /// reformatting half of one produces garbage. So this is a simple command
+    /// over the whole body rather than an operator, and `gqq`/`gqip` are not
+    /// accepted — better to not offer a motion than to accept one and ignore it.
+    Format,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +299,11 @@ impl VimParser {
                 self.wait = Wait::Start;
                 return match c {
                     'g' => self.finish_motion(Motion::Top),
+                    // `gq` is a command, not a motion, so it cannot be an
+                    // operator's target. This arm returns before the general
+                    // operator-pending guard below, so `dgq` has to be rejected
+                    // here or it would silently format instead.
+                    'q' if self.operator.is_none() => self.finish_simple(Simple::Format),
                     _ => {
                         self.reset();
                         Parsed::Invalid
@@ -533,6 +546,30 @@ mod tests {
             last = p.feed(c);
         }
         last
+    }
+
+    /// `gq` is a whole-body command, not a motion, so it must not be usable as
+    /// an operator target — `dgq` is a typo, and formatting instead of erroring
+    /// would be a surprising thing to do to someone's request.
+    #[test]
+    fn gq_formats_and_cannot_be_an_operator_target() {
+        assert_eq!(
+            parse("gq"),
+            Parsed::Command(Command::Simple {
+                cmd: Simple::Format,
+                count: 1
+            })
+        );
+        assert_eq!(parse("dgq"), Parsed::Invalid);
+        assert_eq!(parse("ygq"), Parsed::Invalid);
+        // `gg` must still work — `gq` shares its prefix.
+        assert_eq!(
+            parse("gg"),
+            Parsed::Command(Command::Move {
+                motion: Motion::Top,
+                count: 1
+            })
+        );
     }
 
     fn visual(keys: &str) -> Parsed {
