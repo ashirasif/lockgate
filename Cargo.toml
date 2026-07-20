@@ -27,3 +27,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+[profile.release]
+# Symbols are ~4.5MB of a 20MB binary and buy nothing here: a release build is
+# something an operator runs, not something anyone debugs. Backtraces still
+# name the crate and are recoverable by building without this.
+strip = true
