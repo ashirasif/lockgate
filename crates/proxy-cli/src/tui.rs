@@ -3508,6 +3508,77 @@ mod tests {
         assert_eq!(app.intercept.pane, Pane::Table, "now it leaves");
     }
 
+    /// Every yank form, end to end through the keymap, and a put to prove the
+    /// register actually round-trips.
+    #[test]
+    fn yank_forms_all_reach_the_register() {
+        let cases: [(&str, &str, bool); 6] = [
+            // keys,      expected register text,  linewise
+            ("yy", "GET /req-path HTTP/1.1", true),
+            ("yw", "GET ", false),
+            ("y$", "GET /req-path HTTP/1.1", false),
+            ("yiw", "GET", false),
+            ("yaw", "GET ", false),
+            ("vlly", "GET", false),
+        ];
+        for (keys, expected, linewise) in cases {
+            let (_engine, mut app, _rt) = app_with_both_legs_held();
+            app.apply(Action::Enter);
+            press(&mut app, keys);
+            assert_eq!(app.yank.text, expected, "`{keys}` yanked the wrong text");
+            assert_eq!(app.yank.linewise, linewise, "`{keys}` wrong shape");
+        }
+    }
+
+    /// A yank must not change the buffer — the classic way to get this wrong is
+    /// to implement `y` as delete-then-undo.
+    #[test]
+    fn yank_leaves_the_buffer_untouched() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        let before = app.preview_buffer(true).unwrap().text();
+
+        press(&mut app, "yy");
+        assert_eq!(app.preview_buffer(true).unwrap().text(), before);
+        assert!(
+            !app.preview_buffer(true).unwrap().is_dirty(),
+            "yanking is not an edit"
+        );
+    }
+
+    /// Deleting yanks too, which is what makes `dd` then `p` a move.
+    #[test]
+    fn delete_populates_the_register() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        press(&mut app, "dd");
+        assert_eq!(app.yank.text, "GET /req-path HTTP/1.1");
+        assert!(app.yank.linewise);
+
+        press(&mut app, "p");
+        assert!(
+            app.preview_buffer(true)
+                .unwrap()
+                .text()
+                .contains("GET /req-path"),
+            "dd then p should move the line back"
+        );
+    }
+
+    /// `P` puts before, `p` after — linewise, so they land on their own lines.
+    #[test]
+    fn put_before_and_after_differ() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        press(&mut app, "yy");
+
+        press(&mut app, "P");
+        let lines = app.preview_buffer(true).unwrap().lines().to_vec();
+        assert_eq!(lines[0], "GET /req-path HTTP/1.1");
+        assert_eq!(lines[1], "GET /req-path HTTP/1.1", "P puts above");
+    }
+
     /// `e` stages the focused buffer for the external editor. The handoff
     /// itself needs a real terminal, so the test stops at the staging.
     #[test]
