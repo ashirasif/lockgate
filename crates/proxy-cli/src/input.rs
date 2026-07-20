@@ -87,6 +87,7 @@ pub enum Window {
     /// Replay a single request and read the fresh response.
     Repeater,
     Scope,
+    Findings,
     /// Traffic held in flight, awaiting forward or drop.
     Intercept,
     /// The tree of what has been seen: host, then path.
@@ -97,11 +98,12 @@ pub enum Window {
 
 impl Window {
     /// Left-to-right tab order, and the set `gt` / `gT` cycle through.
-    pub const ALL: [Window; 6] = [
+    pub const ALL: [Window; 7] = [
         Window::Proxy,
         Window::Intercept,
         Window::Repeater,
         Window::Scope,
+        Window::Findings,
         Window::Sitemap,
         Window::Automate,
     ];
@@ -113,6 +115,7 @@ impl Window {
             Window::Intercept => "Intercept",
             Window::Repeater => "Repeater",
             Window::Scope => "Scope",
+            Window::Findings => "Findings",
             Window::Sitemap => "Sitemap",
             Window::Automate => "Automate",
         }
@@ -128,6 +131,7 @@ impl Window {
             Window::Intercept => 'I',
             Window::Repeater => 'R',
             Window::Scope => 'C',
+            Window::Findings => 'T',
             Window::Sitemap => 'S',
             Window::Automate => 'A',
         }
@@ -257,6 +261,8 @@ pub enum Action {
     ScopeAddHost,
     ScopeRemoveHost,
     ToggleScopeFilter,
+    CycleSeverity,
+    CycleStatus,
     NewSession,
     CloseSession,
     /// Repeater: switch sessions. `Some(n)` picks the nth, 1-based as the tab
@@ -309,6 +315,8 @@ enum Bind {
     ScopeAddHost,
     ScopeRemoveHost,
     ToggleScopeFilter,
+    CycleSeverity,
+    CycleStatus,
     NewSession,
     CloseSession,
     SelectSession,
@@ -368,6 +376,11 @@ const WINDOW_MAP: &[(Window, &str, Bind)] = &[
     (Window::Scope, "n", Bind::PromptSeeded(":scope new ")),
     (Window::Scope, "d", Bind::Drop),
     (Window::Scope, "<C-w>", Bind::Focus(None)),
+    // Findings: triage is the whole job, so severity and status are single keys
+    // rather than a form.
+    (Window::Findings, "d", Bind::Drop),
+    (Window::Findings, "s", Bind::CycleSeverity),
+    (Window::Findings, "c", Bind::CycleStatus),
 ];
 
 /// The keymap is data, not control flow, so that `:map` can later rewrite it
@@ -415,6 +428,8 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     // Bypass scope filtering from wherever you noticed something missing —
     // the same reason the intercept toggle is global rather than window-bound.
     ("<Space>c", Bind::ToggleScopeFilter),
+    // File the selected flow as a finding, from wherever you noticed it.
+    ("<Space>f", Bind::PromptSeeded(":finding ")),
     // Intercept verdicts live in `WINDOW_MAP` as bare `f`/`d`, since that is
     // where they are unambiguous. Toggling *whether* we hold is global, though:
     // you reach for it from wherever you noticed traffic was stalling.
@@ -439,6 +454,10 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     // `C` for sCope: `S` is Sitemap and moving it would break muscle memory
     // for the sake of a mnemonic.
     ("C", Bind::Window(Window::Scope)),
+    // `T` for triage: `F` would read better but Intercept already spends it on
+    // forward-all, and a window key you cannot press from every window is worse
+    // than one with a duller mnemonic.
+    ("T", Bind::Window(Window::Findings)),
     ("S", Bind::Window(Window::Sitemap)),
     ("A", Bind::Window(Window::Automate)),
     ("gt", Bind::WindowStep(1)),
@@ -703,6 +722,8 @@ impl Input {
             Bind::ToggleIntercept => Action::ToggleIntercept,
             Bind::SendToRepeater => Action::SendToRepeater,
             Bind::ToggleScopeFilter => Action::ToggleScopeFilter,
+            Bind::CycleSeverity => Action::CycleSeverity,
+            Bind::CycleStatus => Action::CycleStatus,
             Bind::ScopeAddHost => Action::ScopeAddHost,
             Bind::ScopeRemoveHost => Action::ScopeRemoveHost,
             Bind::NewSession => Action::NewSession,

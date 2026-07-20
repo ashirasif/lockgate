@@ -386,6 +386,9 @@ struct App {
     intercept: InterceptView,
     sitemap: SitemapView,
     scope: ScopeView,
+    /// Findings as of the last refresh, and which row is selected.
+    findings: Vec<proxy_core::Finding>,
+    finding_row: usize,
     /// Scopes as of the last refresh, and the highlighted one's rules.
     scopes: Vec<proxy_core::scope::Scope>,
     scope_rules: Vec<proxy_core::scope::ScopeRule>,
@@ -441,6 +444,8 @@ impl App {
             intercept: InterceptView::default(),
             sitemap: SitemapView::default(),
             scope: ScopeView::default(),
+            findings: Vec::new(),
+            finding_row: 0,
             scopes: Vec::new(),
             scope_rules: Vec::new(),
             scope_filter: true,
@@ -610,6 +615,9 @@ impl App {
             self.engine.list_flows()
         };
 
+        self.findings = self.engine.list_findings();
+        self.finding_row = self.finding_row.min(self.findings.len().saturating_sub(1));
+
         self.scopes = self.engine.scopes();
         self.scope.scope_row = self
             .scope
@@ -728,6 +736,10 @@ impl App {
                 // A different item means a different buffer to look at.
                 self.content_scroll = 0;
             }
+            Action::Move { motion, count } if self.window == Window::Findings => {
+                let last = self.findings.len().saturating_sub(1);
+                self.finding_row = step_row(self.finding_row, last, motion, count);
+            }
             Action::Move { motion, count } if self.window == Window::Scope => {
                 // Each pane keeps its own cursor, so switching panes does not
                 // move the one you were not looking at.
@@ -793,6 +805,8 @@ impl App {
                 let on = !self.scope_filter;
                 self.set_scope_filter(on);
             }
+            Action::CycleSeverity => self.cycle_finding(true),
+            Action::CycleStatus => self.cycle_finding(false),
             Action::ScopeAddHost => self.scope_add_host(),
             Action::ScopeRemoveHost => self.scope_remove_host(),
             Action::NewSession => {
@@ -853,6 +867,7 @@ impl App {
             }
             Action::Insert(key) => self.edit(key),
             Action::Forward => self.answer_held(true),
+            Action::Drop if self.window == Window::Findings => self.delete_finding(),
             Action::Drop if self.window == Window::Scope => self.scope_delete(),
             Action::Drop => self.answer_held(false),
             Action::ForwardAll => {
@@ -1371,6 +1386,125 @@ impl App {
             }
         }
         build_sitemap_rows(&nodes, &self.sitemap.collapsed)
+    }
+
+    // --- findings ---
+
+    /// The vocabularies, in the order the keys walk them. Same values the MCP
+    /// tools validate against — the columns are free text with no CHECK, so a
+    /// typo here would persist and skew later filters.
+    const SEVERITIES: &'static [&'static str] = &["info", "low", "medium", "high", "critical"];
+    const STATUSES: &'static [&'static str] = &[
+        "draft",
+        "confirmed",
+        "false_positive",
+        "reported",
+        "fixed",
+        "wont_fix",
+    ];
+
+    /// Step the highlighted finding's severity or status one along.
+    ///
+    /// Cycling rather than prompting: triage is a repeated motion over many
+    /// findings, and a menu per change would make it a chore.
+    fn cycle_finding(&mut self, severity: bool) {
+        let Some(finding) = self.findings.get(self.finding_row) else {
+            self.note("no finding selected");
+            return;
+        };
+        let (id, current) = (
+            finding.id,
+            if severity {
+                finding.severity.clone()
+            } else {
+                finding.status.clone()
+            },
+        );
+        let vocabulary = if severity {
+            Self::SEVERITIES
+        } else {
+            Self::STATUSES
+        };
+        // An unrecognised value starts from the beginning rather than sticking.
+        let next = vocabulary
+            .iter()
+            .position(|v| *v == current)
+            .map_or(0, |i| (i + 1) % vocabulary.len());
+        let next = vocabulary[next];
+
+        let changed = if severity {
+            self.engine.set_finding_triage(id, Some(next), None)
+        } else {
+            self.engine.set_finding_triage(id, None, Some(next))
+        };
+        if changed == 0 {
+            self.note("could not update the finding");
+            return;
+        }
+        self.refresh();
+        self.note(&format!("#{id} → {next}"));
+    }
+
+    fn delete_finding(&mut self) {
+        let Some(finding) = self.findings.get(self.finding_row) else {
+            return;
+        };
+        let (id, title) = (finding.id, finding.title.clone());
+        if self.engine.delete_finding(id) == 0 {
+            self.note("could not delete the finding");
+            return;
+        }
+        self.refresh();
+        self.note(&format!("deleted {title:?}"));
+    }
+
+    /// File the selected flow as a finding. `:finding <title>`.
+    ///
+    /// Deliberately one field. A finding starts as "this looks wrong, and here
+    /// is the request" — the prose belongs in an editor later, and a form up
+    /// front is how you end up not filing it at all.
+    fn file_finding(&mut self, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            self.note("usage: :finding <title>   (files the selected flow)");
+            return;
+        }
+        let Some(flow) = self.detail.as_ref() else {
+            self.note("no flow selected to attach as evidence");
+            return;
+        };
+
+        let new = proxy_core::NewFinding {
+            title: title.to_string(),
+            // Draft and info: a finding you have not triaged yet should not
+            // claim a severity you did not choose.
+            severity: "info".to_string(),
+            status: "draft".to_string(),
+            cvss_vector: None,
+            cvss_score: None,
+            cvss_version: None,
+            cwe: None,
+            description_md: String::new(),
+            repro_md: None,
+            impact_md: None,
+            remediation_md: None,
+            host: flow.request.uri.host().map(str::to_string),
+            path: Some(flow.request.uri.path().to_string()),
+            evidence: vec![(flow.id as i64, Some("observed".to_string()))],
+        };
+
+        let engine = self.engine.clone();
+        let status = self.status.clone();
+        let flow_id = flow.id;
+        // Findings go through the writer task, so this cannot be awaited here
+        // without blocking the draw loop.
+        tokio::spawn(async move {
+            let message = match engine.create_finding(new).await {
+                Ok(id) => format!("filed finding #{id} from flow #{flow_id}"),
+                Err(e) => format!("could not file: {e:?}"),
+            };
+            *status.lock().unwrap() = message;
+        });
     }
 
     // --- scope ---
@@ -1904,6 +2038,7 @@ impl App {
                 self.note(&format!("set {option}={value}"));
             }
             Command::Pretty => self.format_buffer(),
+            Command::Finding(title) => self.file_finding(&title),
             Command::Scope { verb, argument } => self.run_scope_command(&verb, &argument),
             Command::Help => self.note(HELP),
             Command::Unknown(name) => self.note(&format!("E492: not an editor command: {name}")),
@@ -2210,6 +2345,7 @@ impl App {
             Window::Repeater => self.draw_repeater(frame, body),
             Window::Sitemap => self.draw_sitemap(frame, body),
             Window::Scope => self.draw_scope(frame, body),
+            Window::Findings => self.draw_findings(frame, body),
             Window::Automate => self.draw_automate(frame, body),
         }
         self.draw_status(frame, status_bar);
@@ -2921,6 +3057,129 @@ impl App {
         self.content_len = self.scopes.len().max(self.scope_rules.len()) as u16;
     }
 
+    /// Findings: the list on the left, the highlighted one in full on the right.
+    ///
+    /// Severity and status are the two things that move during triage, so they
+    /// are the two things a single key changes.
+    fn draw_findings(&mut self, frame: &mut Frame, area: Rect) {
+        let [banner, panes] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        self.viewport = panes.height.saturating_sub(2) as usize;
+
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  s severity   c status   d delete   <Space>f file the selected flow",
+                muted(),
+            )),
+            banner,
+        );
+
+        if self.findings.is_empty() {
+            frame.render_widget(
+                empty_pane(
+                    " Findings ",
+                    "nothing filed — select a flow in Proxy (P) and press <Space>f",
+                ),
+                panes,
+            );
+            self.content_len = 0;
+            return;
+        }
+
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+                .areas(panes);
+
+        let rows: Vec<Line> = self
+            .findings
+            .iter()
+            .enumerate()
+            .map(|(i, finding)| {
+                let mut spans = vec![
+                    Span::styled(
+                        format!(" {:<8} ", finding.severity),
+                        Style::new().fg(severity_color(&finding.severity)).bold(),
+                    ),
+                    Span::raw(finding.title.clone()),
+                ];
+                // Anything not still a draft has been looked at; saying so in
+                // the list is what stops you re-reading the same finding.
+                if finding.status != "draft" {
+                    spans.push(Span::styled(format!("  [{}]", finding.status), muted()));
+                }
+                let line = Line::from(spans);
+                if i == self.finding_row {
+                    line.style(Style::new().bg(INACTIVE_BG))
+                } else {
+                    line
+                }
+            })
+            .collect();
+
+        frame.render_widget(
+            Paragraph::new(rows).block(
+                Block::bordered()
+                    .title(format!(" Findings ({}) ", self.findings.len()))
+                    .border_style(Style::new().fg(Color::Cyan)),
+            ),
+            left,
+        );
+
+        let detail = match self.findings.get(self.finding_row) {
+            None => vec![Line::styled("no finding selected", muted())],
+            Some(finding) => {
+                let mut lines = vec![
+                    Line::styled(finding.title.clone(), Style::new().bold().fg(Color::Cyan)),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{} ", finding.severity),
+                            Style::new().fg(severity_color(&finding.severity)).bold(),
+                        ),
+                        Span::styled(format!("· {} ", finding.status), muted()),
+                        Span::styled(format!("· {}", finding.origin), muted()),
+                    ]),
+                    Line::from(""),
+                ];
+                if let Some(host) = &finding.host {
+                    let path = finding.path.clone().unwrap_or_default();
+                    lines.push(Line::from(format!("{host}{path}")));
+                }
+                if let Some(cwe) = &finding.cwe {
+                    lines.push(Line::styled(cwe.clone(), muted()));
+                }
+                if !finding.description_md.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.extend(
+                        finding
+                            .description_md
+                            .lines()
+                            .map(|l| Line::from(l.to_string())),
+                    );
+                }
+                // Evidence is what makes a finding reproducible, so it is shown
+                // even when everything else is empty.
+                lines.push(Line::from(""));
+                lines.push(Line::styled("EVIDENCE", muted()));
+                if finding.evidence.is_empty() {
+                    lines.push(Line::styled("  (none)", muted()));
+                } else {
+                    for (flow_id, label) in &finding.evidence {
+                        lines.push(Line::from(format!(
+                            "  #{flow_id}{}",
+                            label.as_ref().map(|l| format!("  {l}")).unwrap_or_default()
+                        )));
+                    }
+                }
+                lines
+            }
+        };
+        self.content_len = detail.len().max(self.findings.len()) as u16;
+        frame.render_widget(
+            pane(detail, " Detail ").scroll((self.content_scroll, 0)),
+            right,
+        );
+    }
+
     /// Sitemap: the tree of what has been seen, host then path. `<CR>` folds.
     fn draw_sitemap(&mut self, frame: &mut Frame, area: Rect) {
         self.viewport = area.height.saturating_sub(2) as usize;
@@ -3177,7 +3436,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/I/R/C/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · :q";
+const HELP: &str = "^k palette · P/I/R/C/T/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · Findings (T): s severity, c status, d delete, <Space>f file · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -3701,6 +3960,18 @@ fn message_lines(start: Line<'static>, headers: &HeaderMap, body: &[u8]) -> Vec<
         }
     }
     lines
+}
+
+/// Severity at a glance. The point of the colour is that "critical" should not
+/// need reading.
+fn severity_color(severity: &str) -> Color {
+    match severity {
+        "critical" => Color::Red,
+        "high" => Color::LightRed,
+        "medium" => Color::Yellow,
+        "low" => Color::Cyan,
+        _ => Color::Gray,
+    }
 }
 
 fn status_color(status: StatusCode) -> Color {
@@ -4276,6 +4547,137 @@ mod tests {
         let mut app = App::new(engine);
         app.refresh();
         assert!(render(&mut app).contains("(pending)"));
+    }
+
+    // --- findings ---
+
+    #[tokio::test]
+    async fn a_flow_can_be_filed_as_a_finding() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        assert!(app.findings.is_empty());
+
+        app.file_finding("auth bypass on /login");
+        // The write goes through the writer task.
+        for _ in 0..200 {
+            if !engine.list_findings().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        app.refresh();
+        assert_eq!(app.findings.len(), 1);
+        let finding = &app.findings[0];
+        assert_eq!(finding.title, "auth bypass on /login");
+        assert_eq!(
+            finding.severity, "info",
+            "untriaged should not claim a severity"
+        );
+        assert_eq!(finding.status, "draft");
+        assert_eq!(finding.host.as_deref(), Some("api.test"));
+        assert_eq!(
+            finding.evidence.len(),
+            1,
+            "the flow you were looking at is the evidence"
+        );
+    }
+
+    #[test]
+    fn filing_without_a_flow_says_so() {
+        let engine = Engine::new();
+        let mut app = App::new(engine);
+        app.refresh();
+        app.file_finding("something");
+        let status = app.status.lock().unwrap().clone();
+        assert!(status.contains("no flow selected"), "{status}");
+    }
+
+    #[test]
+    fn an_empty_title_is_refused() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/x");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("   ");
+        assert!(engine.list_findings().is_empty());
+    }
+
+    /// Triage is a repeated motion, so severity and status are one key each.
+    #[tokio::test]
+    async fn severity_and_status_cycle_through_their_vocabularies() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/x");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("t");
+        for _ in 0..200 {
+            if !engine.list_findings().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        app.refresh();
+
+        assert_eq!(app.findings[0].severity, "info");
+        app.cycle_finding(true);
+        assert_eq!(app.findings[0].severity, "low");
+        app.cycle_finding(true);
+        assert_eq!(app.findings[0].severity, "medium");
+
+        assert_eq!(app.findings[0].status, "draft");
+        app.cycle_finding(false);
+        assert_eq!(app.findings[0].status, "confirmed");
+
+        // And it wraps rather than sticking at the end.
+        for _ in 0..3 {
+            app.cycle_finding(true);
+        }
+        assert_eq!(app.findings[0].severity, "info", "severity should wrap");
+    }
+
+    #[tokio::test]
+    async fn a_finding_can_be_deleted() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/x");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("t");
+        for _ in 0..200 {
+            if !engine.list_findings().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        app.refresh();
+        assert_eq!(app.findings.len(), 1);
+
+        app.delete_finding();
+        assert!(app.findings.is_empty());
+        assert!(engine.list_findings().is_empty());
+    }
+
+    /// The vocabularies must match what the MCP tools validate against — the
+    /// columns are free text with no CHECK, so a divergence would persist.
+    #[test]
+    fn the_vocabularies_are_the_documented_ones() {
+        assert_eq!(
+            App::SEVERITIES,
+            ["info", "low", "medium", "high", "critical"]
+        );
+        assert_eq!(
+            App::STATUSES,
+            [
+                "draft",
+                "confirmed",
+                "false_positive",
+                "reported",
+                "fixed",
+                "wont_fix"
+            ]
+        );
     }
 
     // --- scope ---

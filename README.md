@@ -7,7 +7,7 @@ work the same capture, queue and scope you are looking at.
 Two frontends over one engine:
 
 - a **ratatui TUI** with vim editing, for the human
-- an **MCP server** with 26 tools, for an agent
+- an **MCP server** with 27 tools, for an agent
 
 Both hold the same `Arc<Engine>` in one process, so there is one SQLite writer
 and neither can see stale state.
@@ -31,16 +31,17 @@ exists but you will notice what is missing.
 | **Scope** | Named scopes, include/exclude rules where excludes always win, glob/regex/CIDR host matching, filtering across Proxy and Sitemap, bypass toggle |
 | **Editing** | A real vim grammar — counts, operators, text objects, visual mode, undo/redo, registers — plus `$EDITOR` handoff for anything it does not cover |
 | **Display** | HTTP syntax highlighting, syntect for bodies (JSON, HTML, XML, GraphQL, protobuf, JS-in-`<script>`, …), JSON/HTML pretty-printing, OSC 52 clipboard |
-| **MCP** | 26 tools: recon, intercept, scope, send, format. Resources for full bodies |
-| **Findings** | Schema, core API and MCP tools — see gaps for the missing half |
+| **MCP** | 27 tools: recon, intercept, scope, send, format. Resources for full bodies |
+| **Findings** | File a flow as a finding, triage severity and status by keystroke, delete. Also over MCP |
+| **WebSockets** | Frames captured both directions and correlated to the upgrade, shown in the Proxy pane and over MCP. Observed, not intercepted |
 | **Compressed bodies** | gzip, deflate and brotli decoded for display and over MCP, re-encoded when an intercepted body is edited. Stored bytes are always what arrived |
 
 ### Partial
 
 | Area | What is missing |
 |---|---|
-| **Findings** | No TUI at all. Creatable and listable over MCP only, so a human cannot triage without an agent |
-| **Projects** | The registry supports many; `main.rs` always opens `default`. No picker, no CLI flag |
+| **Findings** | Prose fields (description, repro, impact) are set over MCP only; the TUI files and triages but does not edit them |
+| **Projects** | Selected with `--project`, but only at startup — no switching from inside the TUI |
 | **Notes** | `note` table exists, nothing reads or writes it |
 | **Repeater** | Tabs and history are in memory. Closing the TUI loses them |
 | **Search** | `/` moves the cursor through the flow list. No body search, and no search tool over MCP |
@@ -50,13 +51,12 @@ exists but you will notice what is missing.
 | Area | |
 |---|---|
 | **zstd bodies** | `zstd` is not decoded. Still rare in browser traffic, and the usable crate pulls a C library. Such bodies render as they arrived |
-| **WebSockets** | Frames pass through untouched. The `ws_message` table exists and is never written |
+| **WebSocket interception** | Frames are recorded, never held. Pausing one side of a live full-duplex conversation reorders it against the other |
 | **HTTP/2** | Not enabled |
 | **Match & replace** | Absent |
 | **Automate / Intruder** | The tab is a stub that says so |
 | **Structured filters** | No query language, no saved filters |
 | **Retention** | Nothing evicts old bodies; a long engagement grows without bound |
-| **CLI arguments** | None. Ports are hardcoded (proxy `3000`, MCP `3001`) |
 
 ---
 
@@ -87,6 +87,9 @@ openssl req -x509 -new -nodes \
 Nothing HTTPS works until the CA is trusted. `crates/proxy-core/src/ca/ca.cer`
 is the file to install.
 
+Or, once the proxy is running, browse to **http://proxy/** through it — that is
+the only practical route onto a phone. `--export-ca <path>` writes the same file.
+
 - **macOS** — `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain crates/proxy-core/src/ca/ca.cer`
 - **Firefox** — has its own store: Settings → Privacy & Security → Certificates → Import
 - **iOS/Android** — transfer the `.cer`, install it, then enable it for full trust in the OS certificate settings
@@ -97,22 +100,24 @@ whoever holds it.
 ### 3. Run
 
 ```sh
-cargo run --release
+cargo run --release                          # proxy 3000, MCP 3001, project "default"
+cargo run --release -- --project acme -p 8080
+cargo run --release -- --help
 ```
 
-- proxy listens on `127.0.0.1:3000`
-- MCP listens on `127.0.0.1:3001`
-- project data lives in `~/.proxy`
+Point a browser or `curl -x http://127.0.0.1:3000` at it. Project data lives in
+`~/.proxy`; naming a project both creates and reopens it.
 
-Point a browser or `curl -x http://127.0.0.1:3000` at it.
+`--mcp-port 0` turns the MCP server off, which is what lets a second instance
+run quietly alongside the first.
 
 ---
 
 ## Keys
 
 `?` is not a help key; `:help` prints the summary and `<C-k>` opens the command
-palette. Windows are `P` proxy, `I` intercept, `R` repeater, `C` scope,
-`S` sitemap, `A` automate — `gt`/`gT` cycle.
+palette. Windows are `P` proxy, `I` intercept, `R` repeater,
+`C` scope, `T` findings, `S` sitemap, `A` automate — `gt`/`gT` cycle.
 
 | | |
 |---|---|
@@ -121,6 +126,7 @@ palette. Windows are `P` proxy, `I` intercept, `R` repeater, `C` scope,
 | **Repeater** | `n` new tab · `x` close · `gs` / `{count}gs` switch · `[` `]` history · `p` raw/pretty |
 | **Scope** | `n` new · `a` include · `x` exclude · `d` delete · `<CR>` activate or toggle · `<C-w>` switch pane |
 | **Sitemap** | `<CR>` fold · `a` scope host · `d` unscope host |
+| **Findings** | `s` severity · `c` status · `d` delete · `<Space>f` file the selected flow |
 | **In a buffer** | vim motions and operators · `gq` format body · `<C-g>` hand to `$EDITOR` · `<Esc>` leave |
 
 Digits are vim counts, never window bindings — which is why tab selection is
@@ -191,7 +197,7 @@ side is not trusted and a few hundred bytes can claim gigabytes.
 ## Development
 
 ```sh
-cargo test --workspace      # 372 tests
+cargo test --workspace      # 394 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```

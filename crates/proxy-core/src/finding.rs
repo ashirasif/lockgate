@@ -100,6 +100,34 @@ pub fn insert(conn: &Connection, f: &NewFinding, now: i64) -> rusqlite::Result<i
 
 /// Every finding, newest first. Findings number in the tens, not the millions,
 /// so this is unpaginated on purpose.
+/// Change a finding's triage state.
+///
+/// Severity and status only: they are what move during triage, and the prose
+/// fields belong in an editor rather than behind a keystroke. `None` leaves a
+/// column alone.
+pub fn set_triage(
+    conn: &Connection,
+    id: i64,
+    severity: Option<&str>,
+    status: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE finding
+            SET severity = COALESCE(?2, severity),
+                status = COALESCE(?3, status),
+                updated_at = ?4
+          WHERE id = ?1",
+        rusqlite::params![id, severity, status, now],
+    )
+}
+
+/// Delete a finding and its evidence links.
+pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM finding_evidence WHERE finding_id = ?1", [id])?;
+    conn.execute("DELETE FROM finding WHERE id = ?1", [id])
+}
+
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<Finding>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, severity, status, cvss_vector, cvss_score, cvss_version, cwe,

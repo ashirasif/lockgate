@@ -21,6 +21,8 @@ pub enum Command {
     /// `:pretty` — reformat the body of the message being edited. The same
     /// thing `gq` does, reachable when the buffer does not have focus.
     Pretty,
+    /// `:finding <title>` — file the selected flow as a draft finding.
+    Finding(String),
     /// `:scope <verb> [argument]` — scope management. Patterns are free text,
     /// so they arrive as a command rather than as forty keybindings.
     Scope {
@@ -50,6 +52,7 @@ impl Command {
             "resend" | "rep" | "repeat" => Command::Resend,
             "h" | "help" => Command::Help,
             "pretty" | "pp" | "format" => Command::Pretty,
+            "finding" | "fi" => Command::Finding(rest.to_string()),
             "scope" | "sc" => {
                 let (verb, argument) = match rest.split_once(char::is_whitespace) {
                     Some((verb, argument)) => (verb.to_string(), argument.trim().to_string()),

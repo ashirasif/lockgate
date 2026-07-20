@@ -316,6 +316,25 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Move a finding through triage. Returns rows changed, so an unknown id is
+    /// distinguishable from a no-op.
+    pub fn set_finding_triage(
+        &self,
+        id: i64,
+        severity: Option<&str>,
+        status: Option<&str>,
+    ) -> usize {
+        self.with_db(|conn| crate::finding::set_triage(conn, id, severity, status, now_micros()))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    pub fn delete_finding(&self, id: i64) -> usize {
+        self.with_db(|conn| crate::finding::delete(conn, id))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
     // --- websockets ---
     //
     // Frames arrive with no reference to the exchange that opened the socket —
