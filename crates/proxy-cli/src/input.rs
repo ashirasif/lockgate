@@ -252,7 +252,10 @@ pub enum Action {
     ToggleHoldResponses,
     NewSession,
     CloseSession,
-    SelectSession(usize),
+    /// Repeater: switch sessions. `Some(n)` picks the nth, 1-based as the tab
+    /// strip shows it; `None` cycles to the next, which is what a bare `gs`
+    /// means.
+    SelectSession(Option<usize>),
     History {
         forward: bool,
     },
@@ -294,7 +297,7 @@ enum Bind {
     ToggleHoldResponses,
     NewSession,
     CloseSession,
-    SelectSession(usize),
+    SelectSession,
     History {
         forward: bool,
     },
@@ -331,15 +334,12 @@ const WINDOW_MAP: &[(Window, &str, Bind)] = &[
     (Window::Repeater, "[", Bind::History { forward: false }),
     (Window::Repeater, "]", Bind::History { forward: true }),
     (Window::Repeater, "p", Bind::ToggleView),
-    (Window::Repeater, "1", Bind::SelectSession(1)),
-    (Window::Repeater, "2", Bind::SelectSession(2)),
-    (Window::Repeater, "3", Bind::SelectSession(3)),
-    (Window::Repeater, "4", Bind::SelectSession(4)),
-    (Window::Repeater, "5", Bind::SelectSession(5)),
-    (Window::Repeater, "6", Bind::SelectSession(6)),
-    (Window::Repeater, "7", Bind::SelectSession(7)),
-    (Window::Repeater, "8", Bind::SelectSession(8)),
-    (Window::Repeater, "9", Bind::SelectSession(9)),
+    // `{count}gs` selects a session, bare `gs` cycles — exactly how vim's own
+    // `{count}gt` works on tabs. Binding the digits directly cannot work: a
+    // bare digit is a *count*, consumed before the keymap is consulted, so
+    // `1` would never reach here. Leader-prefixed is taken too — `<Space>1`
+    // and `<Space>2` are the hold toggles.
+    (Window::Repeater, "gs", Bind::SelectSession),
     (Window::Sitemap, "<CR>", Bind::Toggle),
 ];
 
@@ -666,7 +666,7 @@ impl Input {
             Bind::SendToRepeater => Action::SendToRepeater,
             Bind::NewSession => Action::NewSession,
             Bind::CloseSession => Action::CloseSession,
-            Bind::SelectSession(n) => Action::SelectSession(n),
+            Bind::SelectSession => Action::SelectSession(count),
             Bind::History { forward } => Action::History { forward },
             Bind::ToggleView => Action::ToggleView,
             Bind::Toggle => Action::Toggle,
@@ -1171,7 +1171,34 @@ mod tests {
         assert_eq!(feed(&mut input, "\r").pop(), None, "CR is not a Char key");
     }
 
-    /// Outside Intercept those keys stay vim's, unbound and inert.
+    /// Bare digits are vim counts, consumed before the keymap is consulted, so
+    /// a window binding on `1` can never fire. Tab selection is leader-prefixed
+    /// for that reason — this pins the conflict so it cannot come back.
+    #[test]
+    fn digits_stay_counts_and_tab_selection_is_leader_prefixed() {
+        let mut input = Input::new();
+        input.set_window(Window::Repeater);
+        assert!(
+            feed(&mut input, "2").is_empty(),
+            "a bare digit must stay a count"
+        );
+
+        // `{count}gs` is how you pick one, using the count rather than fighting
+        // it. Leader-prefixed digits are not free either: `<Space>1` and
+        // `<Space>2` are the hold toggles.
+        let mut input = Input::new();
+        input.set_window(Window::Repeater);
+        assert_eq!(
+            feed(&mut input, "2gs"),
+            vec![Action::SelectSession(Some(2))]
+        );
+
+        // Bare `gs` cycles, as vim's bare `gt` does.
+        let mut input = Input::new();
+        input.set_window(Window::Repeater);
+        assert_eq!(feed(&mut input, "gs"), vec![Action::SelectSession(None)]);
+    }
+
     #[test]
     fn f_and_d_stay_free_in_other_windows() {
         for window in [Window::Proxy, Window::Repeater, Window::Sitemap] {

@@ -739,14 +739,24 @@ impl App {
                 self.content_scroll = 0;
                 self.note(&format!("closed tab {closed}"));
             }
-            Action::SelectSession(n) => {
-                // 1-based on screen, so the key you press is the number you see.
-                if self.repeater.select(n.saturating_sub(1)) {
-                    self.content_scroll = 0;
-                } else {
-                    self.note(&format!("no tab {n}"));
+            Action::SelectSession(which) => match which {
+                // 1-based on screen, so the count you type is the number you see.
+                Some(n) => {
+                    if self.repeater.select(n.saturating_sub(1)) {
+                        self.content_scroll = 0;
+                    } else {
+                        self.note(&format!("no tab {n}"));
+                    }
                 }
-            }
+                // Bare `gs` cycles, wrapping, so it stays useful with any
+                // number of tabs and never needs a count for the common case.
+                None => {
+                    let next = (self.repeater.active + 1) % self.repeater.sessions.len();
+                    self.repeater.select(next);
+                    self.content_scroll = 0;
+                    self.note(&format!("tab {}", next + 1));
+                }
+            },
             Action::History { forward } => {
                 if self.repeater.step_history(forward) {
                     self.content_scroll = 0;
@@ -1956,7 +1966,10 @@ impl App {
                 panes,
             );
             frame.render_widget(
-                Paragraph::new(Line::styled("  n new tab   x close   1-9 switch", muted())),
+                Paragraph::new(Line::styled(
+                    "  n new tab   x close   gs / {count}gs switch",
+                    muted(),
+                )),
                 banner,
             );
             return;
@@ -2090,7 +2103,7 @@ impl App {
             if editing {
                 "  vim keys   <Esc> leave".to_string()
             } else {
-                "  <CR> edit  ^g $EDITOR  gq format  p view  [ ] history  <Space>r send".to_string()
+                "  <CR> edit  gq format  gs tab  p view  [ ] history  <Space>r send".to_string()
             },
             muted(),
         ));
@@ -2602,7 +2615,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, 1-9 switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · :q";
+const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -3716,10 +3729,10 @@ mod tests {
         assert_eq!(app.repeater.sessions.len(), 3);
         assert_eq!(app.repeater.active, 2, "opening switches to the new tab");
 
-        app.apply(Action::SelectSession(1));
+        app.apply(Action::SelectSession(Some(1)));
         assert_eq!(app.repeater.active, 0, "1 selects the first tab");
 
-        app.apply(Action::SelectSession(9));
+        app.apply(Action::SelectSession(Some(9)));
         assert_eq!(
             app.repeater.active, 0,
             "a tab that isn't there changes nothing"
@@ -3727,6 +3740,34 @@ mod tests {
 
         app.apply(Action::CloseSession);
         assert_eq!(app.repeater.sessions.len(), 2);
+    }
+
+    /// Driven through the real key path, not `apply` — the original bug was
+    /// that the keystrokes never became actions at all, which an action-level
+    /// test cannot see.
+    #[test]
+    fn tab_keys_actually_reach_the_repeater() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        press(&mut app, " s");
+        assert_eq!(app.window, Window::Repeater);
+
+        press(&mut app, "n");
+        press(&mut app, "n");
+        assert_eq!(app.repeater.sessions.len(), 3, "`n` should open tabs");
+        assert_eq!(app.repeater.active, 2);
+
+        press(&mut app, "1gs");
+        assert_eq!(app.repeater.active, 0, "`1gs` should select the first tab");
+
+        press(&mut app, "3gs");
+        assert_eq!(app.repeater.active, 2, "`3gs` should select the third");
+
+        press(&mut app, "gs");
+        assert_eq!(app.repeater.active, 0, "bare `gs` cycles and wraps");
+
+        press(&mut app, "x");
+        assert_eq!(app.repeater.sessions.len(), 2, "`x` should close a tab");
     }
 
     /// There must always be somewhere to land, or the draw path would index an
@@ -3881,7 +3922,7 @@ mod tests {
             "a fresh tab is empty"
         );
 
-        app.apply(Action::SelectSession(1));
+        app.apply(Action::SelectSession(Some(1)));
         assert_eq!(
             app.repeater.session().history.len(),
             1,
