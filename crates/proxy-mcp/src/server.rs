@@ -1,14 +1,20 @@
-//! The MCP server: seven tools for recon over captured traffic, plus the
-//! `flow://` resources that carry full request/response bodies on demand.
+//! The MCP server: fifteen tools — recon over captured traffic, plus live
+//! interception — and the `flow://` resources that carry full request/response
+//! bodies on demand.
 //!
 //! Every tool is a thin shell over an `Engine` verb. Reads go straight to the
 //! engine's database-backed queries; the two writes (annotate, create finding)
 //! go through the engine too, which funnels them to the single writer task —
 //! this server never opens a database of its own.
+//!
+//! The intercept tools are the exception to "reads go to the database": a held
+//! item is a live connection parked on a channel, not history. They share the
+//! engine's `Intercept` with the TUI, so an agent and an operator work the same
+//! queue, and share `http_text` so both see byte-identical wire text.
 
 use std::sync::Arc;
 
-use proxy_core::{Engine, FlowQuery, NewFinding, ResendError, Side};
+use proxy_core::{Engine, FlowQuery, Held, NewFinding, Pending, ResendError, Side, http_text};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
@@ -51,6 +57,109 @@ const STATUSES: &[&str] = &[
     "fixed",
     "wont_fix",
 ];
+
+// --- intercept ---
+
+/// One held item, as listed. The payload is summarised rather than inlined:
+/// `intercept_get` returns the full wire text for the one ticket being worked
+/// on, so listing a deep queue does not drag every body through the context.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct HeldDto {
+    /// Answer this with intercept_forward / intercept_drop.
+    pub ticket: i64,
+    /// The flow this belongs to. One flow can be held twice — once each way —
+    /// so a flow id does not identify a hold.
+    pub flow_id: i64,
+    /// "request" or "response".
+    pub leg: String,
+    /// Unix microseconds. Held traffic is a live connection waiting on you.
+    pub held_at: i64,
+    pub method: Option<String>,
+    pub uri: Option<String>,
+    pub status: Option<u16>,
+    pub body_len: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct InterceptStatusResult {
+    pub enabled: bool,
+    pub holds_requests: bool,
+    pub holds_responses: bool,
+    pub queued_requests: i64,
+    pub queued_responses: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct InterceptSetParams {
+    /// Master switch. Turning it off releases everything currently held.
+    pub enabled: Option<bool>,
+    /// Hold outbound requests.
+    pub hold_requests: Option<bool>,
+    /// Hold inbound responses.
+    pub hold_responses: Option<bool>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct InterceptSetResult {
+    /// How many held items this change released.
+    pub released: i64,
+    pub enabled: bool,
+    pub holds_requests: bool,
+    pub holds_responses: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct InterceptQueueParams {
+    /// "request", "response", or omitted for both.
+    pub leg: Option<String>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct InterceptQueueResult {
+    pub held: Vec<HeldDto>,
+    pub count: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct TicketParams {
+    pub ticket: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct InterceptGetResult {
+    pub ticket: i64,
+    pub flow_id: i64,
+    pub leg: String,
+    /// The message exactly as it will go on the wire. Edit this text and hand
+    /// it back to intercept_forward.
+    pub text: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct InterceptForwardParams {
+    pub ticket: i64,
+    /// Replacement wire text, in the form intercept_get returned. Omit to
+    /// forward unchanged. Re-parsed before sending, so a malformed edit is
+    /// rejected rather than put on the wire.
+    pub edited: Option<String>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct AnsweredResult {
+    /// False if the ticket was unknown — already answered, or never existed.
+    pub answered: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct InterceptAnswerAllParams {
+    /// "forward" or "drop".
+    pub verdict: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct AnsweredAllResult {
+    pub answered: i64,
+}
 
 /// The MCP frontend. Holds only an `Engine` handle and its tool table; a fresh
 /// one is built per session by the transport's service factory.
@@ -312,6 +421,173 @@ impl ProxyServer {
         }))
     }
 
+    // --- intercept ---
+    //
+    // Held traffic is a *live connection* parked on a channel, unlike every
+    // other tool here, which reads history. Nothing times out — matching Burp
+    // and Caido — so anything left in the queue stays parked until it is
+    // answered or interception is turned off. Check intercept_queue after
+    // enabling, and answer what you find.
+
+    #[tool(
+        description = "Get interception state: whether it is on, which legs are held, and how \
+                       many items are waiting. Held items are live connections parked until \
+                       answered — nothing times out."
+    )]
+    async fn intercept_status(&self) -> Result<Json<InterceptStatusResult>, ErrorData> {
+        let i = self.engine.intercept();
+        Ok(Json(InterceptStatusResult {
+            enabled: i.is_enabled(),
+            holds_requests: i.holds_requests(),
+            holds_responses: i.holds_responses(),
+            queued_requests: i.queue_of(true).len() as i64,
+            queued_responses: i.queue_of(false).len() as i64,
+        }))
+    }
+
+    #[tool(
+        description = "Turn interception on/off, or choose which legs are held. Omit a field to \
+                       leave it unchanged. Turning something off releases whatever it was \
+                       holding, unmodified. Returns how many items that released."
+    )]
+    async fn intercept_set(
+        &self,
+        Parameters(p): Parameters<InterceptSetParams>,
+    ) -> Result<Json<InterceptSetResult>, ErrorData> {
+        let i = self.engine.intercept();
+        let mut released = 0usize;
+        if let Some(on) = p.hold_requests {
+            released += i.set_hold_requests(on);
+        }
+        if let Some(on) = p.hold_responses {
+            released += i.set_hold_responses(on);
+        }
+        // Applied last: the master switch should win over a leg toggle sent in
+        // the same call, rather than being silently re-enabled by one.
+        if let Some(on) = p.enabled {
+            released += i.set_enabled(on);
+        }
+        Ok(Json(InterceptSetResult {
+            released: released as i64,
+            enabled: i.is_enabled(),
+            holds_requests: i.holds_requests(),
+            holds_responses: i.holds_responses(),
+        }))
+    }
+
+    #[tool(
+        description = "List held items awaiting a verdict, oldest first. Summaries only — use \
+                       intercept_get for one item's full text. Filter with leg=request|response."
+    )]
+    async fn intercept_queue(
+        &self,
+        Parameters(p): Parameters<InterceptQueueParams>,
+    ) -> Result<Json<InterceptQueueResult>, ErrorData> {
+        let i = self.engine.intercept();
+        let held = match p.leg.as_deref() {
+            None => i.queue(),
+            Some(leg) => match parse_leg(leg)? {
+                true => i.queue_of(true),
+                false => i.queue_of(false),
+            },
+        };
+        let held: Vec<HeldDto> = held.iter().map(held_dto).collect();
+        Ok(Json(InterceptQueueResult {
+            count: held.len() as i64,
+            held,
+        }))
+    }
+
+    #[tool(
+        description = "Get one held item as raw HTTP wire text — start line, headers, blank \
+                       line, body. This is the exact text to edit and hand back to \
+                       intercept_forward."
+    )]
+    async fn intercept_get(
+        &self,
+        Parameters(p): Parameters<TicketParams>,
+    ) -> Result<Json<InterceptGetResult>, ErrorData> {
+        let held = self
+            .engine
+            .intercept()
+            .get(p.ticket as u64)
+            .ok_or_else(|| unknown_ticket(p.ticket))?;
+        Ok(Json(InterceptGetResult {
+            ticket: held.ticket as i64,
+            flow_id: held.flow_id as i64,
+            leg: leg_name(&held.pending).to_string(),
+            text: render_pending(&held.pending),
+        }))
+    }
+
+    #[tool(
+        description = "Release one held item, optionally replacing it with edited wire text in \
+                       the form intercept_get returned. A malformed edit is rejected and the \
+                       item stays held, so a bad edit never reaches the wire."
+    )]
+    async fn intercept_forward(
+        &self,
+        Parameters(p): Parameters<InterceptForwardParams>,
+    ) -> Result<Json<AnsweredResult>, ErrorData> {
+        let ticket = p.ticket as u64;
+        let edited = match p.edited {
+            None => None,
+            Some(text) => {
+                // Reparsed against the original, which supplies what wire text
+                // cannot: the absolute URI behind an origin-form target.
+                let held = self
+                    .engine
+                    .intercept()
+                    .get(ticket)
+                    .ok_or_else(|| unknown_ticket(p.ticket))?;
+                Some(reparse(&held.pending, &text).map_err(|e| {
+                    ErrorData::invalid_params(format!("edited message does not parse: {e}"), None)
+                })?)
+            }
+        };
+        Ok(Json(AnsweredResult {
+            answered: self.engine.intercept().forward(ticket, edited),
+        }))
+    }
+
+    #[tool(
+        description = "Drop one held item. The client gets a 502 rather than a hung socket. \
+                       Returns answered=false if the ticket is unknown."
+    )]
+    async fn intercept_drop(
+        &self,
+        Parameters(p): Parameters<TicketParams>,
+    ) -> Result<Json<AnsweredResult>, ErrorData> {
+        Ok(Json(AnsweredResult {
+            answered: self.engine.intercept().discard(p.ticket as u64),
+        }))
+    }
+
+    #[tool(
+        description = "Answer everything currently held at once with verdict=forward or \
+                       verdict=drop. Use this to clear a queue you no longer intend to work \
+                       through — held connections wait indefinitely."
+    )]
+    async fn intercept_answer_all(
+        &self,
+        Parameters(p): Parameters<InterceptAnswerAllParams>,
+    ) -> Result<Json<AnsweredAllResult>, ErrorData> {
+        let i = self.engine.intercept();
+        let answered = match p.verdict.to_ascii_lowercase().as_str() {
+            "forward" => i.forward_all(),
+            "drop" => i.discard_all(),
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!("verdict must be \"forward\" or \"drop\", got {other:?}"),
+                    None,
+                ));
+            }
+        };
+        Ok(Json(AnsweredAllResult {
+            answered: answered as i64,
+        }))
+    }
+
     #[tool(
         description = "Set a flow's triage comment and/or highlight. Omit a field to leave it \
                        unchanged; pass an empty string to clear it. Returns rows_changed (0 if \
@@ -554,6 +830,76 @@ fn parse_flow_uri(uri: &str) -> Option<(i64, Side)> {
     Some((id, side))
 }
 
+// --- intercept helpers ---
+
+fn leg_name(pending: &Pending) -> &'static str {
+    if pending.is_request() {
+        "request"
+    } else {
+        "response"
+    }
+}
+
+/// `"request"` / `"response"` to the boolean the engine takes.
+fn parse_leg(leg: &str) -> Result<bool, ErrorData> {
+    match leg.to_ascii_lowercase().as_str() {
+        "request" | "requests" => Ok(true),
+        "response" | "responses" => Ok(false),
+        other => Err(ErrorData::invalid_params(
+            format!("leg must be \"request\" or \"response\", got {other:?}"),
+            None,
+        )),
+    }
+}
+
+fn unknown_ticket(ticket: i64) -> ErrorData {
+    ErrorData::resource_not_found(
+        format!("no held item with ticket {ticket} (already answered, or never existed)"),
+        None,
+    )
+}
+
+fn held_dto(held: &Held) -> HeldDto {
+    let (method, uri, status, body_len) = match &held.pending {
+        Pending::Request(r) => (
+            Some(r.method.to_string()),
+            Some(r.uri.to_string()),
+            None,
+            r.body.len(),
+        ),
+        Pending::Response(r) => (None, None, Some(r.status.as_u16()), r.body.len()),
+    };
+    HeldDto {
+        ticket: held.ticket as i64,
+        flow_id: held.flow_id as i64,
+        leg: leg_name(&held.pending).to_string(),
+        held_at: held.held_at,
+        method,
+        uri,
+        status,
+        body_len: body_len as i64,
+    }
+}
+
+/// A held item as editable wire text — the same rendering the TUI shows, from
+/// the same codec, so an agent and an operator are looking at the same bytes.
+fn render_pending(pending: &Pending) -> String {
+    match pending {
+        Pending::Request(r) => http_text::render_request(r),
+        Pending::Response(r) => http_text::render_response(r),
+    }
+}
+
+/// Parse edited text back into the same kind of message it started as. The
+/// original supplies what wire text cannot carry: the absolute URI behind an
+/// origin-form target, and the version if the edit dropped it.
+fn reparse(original: &Pending, text: &str) -> Result<Pending, http_text::ParseError> {
+    Ok(match original {
+        Pending::Request(r) => Pending::Request(http_text::parse_request(text, r)?),
+        Pending::Response(r) => Pending::Response(http_text::parse_response(text, r)?),
+    })
+}
+
 fn clamp_limit(requested: Option<i64>, default: i64, max: i64) -> i64 {
     requested.unwrap_or(default).clamp(1, max)
 }
@@ -635,6 +981,222 @@ mod tests {
             },
         );
         id as i64
+    }
+
+    /// Park a request on the intercept queue the way the proxy handler does,
+    /// and return its ticket. The hold is awaited on a spawned task, so the
+    /// queue is populated while the test drives the tools.
+    ///
+    /// `async`, and yielding through tokio rather than the thread: `#[tokio::test]`
+    /// runs a current-thread runtime, so a synchronous spin here would block the
+    /// executor the spawned hold needs and deadlock rather than ever seeing it.
+    async fn hold_a_request(engine: &Arc<Engine>, uri: &str) -> (u64, tokio::task::JoinHandle<()>) {
+        engine.intercept().set_enabled(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "example.com".parse().unwrap());
+        let request = CapturedRequest {
+            method: Method::GET,
+            uri: uri.parse::<Uri>().unwrap(),
+            version: Version::HTTP_11,
+            headers,
+            body: Bytes::from_static(b"original"),
+        };
+
+        let e = engine.clone();
+        let task = tokio::spawn(async move {
+            let _ = e.intercept().hold_request(1, request).await;
+        });
+        // Spin until the hold lands rather than sleeping a fixed amount.
+        let ticket = loop {
+            if let Some(held) = engine.intercept().queue().first() {
+                break held.ticket;
+            }
+            tokio::task::yield_now().await;
+        };
+        (ticket, task)
+    }
+
+    #[tokio::test]
+    async fn status_and_set_report_the_intercept_state() {
+        let (engine, server) = setup();
+
+        let before = server.intercept_status().await.unwrap().0;
+        assert!(!before.enabled, "interception starts off");
+
+        let set = server
+            .intercept_set(Parameters(InterceptSetParams {
+                enabled: Some(true),
+                hold_requests: None,
+                hold_responses: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(set.enabled);
+        assert!(
+            engine.intercept().is_enabled(),
+            "engine is the source of truth"
+        );
+
+        let off = server
+            .intercept_set(Parameters(InterceptSetParams {
+                enabled: None,
+                hold_responses: Some(false),
+                hold_requests: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!off.holds_responses);
+        assert!(off.holds_requests, "the other leg is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_held_request_is_listed_and_readable_as_wire_text() {
+        let (engine, server) = setup();
+        let (ticket, task) = hold_a_request(&engine, "https://example.com/a?q=1").await;
+
+        let queue = server
+            .intercept_queue(Parameters(InterceptQueueParams { leg: None }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(queue.count, 1);
+        assert_eq!(queue.held[0].leg, "request");
+        assert_eq!(queue.held[0].method.as_deref(), Some("GET"));
+
+        let got = server
+            .intercept_get(Parameters(TicketParams {
+                ticket: ticket as i64,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(got.text.starts_with("GET /a?q=1 HTTP/1.1"), "{}", got.text);
+        assert!(got.text.ends_with("\n\noriginal"), "{}", got.text);
+
+        server
+            .intercept_forward(Parameters(InterceptForwardParams {
+                ticket: ticket as i64,
+                edited: None,
+            }))
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    /// The point of the whole exercise: an agent edits the text and the edit
+    /// reaches the wire.
+    #[tokio::test]
+    async fn an_edited_forward_replaces_the_message() {
+        let (engine, server) = setup();
+        let (ticket, task) = hold_a_request(&engine, "https://example.com/a").await;
+
+        let answered = server
+            .intercept_forward(Parameters(InterceptForwardParams {
+                ticket: ticket as i64,
+                edited: Some(
+                    "POST /changed HTTP/1.1\nhost: example.com\n\nedited body".to_string(),
+                ),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(answered.answered);
+        task.await.unwrap();
+        assert!(engine.intercept().is_empty());
+    }
+
+    /// A malformed edit must be refused *and* leave the item held, so a bad
+    /// edit can be retried rather than having silently gone out or been lost.
+    #[tokio::test]
+    async fn a_malformed_edit_is_rejected_and_the_item_stays_held() {
+        let (engine, server) = setup();
+        let (ticket, task) = hold_a_request(&engine, "https://example.com/a").await;
+
+        let result = server
+            .intercept_forward(Parameters(InterceptForwardParams {
+                ticket: ticket as i64,
+                edited: Some("GET /x HTTP/1.1\nthis-is-not-a-header\n\n".to_string()),
+            }))
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a bad edit must not be forwarded"),
+        };
+        assert!(
+            format!("{err:?}").contains("does not parse"),
+            "should say why: {err:?}"
+        );
+        assert_eq!(engine.intercept().len(), 1, "the item must still be held");
+
+        server
+            .intercept_forward(Parameters(InterceptForwardParams {
+                ticket: ticket as i64,
+                edited: None,
+            }))
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_ticket_is_reported_rather_than_silently_ignored() {
+        let (_engine, server) = setup();
+
+        assert!(
+            server
+                .intercept_get(Parameters(TicketParams { ticket: 999 }))
+                .await
+                .is_err()
+        );
+        // Dropping an unknown ticket is not an error, but it must not claim to
+        // have answered something.
+        let dropped = server
+            .intercept_drop(Parameters(TicketParams { ticket: 999 }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!dropped.answered);
+    }
+
+    #[tokio::test]
+    async fn answer_all_clears_the_queue_and_validates_its_verdict() {
+        let (engine, server) = setup();
+        let (_t1, task1) = hold_a_request(&engine, "https://example.com/one").await;
+
+        let bad = server
+            .intercept_answer_all(Parameters(InterceptAnswerAllParams {
+                verdict: "sideways".to_string(),
+            }))
+            .await;
+        assert!(bad.is_err(), "an unknown verdict must not silently forward");
+        assert_eq!(engine.intercept().len(), 1, "nothing answered on error");
+
+        let all = server
+            .intercept_answer_all(Parameters(InterceptAnswerAllParams {
+                verdict: "forward".to_string(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(all.answered, 1);
+        task1.await.unwrap();
+    }
+
+    /// An agent and an operator share one queue; a leg filter must not invent
+    /// a second view of it.
+    #[tokio::test]
+    async fn the_leg_filter_is_validated() {
+        let (_engine, server) = setup();
+        assert!(
+            server
+                .intercept_queue(Parameters(InterceptQueueParams {
+                    leg: Some("sideways".into())
+                }))
+                .await
+                .is_err()
+        );
     }
 
     fn list_params() -> ListFlowsParams {

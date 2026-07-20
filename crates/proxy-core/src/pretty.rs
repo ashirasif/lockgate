@@ -16,7 +16,7 @@
 //! JSON does not ascribe meaning to — so a pretty-printed body is still the
 //! same request.
 
-use crate::syntax::Language;
+use crate::http_text::{Language, detect_body};
 
 /// Why a body could not be pretty-printed.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,7 +63,7 @@ pub fn pretty_message(text: &str) -> Result<(String, Language), PrettyError> {
     let headers: Vec<String> = head.split('\n').skip(1).map(str::to_string).collect();
     let body_lines: Vec<String> = body.split('\n').map(str::to_string).collect();
 
-    let language = crate::syntax::detect_body(&headers, &body_lines);
+    let language = detect_body(&headers, &body_lines);
     let formatted = match language {
         Language::Json => pretty_json(body)?,
         Language::Html => pretty_html(body)?,

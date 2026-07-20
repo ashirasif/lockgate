@@ -17,9 +17,9 @@ use ratatui::{
 
 use crate::command::Command;
 use crate::editor::{Cursor, TextBuffer, Yank};
-use crate::http_text;
 use crate::input::{Action, Column, Input, InsertKey, Mode, Motion, PaletteKey, Scroll, Window};
 use crate::vim;
+use proxy_core::http_text;
 
 /// The Repeater's working copy of a request.
 ///
@@ -860,7 +860,7 @@ impl App {
             None => "nothing to format here".to_string(),
             Some(buffer) => {
                 let current = buffer.text();
-                match crate::pretty::pretty_message(&current) {
+                match proxy_core::pretty::pretty_message(&current) {
                     // Saying so beats a checkpoint and a no-op edit that makes
                     // the buffer look dirty for no reason.
                     Ok((formatted, _)) if formatted == current => "already formatted".to_string(),
@@ -871,7 +871,7 @@ impl App {
                             // Whitespace between HTML elements can render as a
                             // space, so this one is not purely cosmetic and the
                             // operator should know before forwarding it.
-                            crate::syntax::Language::Html => {
+                            proxy_core::http_text::Language::Html => {
                                 "HTML reformatted — whitespace changed, u to undo".to_string()
                             }
                             _ => "body reformatted — u to undo".to_string(),

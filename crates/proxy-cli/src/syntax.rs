@@ -16,6 +16,7 @@
 //! that fails to parse must still be readable. Every path degrades to plain
 //! text rather than erroring.
 
+use proxy_core::http_text::{Language, detect_body};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -28,19 +29,6 @@ use ratatui::text::{Line, Span};
 enum Kind {
     Request,
     Response,
-}
-
-/// What language a message body is written in.
-///
-/// Public and shared with [`crate::pretty`] on purpose: the highlighter and the
-/// formatter must never disagree about what a body is, or `gq` would reformat
-/// something as JSON that the pane is colouring as HTML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Language {
-    Json,
-    Html,
-    Form,
-    Plain,
 }
 
 // --- palette -------------------------------------------------------------
@@ -152,44 +140,6 @@ pub fn highlight(lines: &[String]) -> Vec<Vec<Style>> {
             }
         })
         .collect()
-}
-
-/// Pick a body language.
-///
-/// `Content-Type` is consulted first, but a body that *looks* like JSON is
-/// treated as JSON regardless of what the header claims. Mislabelled bodies are
-/// routine in this line of work — `text/plain` wrapping JSON is common enough
-/// that trusting the header would make the feature useless exactly when someone
-/// is looking hardest.
-pub fn detect_body(headers: &[String], body: &[String]) -> Language {
-    let content_type = headers
-        .iter()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-type")
-                .then(|| value.trim().to_ascii_lowercase())
-        })
-        .unwrap_or_default();
-
-    if content_type.contains("json") {
-        return Language::Json;
-    }
-    if content_type.contains("x-www-form-urlencoded") {
-        return Language::Form;
-    }
-    if content_type.contains("html") || content_type.contains("xml") {
-        return Language::Html;
-    }
-    match body
-        .iter()
-        .find(|l| !l.trim().is_empty())
-        .and_then(|l| l.trim_start().chars().next())
-    {
-        Some('{' | '[') => Language::Json,
-        Some('<') => Language::Html,
-        _ => Language::Plain,
-    }
 }
 
 /// `METHOD target HTTP/1.1` or `HTTP/1.1 200 Reason`.
