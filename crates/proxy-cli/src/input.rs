@@ -86,6 +86,7 @@ pub enum Window {
     Proxy,
     /// Replay a single request and read the fresh response.
     Repeater,
+    Scope,
     /// Traffic held in flight, awaiting forward or drop.
     Intercept,
     /// The tree of what has been seen: host, then path.
@@ -96,10 +97,11 @@ pub enum Window {
 
 impl Window {
     /// Left-to-right tab order, and the set `gt` / `gT` cycle through.
-    pub const ALL: [Window; 5] = [
+    pub const ALL: [Window; 6] = [
         Window::Proxy,
         Window::Intercept,
         Window::Repeater,
+        Window::Scope,
         Window::Sitemap,
         Window::Automate,
     ];
@@ -110,6 +112,7 @@ impl Window {
             Window::Proxy => "Proxy",
             Window::Intercept => "Intercept",
             Window::Repeater => "Repeater",
+            Window::Scope => "Scope",
             Window::Sitemap => "Sitemap",
             Window::Automate => "Automate",
         }
@@ -124,6 +127,7 @@ impl Window {
             Window::Proxy => 'P',
             Window::Intercept => 'I',
             Window::Repeater => 'R',
+            Window::Scope => 'C',
             Window::Sitemap => 'S',
             Window::Automate => 'A',
         }
@@ -250,6 +254,9 @@ pub enum Action {
     /// `<Space>1` / `<Space>2` — choose which legs of an exchange hold.
     ToggleHoldRequests,
     ToggleHoldResponses,
+    ScopeAddHost,
+    ScopeRemoveHost,
+    ToggleScopeFilter,
     NewSession,
     CloseSession,
     /// Repeater: switch sessions. `Some(n)` picks the nth, 1-based as the tab
@@ -276,6 +283,10 @@ enum Bind {
     Mode(Mode),
     /// Opens the bottom prompt in `Command` mode, seeded with this character.
     Prompt(char),
+    /// Opens the prompt pre-filled with a whole command, so a key can offer a
+    /// verb while leaving its argument to be typed. Scope patterns are free
+    /// text; a keybinding per pattern is not a thing.
+    PromptSeeded(&'static str),
     Resend,
     Window(Window),
     /// Cycle windows by `+1` (`gt`) or `-1` (`gT`).
@@ -295,6 +306,9 @@ enum Bind {
     Focus(Option<Column>),
     ToggleHoldRequests,
     ToggleHoldResponses,
+    ScopeAddHost,
+    ScopeRemoveHost,
+    ToggleScopeFilter,
     NewSession,
     CloseSession,
     SelectSession,
@@ -341,6 +355,19 @@ const WINDOW_MAP: &[(Window, &str, Bind)] = &[
     // and `<Space>2` are the hold toggles.
     (Window::Repeater, "gs", Bind::SelectSession),
     (Window::Sitemap, "<CR>", Bind::Toggle),
+    // Sitemap: put the highlighted host in scope, or take it out again.
+    (Window::Sitemap, "a", Bind::ScopeAddHost),
+    (Window::Sitemap, "d", Bind::ScopeRemoveHost),
+    // Scope: `<CR>` activates a scope or toggles a rule, depending on which
+    // pane has the keys — the same "act on what is highlighted" shape the
+    // other windows use. Patterns are free text, so the keys that need one
+    // open a pre-filled prompt rather than pretending to be a form.
+    (Window::Scope, "<CR>", Bind::Enter),
+    (Window::Scope, "a", Bind::PromptSeeded(":scope add ")),
+    (Window::Scope, "x", Bind::PromptSeeded(":scope exclude ")),
+    (Window::Scope, "n", Bind::PromptSeeded(":scope new ")),
+    (Window::Scope, "d", Bind::Drop),
+    (Window::Scope, "<C-w>", Bind::Focus(None)),
 ];
 
 /// The keymap is data, not control flow, so that `:map` can later rewrite it
@@ -385,6 +412,9 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     // Leader. Application verbs live here so they never shadow vim's own keys.
     ("<Space>r", Bind::Resend),
     ("<Space>s", Bind::SendToRepeater),
+    // Bypass scope filtering from wherever you noticed something missing —
+    // the same reason the intercept toggle is global rather than window-bound.
+    ("<Space>c", Bind::ToggleScopeFilter),
     // Intercept verdicts live in `WINDOW_MAP` as bare `f`/`d`, since that is
     // where they are unambiguous. Toggling *whether* we hold is global, though:
     // you reach for it from wherever you noticed traffic was stalling.
@@ -406,6 +436,9 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     ("P", Bind::Window(Window::Proxy)),
     ("I", Bind::Window(Window::Intercept)),
     ("R", Bind::Window(Window::Repeater)),
+    // `C` for sCope: `S` is Sitemap and moving it would break muscle memory
+    // for the sake of a mnemonic.
+    ("C", Bind::Window(Window::Scope)),
     ("S", Bind::Window(Window::Sitemap)),
     ("A", Bind::Window(Window::Automate)),
     ("gt", Bind::WindowStep(1)),
@@ -657,6 +690,11 @@ impl Input {
                 self.cmdline = seed.to_string();
                 return None;
             }
+            Bind::PromptSeeded(seed) => {
+                self.mode = Mode::Command;
+                seed.clone_into(&mut self.cmdline);
+                return None;
+            }
             Bind::Resend => Action::Resend,
             Bind::Forward => Action::Forward,
             Bind::Drop => Action::Drop,
@@ -664,6 +702,9 @@ impl Input {
             Bind::DropAll => Action::DropAll,
             Bind::ToggleIntercept => Action::ToggleIntercept,
             Bind::SendToRepeater => Action::SendToRepeater,
+            Bind::ToggleScopeFilter => Action::ToggleScopeFilter,
+            Bind::ScopeAddHost => Action::ScopeAddHost,
+            Bind::ScopeRemoveHost => Action::ScopeRemoveHost,
             Bind::NewSession => Action::NewSession,
             Bind::CloseSession => Action::CloseSession,
             Bind::SelectSession => Action::SelectSession(count),
@@ -1201,7 +1242,9 @@ mod tests {
 
     #[test]
     fn f_and_d_stay_free_in_other_windows() {
-        for window in [Window::Proxy, Window::Repeater, Window::Sitemap] {
+        // Proxy and Repeater can both put a text buffer under the cursor, so
+        // `d` there has to stay the delete operator.
+        for window in [Window::Proxy, Window::Repeater] {
             let mut input = Input::new();
             input.set_window(window);
             assert!(
@@ -1213,6 +1256,27 @@ mod tests {
                 "d should be unbound in {window:?}"
             );
         }
+
+        // Sitemap and Scope have no buffer and no line to operate on, which is
+        // the same reason Intercept gets to spend `d` on a verdict. `f` stays
+        // free in both: there is still nothing to find a character on, but
+        // nothing worth binding it to either.
+        for window in [Window::Sitemap, Window::Scope] {
+            let mut input = Input::new();
+            input.set_window(window);
+            assert!(
+                feed(&mut input, "f").is_empty(),
+                "f should be unbound in {window:?}"
+            );
+        }
+
+        let mut input = Input::new();
+        input.set_window(Window::Sitemap);
+        assert_eq!(
+            feed(&mut input, "d"),
+            vec![Action::ScopeRemoveHost],
+            "Sitemap spends `d` on taking a host out of scope"
+        );
     }
 
     /// `<CR>` means different things in different windows, which is exactly

@@ -197,6 +197,18 @@ struct Compiled {
 }
 
 impl Compiled {
+    /// As [`Compiled::matches`] but blind to the port, for callers that have
+    /// no port to offer.
+    fn matches_host_path(&self, host: &str, path: &str) -> bool {
+        if self.host.as_ref().is_some_and(|m| !m.matches(host)) {
+            return false;
+        }
+        match &self.path_prefix {
+            Some(prefix) => path_has_prefix(path, prefix),
+            None => true,
+        }
+    }
+
     fn matches(&self, target: &Target) -> bool {
         if let Some(host) = &self.host
             && !host.matches(target.host)
@@ -264,6 +276,28 @@ impl Matcher {
         // No includes means "everything", which is what an empty scope should do
         // — otherwise a fresh project would show no traffic at all.
         self.includes.is_empty() || self.includes.iter().any(|rule| rule.matches(target))
+    }
+
+    /// Whether a host/path pair is in scope, ignoring any port constraint.
+    ///
+    /// The sitemap records a host and a path but no port — one node covers
+    /// `:80` and `:443` alike — so a port-constrained rule cannot be decided
+    /// here. Ignoring the port errs toward *showing* the node, which is the
+    /// safe direction to be wrong: you see something that might be out of
+    /// scope, rather than missing something that is in it.
+    pub fn matches_host_path(&self, host: &str, path: &str) -> bool {
+        if self
+            .excludes
+            .iter()
+            .any(|rule| rule.matches_host_path(host, path))
+        {
+            return false;
+        }
+        self.includes.is_empty()
+            || self
+                .includes
+                .iter()
+                .any(|rule| rule.matches_host_path(host, path))
     }
 
     /// True when this scope narrows anything. Lets callers skip the filter
@@ -464,6 +498,30 @@ pub fn list_rules(conn: &Connection, scope_id: i64) -> Result<Vec<ScopeRule>, Sc
         });
     }
     Ok(out)
+}
+
+/// Turn a rule off without losing it.
+///
+/// Worth having distinct from deletion: narrowing scope to check whether a rule
+/// is the reason something is missing is a routine move, and retyping the
+/// pattern afterwards is how people stop bothering.
+pub fn set_rule_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(), ScopeError> {
+    conn.execute(
+        "UPDATE scope_rule SET enabled = ?2 WHERE id = ?1",
+        params![id, enabled],
+    )?;
+    Ok(())
+}
+
+/// Delete a scope and, by cascade, its rules.
+///
+/// Deleting the active scope leaves none active, which means unrestricted —
+/// the same state as a fresh project. That is the safe direction to fail: you
+/// see more than you asked for, never less.
+pub fn delete_scope(conn: &Connection, id: i64) -> Result<(), ScopeError> {
+    conn.execute("DELETE FROM scope_rule WHERE scope_id = ?1", params![id])?;
+    conn.execute("DELETE FROM scope WHERE id = ?1", params![id])?;
+    Ok(())
 }
 
 pub fn delete_rule(conn: &Connection, id: i64) -> Result<(), ScopeError> {

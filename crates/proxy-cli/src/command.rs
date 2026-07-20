@@ -21,6 +21,12 @@ pub enum Command {
     /// `:pretty` — reformat the body of the message being edited. The same
     /// thing `gq` does, reachable when the buffer does not have focus.
     Pretty,
+    /// `:scope <verb> [argument]` — scope management. Patterns are free text,
+    /// so they arrive as a command rather than as forty keybindings.
+    Scope {
+        verb: String,
+        argument: String,
+    },
     Help,
     Unknown(String),
 }
@@ -44,6 +50,13 @@ impl Command {
             "resend" | "rep" | "repeat" => Command::Resend,
             "h" | "help" => Command::Help,
             "pretty" | "pp" | "format" => Command::Pretty,
+            "scope" | "sc" => {
+                let (verb, argument) = match rest.split_once(char::is_whitespace) {
+                    Some((verb, argument)) => (verb.to_string(), argument.trim().to_string()),
+                    None => (rest.to_string(), String::new()),
+                };
+                Command::Scope { verb, argument }
+            }
             "set" => parse_set(rest),
             _ => Command::Unknown(name.to_string()),
         })

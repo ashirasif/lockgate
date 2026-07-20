@@ -330,6 +330,10 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     // captured traffic, which is a fair trade for not fsyncing every batch.
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // WAL allows one writer at a time. Capture batches are short, but a scope
+    // edit arriving mid-batch would otherwise fail outright rather than wait a
+    // few milliseconds for it.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
     migrate(&conn, MIGRATIONS, SCHEMA_VERSION)?;
     Ok(conn)

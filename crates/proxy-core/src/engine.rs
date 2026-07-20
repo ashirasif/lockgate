@@ -302,6 +302,74 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    // --- scope ---
+    //
+    // These write through the read connection rather than the writer task. That
+    // is deliberate: the writer exists to batch a firehose of captured traffic,
+    // and scope edits are a handful of user-initiated statements. Routing them
+    // through the queue would mean a rule edit did not take effect until the
+    // next flush, which is exactly when someone is watching for it to.
+
+    /// Scope work against the project database.
+    ///
+    /// `with_db` hands back an `Option` that is always `Some`; going straight
+    /// to the connection keeps these signatures about scope errors rather than
+    /// about a state that cannot occur.
+    fn with_scope<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, crate::scope::ScopeError>,
+    ) -> Result<T, crate::scope::ScopeError> {
+        let conn = self.read_conn().lock().unwrap();
+        f(&conn)
+    }
+
+    pub fn scopes(&self) -> Vec<crate::scope::Scope> {
+        self.with_scope(crate::scope::list_scopes)
+            .unwrap_or_default()
+    }
+
+    pub fn active_scope(&self) -> Option<crate::scope::Scope> {
+        self.with_scope(crate::scope::active_scope).ok().flatten()
+    }
+
+    pub fn create_scope(&self, name: &str) -> Result<i64, crate::scope::ScopeError> {
+        self.with_scope(|conn| crate::scope::create_scope(conn, name))
+    }
+
+    pub fn delete_scope(&self, id: i64) -> Result<(), crate::scope::ScopeError> {
+        self.with_scope(|conn| crate::scope::delete_scope(conn, id))
+    }
+
+    pub fn set_active_scope(&self, id: i64) -> Result<(), crate::scope::ScopeError> {
+        self.with_scope(|conn| crate::scope::set_active(conn, id))
+    }
+
+    pub fn scope_rules(&self, scope_id: i64) -> Vec<crate::scope::ScopeRule> {
+        self.with_scope(|conn| crate::scope::list_rules(conn, scope_id))
+            .unwrap_or_default()
+    }
+
+    pub fn add_scope_rule(
+        &self,
+        scope_id: i64,
+        action: crate::scope::Action,
+        spec: &crate::scope::RuleSpec,
+    ) -> Result<i64, crate::scope::ScopeError> {
+        self.with_scope(|conn| crate::scope::add_rule(conn, scope_id, action, spec, None))
+    }
+
+    pub fn delete_scope_rule(&self, id: i64) -> Result<(), crate::scope::ScopeError> {
+        self.with_scope(|conn| crate::scope::delete_rule(conn, id))
+    }
+
+    pub fn set_scope_rule_enabled(
+        &self,
+        id: i64,
+        enabled: bool,
+    ) -> Result<(), crate::scope::ScopeError> {
+        self.with_scope(|conn| crate::scope::set_rule_enabled(conn, id, enabled))
+    }
+
     /// History filtered to the active scope.
     ///
     /// Scope is applied at read time rather than stored on each flow: it is

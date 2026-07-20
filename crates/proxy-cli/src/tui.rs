@@ -286,6 +286,18 @@ struct SitemapView {
     collapsed: HashSet<String>,
 }
 
+/// The Scope window's view state. The scopes and rules themselves live in the
+/// project database, read fresh each refresh.
+///
+/// Two panes: the scopes on the left, the highlighted scope's rules on the
+/// right. `<C-w>` moves between them, matching Intercept.
+#[derive(Default)]
+struct ScopeView {
+    column: Column,
+    scope_row: usize,
+    rule_row: usize,
+}
+
 /// A buffer handed out to the operator's own editor, and where to put it back.
 ///
 /// The edit is deferred rather than done inline because it needs the terminal:
@@ -315,6 +327,9 @@ struct SitemapRow {
     key: String,
     flow_count: i64,
     has_children: bool,
+    /// The host this row belongs to, carried on every row — scoping from a
+    /// path row should mean the same thing as scoping from its host.
+    host: String,
 }
 
 /// Take over the terminal and run the UI until the user quits.
@@ -370,6 +385,16 @@ struct App {
     repeater: Repeater,
     intercept: InterceptView,
     sitemap: SitemapView,
+    scope: ScopeView,
+    /// Scopes as of the last refresh, and the highlighted one's rules.
+    scopes: Vec<proxy_core::scope::Scope>,
+    scope_rules: Vec<proxy_core::scope::ScopeRule>,
+    /// Whether the active scope actually filters what the other windows list.
+    ///
+    /// A bypass rather than an edit: narrowing to check whether scope is why
+    /// something is missing is routine, and making that mean "retype your
+    /// rules afterwards" is how people stop using scope at all.
+    scope_filter: bool,
     /// The two intercept queues as of this tick. Snapshotted in `refresh` so
     /// drawing and key handling within one frame agree on what is held —
     /// re-reading the live queue mid-frame could answer a ticket the operator
@@ -415,6 +440,10 @@ impl App {
             repeater: Repeater::default(),
             intercept: InterceptView::default(),
             sitemap: SitemapView::default(),
+            scope: ScopeView::default(),
+            scopes: Vec::new(),
+            scope_rules: Vec::new(),
+            scope_filter: true,
             held_requests: Vec::new(),
             held_responses: Vec::new(),
             yank: Yank::default(),
@@ -573,7 +602,27 @@ impl App {
         // would slide onto a different flow while the operator is reading it —
         // so remember the flow *id* and put the cursor back on it.
         let pinned = self.selected_id();
-        self.flows = self.engine.list_flows();
+        // Scope is a *view* filter, applied at read time — nothing was dropped
+        // at capture, so turning it off shows everything again.
+        self.flows = if self.scope_filter {
+            self.engine.list_flows_in_scope()
+        } else {
+            self.engine.list_flows()
+        };
+
+        self.scopes = self.engine.scopes();
+        self.scope.scope_row = self
+            .scope
+            .scope_row
+            .min(self.scopes.len().saturating_sub(1));
+        self.scope_rules = match self.scopes.get(self.scope.scope_row) {
+            Some(scope) => self.engine.scope_rules(scope.id),
+            None => Vec::new(),
+        };
+        self.scope.rule_row = self
+            .scope
+            .rule_row
+            .min(self.scope_rules.len().saturating_sub(1));
 
         match pinned.and_then(|id| self.flows.iter().position(|f| f.id == id)) {
             Some(row) => self.table.select(Some(row)),
@@ -679,6 +728,21 @@ impl App {
                 // A different item means a different buffer to look at.
                 self.content_scroll = 0;
             }
+            Action::Move { motion, count } if self.window == Window::Scope => {
+                // Each pane keeps its own cursor, so switching panes does not
+                // move the one you were not looking at.
+                if self.scope.column == Column::Left {
+                    let last = self.scopes.len().saturating_sub(1);
+                    self.scope.scope_row = step_row(self.scope.scope_row, last, motion, count);
+                    // The rules pane follows the highlighted scope, so its
+                    // cursor cannot stay where it was.
+                    self.scope.rule_row = 0;
+                    self.refresh();
+                } else {
+                    let last = self.scope_rules.len().saturating_sub(1);
+                    self.scope.rule_row = step_row(self.scope.rule_row, last, motion, count);
+                }
+            }
             Action::Move { motion, count } if self.window == Window::Sitemap => {
                 let last = self.sitemap_rows().len().saturating_sub(1);
                 self.sitemap.selected = step_row(self.sitemap.selected, last, motion, count);
@@ -725,6 +789,12 @@ impl App {
             Action::Resend if self.window == Window::Repeater => self.send_repeater(),
             Action::Resend => self.resend_selected(),
             Action::SendToRepeater => self.load_repeater(),
+            Action::ToggleScopeFilter => {
+                let on = !self.scope_filter;
+                self.set_scope_filter(on);
+            }
+            Action::ScopeAddHost => self.scope_add_host(),
+            Action::ScopeRemoveHost => self.scope_remove_host(),
             Action::NewSession => {
                 self.repeater.open();
                 self.content_scroll = 0;
@@ -783,6 +853,7 @@ impl App {
             }
             Action::Insert(key) => self.edit(key),
             Action::Forward => self.answer_held(true),
+            Action::Drop if self.window == Window::Scope => self.scope_delete(),
             Action::Drop => self.answer_held(false),
             Action::ForwardAll => {
                 let n = self.engine.intercept().forward_all();
@@ -805,6 +876,10 @@ impl App {
                 let released = intercept.set_hold_responses(on);
                 self.note(&leg_note("responses", on, released));
             }
+            Action::Focus(column) if self.window == Window::Scope => {
+                self.scope.column = column.unwrap_or_else(|| self.scope.column.flip());
+                self.content_scroll = 0;
+            }
             Action::Focus(column) => {
                 self.intercept.focus = column.unwrap_or_else(|| self.intercept.focus.flip());
                 // The two columns scroll independently; carrying an offset from
@@ -812,6 +887,7 @@ impl App {
                 self.content_scroll = 0;
             }
             Action::Toggle => self.toggle_fold(),
+            Action::Enter if self.window == Window::Scope => self.scope_enter(),
             Action::Enter => self.enter_preview(),
             Action::ExternalEdit => self.request_external_edit(),
             Action::Vim(cmd) => self.run_vim(cmd),
@@ -1287,8 +1363,257 @@ impl App {
         // A generous page: the fold state is per-key, so paging would need to
         // hold parents across pages anyway. Bounded so a huge project cannot
         // stall a frame.
-        let nodes = self.engine.sitemap(None, 0, 5000);
+        let mut nodes = self.engine.sitemap(None, 0, 5000);
+        if self.scope_filter {
+            let matcher = self.engine.scope_matcher();
+            if !matcher.is_unrestricted() {
+                nodes.retain(|n| matcher.matches_host_path(&n.host, &n.path));
+            }
+        }
         build_sitemap_rows(&nodes, &self.sitemap.collapsed)
+    }
+
+    // --- scope ---
+
+    /// The scope that edits apply to: the active one, or a first one created on
+    /// demand so adding a host from the Sitemap always lands somewhere.
+    fn target_scope(&mut self) -> Option<i64> {
+        if let Some(scope) = self.scopes.iter().find(|s| s.is_active) {
+            return Some(scope.id);
+        }
+        if let Some(scope) = self.scopes.first() {
+            return Some(scope.id);
+        }
+        match self.engine.create_scope("default") {
+            Ok(id) => {
+                // Created scopes are inert until active, and a scope nobody
+                // activated would silently not filter.
+                let _ = self.engine.set_active_scope(id);
+                Some(id)
+            }
+            Err(e) => {
+                self.note(&format!("could not create a scope: {e:?}"));
+                None
+            }
+        }
+    }
+
+    fn sitemap_host(&self) -> Option<String> {
+        let rows = self.sitemap_rows();
+        rows.get(self.sitemap.selected).map(|row| row.host.clone())
+    }
+
+    /// Put the highlighted host in scope.
+    ///
+    /// Two rules, because `*.linear.app` does not match the apex `linear.app` —
+    /// there is no leading label for `*` to consume. One without the other is a
+    /// scope that silently misses either the site or all of its subdomains.
+    fn scope_add_host(&mut self) {
+        let Some(host) = self.sitemap_host() else {
+            self.note("no host selected");
+            return;
+        };
+        let Some(scope_id) = self.target_scope() else {
+            return;
+        };
+
+        let existing: Vec<String> = self
+            .engine
+            .scope_rules(scope_id)
+            .iter()
+            .filter_map(|r| r.spec.host.as_ref().map(|(_, p)| p.clone()))
+            .collect();
+
+        let mut added = 0;
+        for pattern in [host.clone(), format!("*.{host}")] {
+            if existing.iter().any(|p| p == &pattern) {
+                continue;
+            }
+            let spec = proxy_core::scope::RuleSpec::host(
+                proxy_core::scope::HostKind::Glob,
+                pattern.clone(),
+            );
+            match self
+                .engine
+                .add_scope_rule(scope_id, proxy_core::scope::Action::Include, &spec)
+            {
+                Ok(_) => added += 1,
+                Err(e) => {
+                    self.note(&format!("could not add {pattern}: {e:?}"));
+                    return;
+                }
+            }
+        }
+        self.refresh();
+        self.note(&match added {
+            0 => format!("{host} was already in scope"),
+            n => format!("{host} in scope (+{n} rules)"),
+        });
+    }
+
+    /// Drop every rule naming the highlighted host, apex and wildcard alike.
+    fn scope_remove_host(&mut self) {
+        let Some(host) = self.sitemap_host() else {
+            self.note("no host selected");
+            return;
+        };
+        let Some(scope_id) = self.target_scope() else {
+            return;
+        };
+
+        let wildcard = format!("*.{host}");
+        let doomed: Vec<i64> = self
+            .engine
+            .scope_rules(scope_id)
+            .iter()
+            .filter(|r| {
+                r.spec
+                    .host
+                    .as_ref()
+                    .is_some_and(|(_, p)| p == &host || p == &wildcard)
+            })
+            .map(|r| r.id)
+            .collect();
+
+        if doomed.is_empty() {
+            self.note(&format!("{host} is not named by any rule"));
+            return;
+        }
+        let removed = doomed.len();
+        for id in doomed {
+            if let Err(e) = self.engine.delete_scope_rule(id) {
+                self.note(&format!("could not remove a rule: {e:?}"));
+                return;
+            }
+        }
+        self.refresh();
+        self.note(&format!("{host} out of scope (−{removed} rules)"));
+    }
+
+    /// `<CR>` in the Scope window: activate a scope, or toggle a rule.
+    fn scope_enter(&mut self) {
+        if self.scope.column == Column::Left {
+            let Some(scope) = self.scopes.get(self.scope.scope_row) else {
+                self.note("no scope to activate");
+                return;
+            };
+            let (id, name) = (scope.id, scope.name.clone());
+            match self.engine.set_active_scope(id) {
+                Ok(()) => {
+                    self.refresh();
+                    self.note(&format!("active scope: {name}"));
+                }
+                Err(e) => self.note(&format!("could not activate: {e:?}")),
+            }
+            return;
+        }
+
+        let Some(rule) = self.scope_rules.get(self.scope.rule_row) else {
+            self.note("no rule selected");
+            return;
+        };
+        let (id, enabled) = (rule.id, rule.enabled);
+        match self.engine.set_scope_rule_enabled(id, !enabled) {
+            Ok(()) => {
+                self.refresh();
+                self.note(if enabled { "rule off" } else { "rule on" });
+            }
+            Err(e) => self.note(&format!("could not toggle: {e:?}")),
+        }
+    }
+
+    /// `d` in the Scope window: delete the highlighted rule, or scope.
+    fn scope_delete(&mut self) {
+        if self.scope.column == Column::Left {
+            let Some(scope) = self.scopes.get(self.scope.scope_row) else {
+                return;
+            };
+            let (id, name) = (scope.id, scope.name.clone());
+            match self.engine.delete_scope(id) {
+                Ok(()) => {
+                    self.refresh();
+                    self.note(&format!("deleted scope {name}"));
+                }
+                Err(e) => self.note(&format!("could not delete: {e:?}")),
+            }
+            return;
+        }
+
+        let Some(rule) = self.scope_rules.get(self.scope.rule_row) else {
+            self.note("no rule selected");
+            return;
+        };
+        let id = rule.id;
+        match self.engine.delete_scope_rule(id) {
+            Ok(()) => {
+                self.refresh();
+                self.note("rule deleted");
+            }
+            Err(e) => self.note(&format!("could not delete: {e:?}")),
+        }
+    }
+
+    /// Add a rule to the scope under the cursor.
+    ///
+    /// Glob unless the pattern says otherwise: `re:` for a regex, `cidr:` for a
+    /// network. Glob is the default because it is what people mean and, unlike
+    /// an unanchored regex, it cannot silently match more than it looks like.
+    fn scope_add_rule(&mut self, pattern: &str, action: proxy_core::scope::Action) {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            self.note("usage: :scope add <pattern>   (re: or cidr: to change kind)");
+            return;
+        }
+        let Some(scope_id) = self
+            .scopes
+            .get(self.scope.scope_row)
+            .map(|s| s.id)
+            .or_else(|| self.target_scope())
+        else {
+            return;
+        };
+
+        let (kind, pattern) = match pattern.split_once(':') {
+            Some(("re", rest)) => (proxy_core::scope::HostKind::Regex, rest.trim()),
+            Some(("cidr", rest)) => (proxy_core::scope::HostKind::Cidr, rest.trim()),
+            _ => (proxy_core::scope::HostKind::Glob, pattern),
+        };
+
+        let spec = proxy_core::scope::RuleSpec::host(kind, pattern);
+        match self.engine.add_scope_rule(scope_id, action, &spec) {
+            Ok(_) => {
+                self.refresh();
+                self.note(&format!("added {pattern}"));
+            }
+            // add_rule compiles the pattern before storing it, so a bad regex
+            // is refused here rather than breaking the matcher later.
+            Err(e) => self.note(&format!("rejected: {e:?}")),
+        }
+    }
+
+    fn scope_new(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.note("usage: :scope new <name>");
+            return;
+        }
+        match self.engine.create_scope(name) {
+            Ok(id) => {
+                if self.scopes.is_empty() {
+                    // The first scope may as well be the active one; a scope
+                    // that filters nothing looks broken.
+                    let _ = self.engine.set_active_scope(id);
+                }
+                self.refresh();
+                self.scope.scope_row = self
+                    .scopes
+                    .iter()
+                    .position(|s| s.id == id)
+                    .unwrap_or(self.scope.scope_row);
+                self.note(&format!("created scope {name}"));
+            }
+            Err(e) => self.note(&format!("could not create: {e:?}")),
+        }
     }
 
     // --- repeater ---
@@ -1579,9 +1904,54 @@ impl App {
                 self.note(&format!("set {option}={value}"));
             }
             Command::Pretty => self.format_buffer(),
+            Command::Scope { verb, argument } => self.run_scope_command(&verb, &argument),
             Command::Help => self.note(HELP),
             Command::Unknown(name) => self.note(&format!("E492: not an editor command: {name}")),
         }
+    }
+
+    /// `:scope …`. Verbs rather than keys because every one of these takes a
+    /// pattern or a name, and free text has to be typed somewhere.
+    fn run_scope_command(&mut self, verb: &str, argument: &str) {
+        match verb {
+            "new" => self.scope_new(argument),
+            "add" | "include" => self.scope_add_rule(argument, proxy_core::scope::Action::Include),
+            "exclude" | "ex" => self.scope_add_rule(argument, proxy_core::scope::Action::Exclude),
+            "use" => {
+                match self
+                    .scopes
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(argument.trim()))
+                {
+                    Some(scope) => {
+                        let (id, name) = (scope.id, scope.name.clone());
+                        match self.engine.set_active_scope(id) {
+                            Ok(()) => {
+                                self.refresh();
+                                self.note(&format!("active scope: {name}"));
+                            }
+                            Err(e) => self.note(&format!("could not activate: {e:?}")),
+                        }
+                    }
+                    None => self.note(&format!("no scope named {argument:?}")),
+                }
+            }
+            "off" | "bypass" => self.set_scope_filter(false),
+            "on" => self.set_scope_filter(true),
+            "" => self.note("usage: :scope new|add|exclude|use|on|off [argument]"),
+            other => self.note(&format!("unknown: :scope {other}")),
+        }
+    }
+
+    /// Turn scope filtering off or on without touching the rules.
+    fn set_scope_filter(&mut self, on: bool) {
+        self.scope_filter = on;
+        self.refresh();
+        self.note(if on {
+            "scope filtering on"
+        } else {
+            "scope bypassed — showing everything"
+        });
     }
 
     fn move_cursor(&mut self, motion: Motion, count: Option<usize>) {
@@ -1839,6 +2209,7 @@ impl App {
             Window::Intercept => self.draw_intercept(frame, body),
             Window::Repeater => self.draw_repeater(frame, body),
             Window::Sitemap => self.draw_sitemap(frame, body),
+            Window::Scope => self.draw_scope(frame, body),
             Window::Automate => self.draw_automate(frame, body),
         }
         self.draw_status(frame, status_bar);
@@ -2407,6 +2778,149 @@ impl App {
         }
     }
 
+    /// Scope: the named scopes on the left, the highlighted one's rules on the
+    /// right.
+    ///
+    /// Only one scope is active at a time, and it is the active one that filters
+    /// the other windows — so which is active has to be visible at a glance,
+    /// not inferred from a highlight that also means "the cursor is here".
+    fn draw_scope(&mut self, frame: &mut Frame, area: Rect) {
+        let [banner, panes] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        self.viewport = panes.height.saturating_sub(2) as usize;
+
+        let active = self.scopes.iter().find(|s| s.is_active);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if self.scope_filter { " FILTERING " } else { " BYPASSED " },
+                    Style::new()
+                        .fg(Color::Black)
+                        .bg(if self.scope_filter { Color::Cyan } else { INACTIVE_BG }),
+                ),
+                Span::styled(
+                    match active {
+                        Some(scope) => format!("  {}  ", scope.name),
+                        None => "  no active scope — everything is in scope  ".to_string(),
+                    },
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    "n new  a include  x exclude  d delete  <CR> activate/toggle  ^w pane  <Space>c bypass",
+                    muted(),
+                ),
+            ])),
+            banner,
+        );
+
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .areas(panes);
+
+        let on_scopes = self.scope.column == Column::Left;
+        let border_for = |mine: bool| {
+            if mine {
+                Style::new().fg(Color::Cyan)
+            } else {
+                muted()
+            }
+        };
+
+        // --- scopes ---
+        let rows: Vec<Line> = if self.scopes.is_empty() {
+            vec![Line::styled("no scopes — n to create one", muted())]
+        } else {
+            self.scopes
+                .iter()
+                .enumerate()
+                .map(|(i, scope)| {
+                    // The dot is the answer to "which one is filtering?"; the
+                    // highlight only says where the cursor is.
+                    let marker = if scope.is_active { "●" } else { "○" };
+                    let text = format!(" {marker} {} ", scope.name);
+                    if i == self.scope.scope_row {
+                        Line::styled(
+                            text,
+                            if on_scopes {
+                                Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+                            } else {
+                                Style::new().bg(INACTIVE_BG)
+                            },
+                        )
+                    } else if scope.is_active {
+                        Line::styled(text, Style::new().fg(Color::Cyan))
+                    } else {
+                        Line::from(text)
+                    }
+                })
+                .collect()
+        };
+        frame.render_widget(
+            Paragraph::new(rows).block(
+                Block::bordered()
+                    .title(format!(" Scopes ({}) ", self.scopes.len()))
+                    .border_style(border_for(on_scopes)),
+            ),
+            left,
+        );
+
+        // --- rules ---
+        let rows: Vec<Line> = if self.scope_rules.is_empty() {
+            vec![Line::styled(
+                "no rules — everything is in scope (a to include)",
+                muted(),
+            )]
+        } else {
+            self.scope_rules
+                .iter()
+                .enumerate()
+                .map(|(i, rule)| {
+                    let selected = i == self.scope.rule_row && !on_scopes;
+                    let mut spans = vec![
+                        // Include and exclude read as opposites at a glance;
+                        // excludes always win, so they need to stand out.
+                        Span::styled(
+                            match rule.action {
+                                proxy_core::scope::Action::Include => " + ",
+                                proxy_core::scope::Action::Exclude => " − ",
+                            },
+                            match rule.action {
+                                proxy_core::scope::Action::Include => Style::new().fg(Color::Green),
+                                proxy_core::scope::Action::Exclude => Style::new().fg(Color::Red),
+                            },
+                        ),
+                        Span::styled(format!("{:<6}", kind_label(rule)), muted()),
+                        Span::raw(rule_pattern(rule)),
+                    ];
+                    if !rule.enabled {
+                        spans.push(Span::styled("  (off)", muted()));
+                    }
+                    let mut line = Line::from(spans);
+                    if selected {
+                        line = line.style(Style::new().bg(INACTIVE_BG));
+                    } else if i == self.scope.rule_row {
+                        line = line.style(Style::new().bg(INACTIVE_BG).add_modifier(Modifier::DIM));
+                    }
+                    line
+                })
+                .collect()
+        };
+        let title = match self.scopes.get(self.scope.scope_row) {
+            Some(scope) => format!(" Rules — {} ", scope.name),
+            None => " Rules ".to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(rows).block(
+                Block::bordered()
+                    .title(title)
+                    .border_style(border_for(!on_scopes)),
+            ),
+            right,
+        );
+
+        self.content_len = self.scopes.len().max(self.scope_rules.len()) as u16;
+    }
+
     /// Sitemap: the tree of what has been seen, host then path. `<CR>` folds.
     fn draw_sitemap(&mut self, frame: &mut Frame, area: Rect) {
         self.viewport = area.height.saturating_sub(2) as usize;
@@ -2615,7 +3129,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · :q";
+const HELP: &str = "^k palette · P/I/R/C/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -2723,6 +3237,7 @@ fn build_sitemap_rows(nodes: &[SitemapNode], collapsed: &HashSet<String>) -> Vec
             // A host's count is the traffic across everything beneath it.
             flow_count: host_roots.iter().map(|n| n.flow_count).sum(),
             has_children: !host_roots.is_empty(),
+            host: host.to_string(),
         });
         if folded {
             continue;
@@ -2752,6 +3267,7 @@ fn push_sitemap_node(
         key,
         flow_count: node.flow_count,
         has_children: !kids.is_empty(),
+        host: node.host.clone(),
     });
     if folded {
         return;
@@ -3057,6 +3573,31 @@ fn empty_pane(title: &'static str, message: &'static str) -> Paragraph<'static> 
     Paragraph::new(Line::styled(message, muted())).block(Block::bordered().title(title))
 }
 
+/// How a rule's host pattern should be read, for the rules list.
+fn kind_label(rule: &proxy_core::scope::ScopeRule) -> &'static str {
+    match rule.spec.host {
+        Some((proxy_core::scope::HostKind::Glob, _)) => "glob",
+        Some((proxy_core::scope::HostKind::Regex, _)) => "regex",
+        Some((proxy_core::scope::HostKind::Cidr, _)) => "cidr",
+        None => "any",
+    }
+}
+
+/// The rule as text: host, then the port and path constraints if it has them.
+fn rule_pattern(rule: &proxy_core::scope::ScopeRule) -> String {
+    let mut out = match &rule.spec.host {
+        Some((_, pattern)) => pattern.clone(),
+        None => "*".to_string(),
+    };
+    if let Some(port) = rule.spec.port {
+        out.push_str(&format!(":{port}"));
+    }
+    if let Some(prefix) = &rule.spec.path_prefix {
+        out.push_str(prefix);
+    }
+    out
+}
+
 /// A section header inside the Automate pane.
 fn section(lines: &mut Vec<Line<'static>>, title: &str) {
     if !lines.is_empty() {
@@ -3190,6 +3731,27 @@ mod tests {
             app.apply(action);
         }
         app.refresh();
+    }
+
+    /// Record one flow at a given URI, for scope tests that care about hosts.
+    fn record_flow(engine: &Arc<Engine>, uri: &str) {
+        let uri: Uri = uri.parse().unwrap();
+        let id = engine.record_request(CapturedRequest {
+            method: Method::GET,
+            uri,
+            version: Version::HTTP_11,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        });
+        engine.record_response(
+            id,
+            CapturedResponse {
+                status: StatusCode::OK,
+                version: Version::HTTP_11,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
     }
 
     fn engine_with(count: usize) -> Arc<Engine> {
@@ -3648,6 +4210,251 @@ mod tests {
         let mut app = App::new(engine);
         app.refresh();
         assert!(render(&mut app).contains("(pending)"));
+    }
+
+    // --- scope ---
+
+    /// The whole loop, through real keys: add a host from the Sitemap, see the
+    /// Proxy list narrow, then bypass and see it widen again.
+    #[test]
+    fn scoping_a_host_filters_the_other_windows() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://in-scope.test/a");
+        record_flow(&engine, "https://other.test/b");
+        let mut app = App::new(engine);
+        app.refresh();
+        assert_eq!(app.flows.len(), 2, "no scope means everything");
+
+        // Put the first host in scope from the Sitemap.
+        press(&mut app, "S");
+        assert_eq!(app.window, Window::Sitemap);
+        let rows = app.sitemap_rows();
+        let row = rows
+            .iter()
+            .position(|r| r.host == "in-scope.test")
+            .expect("host should be in the tree");
+        app.sitemap.selected = row;
+        press(&mut app, "a");
+
+        app.refresh();
+        assert_eq!(
+            app.flows.len(),
+            1,
+            "Proxy should now list only the scoped host"
+        );
+        assert!(app.flows[0].uri.to_string().contains("in-scope.test"));
+
+        // The bypass shows everything again without touching the rules.
+        press(&mut app, " c");
+        assert_eq!(app.flows.len(), 2, "bypass should widen the view");
+        assert!(!app.scope_filter);
+        press(&mut app, " c");
+        assert_eq!(app.flows.len(), 1, "and put it back");
+    }
+
+    /// `*.host` does not match the apex `host`, so adding a host has to create
+    /// both or it silently misses one of them.
+    #[test]
+    fn adding_a_host_covers_the_apex_and_its_subdomains() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://linear.app/a");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.window = Window::Sitemap;
+        app.sitemap.selected = 0;
+        app.scope_add_host();
+
+        let scope_id = app.scopes.iter().find(|s| s.is_active).expect("a scope").id;
+        let patterns: Vec<String> = engine
+            .scope_rules(scope_id)
+            .iter()
+            .filter_map(|r| r.spec.host.as_ref().map(|(_, p)| p.clone()))
+            .collect();
+        assert!(patterns.contains(&"linear.app".to_string()), "{patterns:?}");
+        assert!(
+            patterns.contains(&"*.linear.app".to_string()),
+            "{patterns:?}"
+        );
+
+        // Adding twice must not pile up duplicates.
+        app.scope_add_host();
+        let after = engine.scope_rules(scope_id).len();
+        assert_eq!(after, 2, "adding an already-scoped host should be a no-op");
+    }
+
+    #[test]
+    fn removing_a_host_drops_both_of_its_rules() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://linear.app/a");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.window = Window::Sitemap;
+        app.sitemap.selected = 0;
+        app.scope_add_host();
+        let scope_id = app.scopes.iter().find(|s| s.is_active).unwrap().id;
+        assert_eq!(engine.scope_rules(scope_id).len(), 2);
+
+        app.scope_remove_host();
+        assert!(
+            engine.scope_rules(scope_id).is_empty(),
+            "both apex and wildcard should go"
+        );
+    }
+
+    /// Glob unless asked otherwise, because an unanchored regex silently
+    /// matches more than it looks like.
+    #[test]
+    fn rule_patterns_default_to_glob_with_prefixes_for_the_rest() {
+        let engine = Engine::new();
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.scope_new("t");
+
+        app.scope_add_rule("*.linear.app", proxy_core::scope::Action::Include);
+        app.scope_add_rule("re:^api\\.", proxy_core::scope::Action::Include);
+        app.scope_add_rule("cidr:10.0.0.0/8", proxy_core::scope::Action::Exclude);
+
+        let scope_id = app.scopes[0].id;
+        let kinds: Vec<_> = engine
+            .scope_rules(scope_id)
+            .iter()
+            .filter_map(|r| r.spec.host.as_ref().map(|(k, _)| *k))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                proxy_core::scope::HostKind::Glob,
+                proxy_core::scope::HostKind::Regex,
+                proxy_core::scope::HostKind::Cidr,
+            ]
+        );
+    }
+
+    /// A pattern that will not compile must be refused when it is typed, not
+    /// when the matcher next runs.
+    #[test]
+    fn a_bad_pattern_is_rejected_on_entry() {
+        let engine = Engine::new();
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.scope_new("t");
+        let scope_id = app.scopes[0].id;
+
+        app.scope_add_rule("re:[unclosed", proxy_core::scope::Action::Include);
+        assert!(
+            engine.scope_rules(scope_id).is_empty(),
+            "a bad regex must not be stored"
+        );
+        let status = app.status.lock().unwrap().clone();
+        assert!(status.contains("rejected"), "{status}");
+    }
+
+    /// Excludes always beat includes, which is what makes the result
+    /// independent of rule order.
+    #[test]
+    fn an_exclude_carves_a_hole_in_an_include() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://app.linear.app/a");
+        record_flow(&engine, "https://admin.linear.app/b");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.scope_new("t");
+        app.scope_add_rule("*.linear.app", proxy_core::scope::Action::Include);
+        app.refresh();
+        assert_eq!(app.flows.len(), 2);
+
+        app.scope_add_rule("admin.linear.app", proxy_core::scope::Action::Exclude);
+        app.refresh();
+        assert_eq!(app.flows.len(), 1, "the exclude should win");
+        assert!(app.flows[0].uri.to_string().contains("app.linear.app"));
+    }
+
+    /// Turning a rule off is not the same as deleting it.
+    #[test]
+    fn a_disabled_rule_stops_filtering_but_survives() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://a.test/x");
+        record_flow(&engine, "https://b.test/y");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.scope_new("t");
+        app.scope_add_rule("a.test", proxy_core::scope::Action::Include);
+        app.refresh();
+        assert_eq!(app.flows.len(), 1);
+
+        app.scope.column = Column::Right;
+        app.scope.rule_row = 0;
+        app.scope_enter();
+        app.refresh();
+        assert_eq!(app.flows.len(), 2, "a disabled rule should not narrow");
+        assert_eq!(app.scope_rules.len(), 1, "but it is still there");
+        assert!(!app.scope_rules[0].enabled);
+    }
+
+    /// Only one scope filters at a time, and which one has to be switchable.
+    #[test]
+    fn switching_the_active_scope_changes_what_is_listed() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://a.test/x");
+        record_flow(&engine, "https://b.test/y");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+
+        app.scope_new("only-a");
+        app.scope_add_rule("a.test", proxy_core::scope::Action::Include);
+        app.scope_new("only-b");
+        app.scope_add_rule("b.test", proxy_core::scope::Action::Include);
+
+        app.run_scope_command("use", "only-a");
+        assert!(app.flows[0].uri.to_string().contains("a.test"));
+        assert_eq!(app.flows.len(), 1);
+
+        app.run_scope_command("use", "only-b");
+        assert_eq!(app.flows.len(), 1);
+        assert!(app.flows[0].uri.to_string().contains("b.test"));
+    }
+
+    /// Deleting the active scope leaves nothing active, which means
+    /// unrestricted — the safe direction to fail.
+    #[test]
+    fn deleting_the_active_scope_widens_rather_than_hides() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://a.test/x");
+        record_flow(&engine, "https://b.test/y");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.scope_new("only-a");
+        app.scope_add_rule("a.test", proxy_core::scope::Action::Include);
+        app.refresh();
+        assert_eq!(app.flows.len(), 1);
+
+        app.scope.column = Column::Left;
+        app.scope.scope_row = 0;
+        app.scope_delete();
+        app.refresh();
+        assert_eq!(app.flows.len(), 2, "no scope means everything");
+    }
+
+    /// Hiding a held item would strand a live connection with no way to answer
+    /// it, so Intercept is deliberately not filtered.
+    #[test]
+    fn intercept_queues_are_not_filtered_by_scope() {
+        let (engine, mut app, _rt) = app_with_both_legs_held();
+        app.refresh();
+        app.scope_new("nothing-matches");
+        app.scope_add_rule("no-such-host.invalid", proxy_core::scope::Action::Include);
+        app.refresh();
+
+        assert_eq!(
+            engine.intercept().queue_of(true).len(),
+            1,
+            "the hold is still on the queue"
+        );
+        assert_eq!(
+            app.held_requests.len(),
+            1,
+            "and still visible, or it could never be answered"
+        );
     }
 
     // --- repeater ---
