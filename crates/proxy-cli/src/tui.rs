@@ -863,11 +863,19 @@ impl App {
                 match crate::pretty::pretty_message(&current) {
                     // Saying so beats a checkpoint and a no-op edit that makes
                     // the buffer look dirty for no reason.
-                    Ok(formatted) if formatted == current => "already formatted".to_string(),
-                    Ok(formatted) => {
+                    Ok((formatted, _)) if formatted == current => "already formatted".to_string(),
+                    Ok((formatted, language)) => {
                         buffer.checkpoint();
                         buffer.set_text(&formatted);
-                        "body reformatted — u to undo".to_string()
+                        match language {
+                            // Whitespace between HTML elements can render as a
+                            // space, so this one is not purely cosmetic and the
+                            // operator should know before forwarding it.
+                            crate::syntax::Language::Html => {
+                                "HTML reformatted — whitespace changed, u to undo".to_string()
+                            }
+                            _ => "body reformatted — u to undo".to_string(),
+                        }
                     }
                     Err(e) => format!("cannot format: {e}"),
                 }
@@ -1711,8 +1719,10 @@ impl App {
             muted()
         };
         frame.render_widget(
-            buffer_pane(&self.repeater.request, title, editing, inserting, border)
-                .scroll((self.content_scroll, 0)),
+            buffer_pane(&self.repeater.request, title, editing, inserting, border).scroll((
+                self.content_scroll,
+                horizontal_scroll(&self.repeater.request, left),
+            )),
             left,
         );
 
@@ -1933,8 +1943,9 @@ impl App {
                 // Show the cursor whenever the preview has the keys, not only
                 // while inserting — that is what makes it navigable rather than
                 // a block of text that happens to scroll.
+                let hscroll = horizontal_scroll(buffer, view_area);
                 let widget = buffer_pane(buffer, title, in_preview, inserting, view_border)
-                    .scroll((view_scroll, 0));
+                    .scroll((view_scroll, hscroll));
                 if focused {
                     self.content_len = buffer.lines().len() as u16;
                 }
@@ -2445,6 +2456,20 @@ fn pane(lines: Vec<Line<'static>>, title: impl Into<String>) -> Paragraph<'stati
     Paragraph::new(lines)
         .block(Block::bordered().title(title.into()))
         .wrap(Wrap { trim: false })
+}
+
+/// How far to scroll a buffer pane sideways to keep the cursor on screen.
+///
+/// The companion to [`buffer_pane`]'s refusal to wrap. Without this, a minified
+/// body — a 559-byte HTML response on one line is the normal case, not a corner
+/// one — runs off the right edge with no way to reach the rest of it. Scrolling
+/// only once the cursor would leave the pane keeps short lines pinned at column
+/// zero, so the view stays still until it has a reason to move.
+fn horizontal_scroll(buffer: &TextBuffer, area: Rect) -> u16 {
+    // Borders eat a column on each side, and one more so the cursor is never
+    // drawn flush against the right edge.
+    let visible = area.width.saturating_sub(3) as usize;
+    buffer.cursor().col.saturating_sub(visible) as u16
 }
 
 /// A pane showing an editable buffer, with the cursor drawn as a block when the
@@ -3714,6 +3739,44 @@ mod tests {
         assert_eq!(app.preview_buffer(true).unwrap().text(), original);
         let status = app.status.lock().unwrap().clone();
         assert!(status.contains("cannot format"), "should say why: {status}");
+    }
+
+    /// A minified body is one very long line; without sideways scrolling the
+    /// far end of it is unreachable, which is what made the pane look broken.
+    #[test]
+    fn the_view_follows_the_cursor_along_a_long_line() {
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buffer = TextBuffer::from_text(&"x".repeat(500));
+
+        assert_eq!(
+            horizontal_scroll(&buffer, area),
+            0,
+            "a cursor already on screen must not shift the view"
+        );
+
+        buffer.set_cursor(Cursor { line: 0, col: 36 });
+        assert_eq!(horizontal_scroll(&buffer, area), 0, "still just on screen");
+
+        buffer.set_cursor(Cursor { line: 0, col: 200 });
+        let scroll = horizontal_scroll(&buffer, area);
+        assert!(scroll > 0, "the view should follow the cursor");
+        // The cursor must land inside the visible columns, not past the edge.
+        let visible = area.width as usize - 3;
+        assert!(
+            (200 - scroll as usize) <= visible,
+            "cursor at {} of {visible} visible",
+            200 - scroll as usize
+        );
+    }
+
+    /// Short lines must not scroll sideways at all, or the whole pane would
+    /// drift whenever the cursor sat near the end of one.
+    #[test]
+    fn short_lines_stay_pinned_at_column_zero() {
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buffer = TextBuffer::from_text("GET / HTTP/1.1");
+        buffer.set_cursor(Cursor { line: 0, col: 13 });
+        assert_eq!(horizontal_scroll(&buffer, area), 0);
     }
 
     /// `<C-g>` stages the focused buffer for the external editor. The handoff
