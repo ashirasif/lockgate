@@ -237,6 +237,10 @@ pub enum Action {
     SendToRepeater,
     /// `<CR>` on a sitemap row — fold or unfold it.
     Toggle,
+    /// `<CR>` on a queue row — step into the preview for that item.
+    Enter,
+    /// Escape with nothing half-typed: step back out of wherever you are.
+    Escape,
     /// `<C-w>h` / `<C-w>l` / `<C-w>w` — move focus between split panes.
     Focus(Option<Column>),
     /// `<Space>1` / `<Space>2` — choose which legs of an exchange hold.
@@ -271,11 +275,30 @@ enum Bind {
     ToggleIntercept,
     SendToRepeater,
     Toggle,
+    Enter,
     /// `None` cycles to the other pane; `Some(c)` focuses that side.
     Focus(Option<Column>),
     ToggleHoldRequests,
     ToggleHoldResponses,
 }
+
+/// Bindings that only apply inside one window, checked before [`NORMAL_MAP`].
+///
+/// This is the escape hatch from the fidelity rule. `f` and `d` are find-char
+/// and the delete operator in vim, and shadowing them globally would be exactly
+/// the sort of lie this file exists to prevent. But inside Intercept there is no
+/// line to find a character on and nothing to delete — there is a queue, and the
+/// two things you do to it are forward and drop. A key that is unambiguous in
+/// one window can be spent there without costing anything anywhere else.
+const WINDOW_MAP: &[(Window, &str, Bind)] = &[
+    (Window::Intercept, "f", Bind::Forward),
+    (Window::Intercept, "d", Bind::Drop),
+    (Window::Intercept, "F", Bind::ForwardAll),
+    (Window::Intercept, "D", Bind::DropAll),
+    // Step into the preview for the highlighted item.
+    (Window::Intercept, "<CR>", Bind::Enter),
+    (Window::Sitemap, "<CR>", Bind::Toggle),
+];
 
 /// The keymap is data, not control flow, so that `:map` can later rewrite it
 /// and so the resolver can answer "is this a prefix of something?" generically.
@@ -319,13 +342,9 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     // Leader. Application verbs live here so they never shadow vim's own keys.
     ("<Space>r", Bind::Resend),
     ("<Space>s", Bind::SendToRepeater),
-    // Intercept verdicts. Lowercase answers one item, uppercase answers them
-    // all — the same shift-widens-the-scope shape as `<Space>r` over a visual
-    // selection.
-    ("<Space>f", Bind::Forward),
-    ("<Space>d", Bind::Drop),
-    ("<Space>F", Bind::ForwardAll),
-    ("<Space>D", Bind::DropAll),
+    // Intercept verdicts live in `WINDOW_MAP` as bare `f`/`d`, since that is
+    // where they are unambiguous. Toggling *whether* we hold is global, though:
+    // you reach for it from wherever you noticed traffic was stalling.
     ("<Space>i", Bind::ToggleIntercept),
     // Which legs hold, numbered left-to-right the way the panes are laid out.
     ("<Space>1", Bind::ToggleHoldRequests),
@@ -336,7 +355,6 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     ("<C-w>w", Bind::Focus(None)),
     // `i` starts insert, exactly as in vim — there is something to edit now.
     ("i", Bind::Mode(Mode::Insert)),
-    ("<CR>", Bind::Toggle),
     // Windows. In a text editor these uppercase keys are Replace / Insert /
     // Append — but jumping between tools is the navigation a proxy needs
     // constantly, so they are spent here. `gt` / `gT` still cycle the way vim
@@ -367,6 +385,9 @@ pub struct Input {
     pending: Vec<String>,
     /// The `:`/`/`/`?` line being typed, including its leading character.
     cmdline: String,
+    /// Which window is on screen, so [`WINDOW_MAP`] can be consulted. The app
+    /// keeps this in step; the input layer never changes it itself.
+    window: Window,
 }
 
 impl Input {
@@ -376,6 +397,12 @@ impl Input {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Tell the input layer which window is active, so window-scoped bindings
+    /// resolve against the right one.
+    pub fn set_window(&mut self, window: Window) {
+        self.window = window;
     }
 
     /// The in-progress `:` or `/` line, for the UI to render at the bottom.
@@ -467,12 +494,16 @@ impl Input {
         let token = encode(key)?;
 
         if token == "<Esc>" {
+            let had_pending = !self.pending.is_empty() || !self.count.is_empty();
             self.reset();
-            // Escape leaves Visual for Normal; in Normal it just clears pending.
-            return (self.mode == Mode::Visual).then(|| {
+            if self.mode == Mode::Visual {
                 self.mode = Mode::Normal;
-                Action::ModeChange(Mode::Normal)
-            });
+                return Some(Action::ModeChange(Mode::Normal));
+            }
+            // With something half-typed, Escape's job was to discard it and
+            // nothing more. Otherwise it means "back out", which is the window's
+            // to interpret.
+            return (!had_pending).then_some(Action::Escape);
         }
 
         // A count is digits typed before a command — but a leading `0` is the
@@ -483,7 +514,7 @@ impl Input {
         }
 
         self.pending.push(token);
-        match resolve(&self.pending) {
+        match resolve(&self.pending, self.window) {
             Resolution::Partial => None,
             Resolution::None => {
                 self.reset();
@@ -532,6 +563,7 @@ impl Input {
             Bind::ToggleIntercept => Action::ToggleIntercept,
             Bind::SendToRepeater => Action::SendToRepeater,
             Bind::Toggle => Action::Toggle,
+            Bind::Enter => Action::Enter,
             Bind::Focus(column) => Action::Focus(column),
             Bind::ToggleHoldRequests => Action::ToggleHoldRequests,
             Bind::ToggleHoldResponses => Action::ToggleHoldResponses,
@@ -608,9 +640,22 @@ enum Resolution {
 }
 
 /// Look a typed sequence up in the keymap.
-fn resolve(pending: &[String]) -> Resolution {
+///
+/// Window-scoped bindings win over global ones, so a window can claim a key
+/// without the global map having to know that any window exists.
+fn resolve(pending: &[String], window: Window) -> Resolution {
     let typed = pending.concat();
     let mut partial = false;
+
+    for (scope, sequence, bind) in WINDOW_MAP {
+        if *scope != window {
+            continue;
+        }
+        if *sequence == typed {
+            return Resolution::Match(*bind, None);
+        }
+        partial |= sequence.starts_with(&typed);
+    }
 
     for (sequence, bind) in NORMAL_MAP {
         if let Some(prefix) = sequence.strip_suffix("{char}") {
@@ -1000,13 +1045,77 @@ mod tests {
     }
 
     #[test]
-    fn leader_answers_held_traffic() {
-        assert_eq!(last(" f"), Action::Forward);
-        assert_eq!(last(" d"), Action::Drop);
-        assert_eq!(last(" F"), Action::ForwardAll);
-        assert_eq!(last(" D"), Action::DropAll);
+    fn leader_verbs_are_global() {
         assert_eq!(last(" i"), Action::ToggleIntercept);
         assert_eq!(last(" s"), Action::SendToRepeater);
+    }
+
+    /// In Intercept, bare `f`/`d` answer the queue. This is the one place the
+    /// fidelity rule bends, and it must bend *only* there.
+    #[test]
+    fn intercept_claims_bare_f_and_d() {
+        let mut input = Input::new();
+        input.set_window(Window::Intercept);
+        assert_eq!(feed(&mut input, "f").pop(), Some(Action::Forward));
+        assert_eq!(feed(&mut input, "d").pop(), Some(Action::Drop));
+        assert_eq!(feed(&mut input, "F").pop(), Some(Action::ForwardAll));
+        assert_eq!(feed(&mut input, "D").pop(), Some(Action::DropAll));
+        assert_eq!(feed(&mut input, "\r").pop(), None, "CR is not a Char key");
+    }
+
+    /// Outside Intercept those keys stay vim's, unbound and inert.
+    #[test]
+    fn f_and_d_stay_free_in_other_windows() {
+        for window in [Window::Proxy, Window::Repeater, Window::Sitemap] {
+            let mut input = Input::new();
+            input.set_window(window);
+            assert!(
+                feed(&mut input, "f").is_empty(),
+                "f should be unbound in {window:?}"
+            );
+            assert!(
+                feed(&mut input, "d").is_empty(),
+                "d should be unbound in {window:?}"
+            );
+        }
+    }
+
+    /// `<CR>` means different things in different windows, which is exactly
+    /// what window scoping is for.
+    #[test]
+    fn cr_is_scoped_to_the_window() {
+        let cr = KeyEvent::from(KeyCode::Enter);
+
+        let mut input = Input::new();
+        input.set_window(Window::Intercept);
+        assert_eq!(input.feed(cr), Some(Action::Enter));
+
+        let mut input = Input::new();
+        input.set_window(Window::Sitemap);
+        assert_eq!(input.feed(cr), Some(Action::Toggle));
+
+        let mut input = Input::new();
+        input.set_window(Window::Proxy);
+        assert_eq!(input.feed(cr), None, "unbound elsewhere");
+    }
+
+    /// Escape with nothing half-typed is a "back out" the window interprets;
+    /// with a partial sequence it only discards that.
+    #[test]
+    fn escape_reports_only_when_nothing_is_pending() {
+        let mut input = Input::new();
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Esc)),
+            Some(Action::Escape)
+        );
+
+        let mut input = Input::new();
+        feed(&mut input, "12g");
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Esc)),
+            None,
+            "should have discarded the partial sequence instead"
+        );
     }
 
     /// `gt` / `gT` cycle tabs, and must not disturb `gg`, whose prefix they share.

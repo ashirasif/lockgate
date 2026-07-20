@@ -158,6 +158,24 @@ impl TextBuffer {
         }
     }
 
+    /// `gg` — first line, keeping the column where it fits.
+    pub fn top(&mut self) {
+        self.cursor.line = 0;
+        self.clamp_col();
+    }
+
+    /// `G` — last line.
+    pub fn bottom(&mut self) {
+        self.cursor.line = self.lines.len().saturating_sub(1);
+        self.clamp_col();
+    }
+
+    /// Jump to a zero-based line, clamped to the buffer.
+    pub fn goto_line(&mut self, line: usize) {
+        self.cursor.line = line.min(self.lines.len().saturating_sub(1));
+        self.clamp_col();
+    }
+
     pub fn line_start(&mut self) {
         self.cursor.col = 0;
     }

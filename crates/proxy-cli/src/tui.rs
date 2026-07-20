@@ -48,9 +48,21 @@ struct Repeater {
 /// own preview. The legs are answered independently, so each column carries its
 /// own cursor and its own edit buffer, and `<C-w>h`/`<C-w>l` choose which one
 /// the keys act on.
+/// Which half of a column has the keys: the queue, or the preview under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Pane {
+    #[default]
+    Table,
+    Preview,
+}
+
 #[derive(Default)]
 struct InterceptView {
     focus: Column,
+    /// `<CR>` steps down into the preview, Escape steps back up. Movement keys
+    /// walk queue rows in `Table` and buffer lines in `Preview`, which is what
+    /// makes the preview feel like a buffer rather than a viewport.
+    pane: Pane,
     /// Row cursor per column, into that leg's queue as last rendered.
     request_row: usize,
     response_row: usize,
@@ -295,6 +307,13 @@ impl App {
             Action::Move { motion, count } if self.window == Window::Proxy => {
                 self.move_cursor(motion, count)
             }
+            // Inside a preview the motions walk the buffer; on a queue they
+            // walk rows.
+            Action::Move { motion, count }
+                if self.window == Window::Intercept && self.intercept.pane == Pane::Preview =>
+            {
+                self.move_in_preview(motion, count)
+            }
             Action::Move { motion, count } if self.window == Window::Intercept => {
                 let requests = self.intercept.showing_requests();
                 let last = self.held(requests).len().saturating_sub(1);
@@ -304,6 +323,8 @@ impl App {
                 } else {
                     self.intercept.response_row = row;
                 }
+                // A different item means a different buffer to look at.
+                self.content_scroll = 0;
             }
             Action::Move { motion, count } if self.window == Window::Sitemap => {
                 let last = self.sitemap_rows().len().saturating_sub(1);
@@ -382,6 +403,8 @@ impl App {
                 self.content_scroll = 0;
             }
             Action::Toggle => self.toggle_fold(),
+            Action::Enter => self.enter_preview(),
+            Action::Escape => self.leave_preview(),
             Action::Command(line) => self.run_command(&line),
             Action::Window(window) => self.show_window(window),
             Action::WindowStep(direction) => self.show_window(self.window.step(direction)),
@@ -391,10 +414,76 @@ impl App {
 
     // --- editing ---
 
+    /// Step from a queue into the preview beneath it.
+    fn enter_preview(&mut self) {
+        if self.window != Window::Intercept {
+            return;
+        }
+        let requests = self.intercept.showing_requests();
+        if self.held(requests).is_empty() {
+            return;
+        }
+        self.intercept.pane = Pane::Preview;
+        self.content_scroll = 0;
+        // Materialise the buffer now so the cursor is visible on arrival.
+        self.preview_buffer(requests);
+        self.note(if requests {
+            "request preview — i edit, <Esc> back"
+        } else {
+            "response preview — read-only, <Esc> back"
+        });
+    }
+
+    /// Step back out of a preview to its queue.
+    fn leave_preview(&mut self) {
+        if self.window == Window::Intercept && self.intercept.pane == Pane::Preview {
+            self.intercept.pane = Pane::Table;
+            self.content_scroll = 0;
+        }
+    }
+
+    /// Move the cursor inside the focused preview buffer.
+    fn move_in_preview(&mut self, motion: Motion, count: Option<usize>) {
+        let requests = self.intercept.showing_requests();
+        let Some(buffer) = self.preview_buffer(requests) else {
+            return;
+        };
+        let step = count.unwrap_or(1);
+        match motion {
+            Motion::Down => (0..step).for_each(|_| buffer.down()),
+            Motion::Up => (0..step).for_each(|_| buffer.up()),
+            Motion::Top => match count {
+                Some(n) => buffer.goto_line(n.saturating_sub(1)),
+                None => buffer.top(),
+            },
+            Motion::Bottom => match count {
+                Some(n) => buffer.goto_line(n.saturating_sub(1)),
+                None => buffer.bottom(),
+            },
+            Motion::HalfPageDown | Motion::PageDown => (0..10 * step).for_each(|_| buffer.down()),
+            Motion::HalfPageUp | Motion::PageUp => (0..10 * step).for_each(|_| buffer.up()),
+            _ => {}
+        }
+    }
+
     /// Route a keystroke to whichever buffer the active window is editing.
     /// Windows with nothing editable swallow it, so `i` there is inert rather
     /// than scribbling into a buffer the operator cannot see.
     fn edit(&mut self, key: InsertKey) {
+        // `i` from the queue means "edit this one", so open its preview rather
+        // than leaving the operator in INSERT with nothing underneath the
+        // cursor. `<CR>` is still the way to open one just to read it.
+        if self.window == Window::Intercept && self.intercept.pane == Pane::Table {
+            self.enter_preview();
+        }
+        // A held response is shown for reading, not rewriting. Refusing here
+        // rather than hiding the buffer keeps it navigable — you can still put
+        // the cursor anywhere in it — while nothing you type can change what
+        // gets forwarded.
+        if self.window == Window::Intercept && !self.intercept.showing_requests() {
+            self.note("responses are read-only here");
+            return;
+        }
         let Some(buffer) = self.active_buffer() else {
             return;
         };
@@ -423,19 +512,25 @@ impl App {
                 .original
                 .is_some()
                 .then(|| &mut self.repeater.request),
-            Window::Intercept => {
-                let requests = self.intercept.showing_requests();
-                let held = self.held(requests).get(self.intercept.row(requests))?;
-                let ticket = held.ticket;
-                let text = render_pending(&held.pending);
-                let slot = self.intercept.edit(requests);
-                if slot.as_ref().map(|(t, _)| *t) != Some(ticket) {
-                    *slot = Some((ticket, TextBuffer::from_text(&text)));
-                }
-                slot.as_mut().map(|(_, b)| b)
-            }
+            Window::Intercept => self.preview_buffer(self.intercept.showing_requests()),
             _ => None,
         }
+    }
+
+    /// The buffer backing one column's preview, created on first use.
+    ///
+    /// Both columns get one, responses included — it is what carries the cursor
+    /// for reading. Whether typing into it is *allowed* is a separate question,
+    /// answered in [`App::edit`].
+    fn preview_buffer(&mut self, requests: bool) -> Option<&mut TextBuffer> {
+        let held = self.held(requests).get(self.intercept.row(requests))?;
+        let ticket = held.ticket;
+        let text = render_pending(&held.pending);
+        let slot = self.intercept.edit(requests);
+        if slot.as_ref().map(|(t, _)| *t) != Some(ticket) {
+            *slot = Some((ticket, TextBuffer::from_text(&text)));
+        }
+        slot.as_mut().map(|(_, b)| b)
     }
 
     // --- intercept ---
@@ -726,6 +821,12 @@ impl App {
         if window != self.window {
             self.window = window;
             self.content_scroll = 0;
+            // Window-scoped bindings resolve against this, so it has to move
+            // with the window or `f` would still mean forward after leaving.
+            self.input.set_window(window);
+            // Always arrive on the queue, not inside a preview you stepped into
+            // three windows ago.
+            self.intercept.pane = Pane::Table;
             self.note(window.label());
         }
     }
@@ -1179,8 +1280,14 @@ impl App {
                 .areas(panes);
 
         let title = if dirty { " Request* " } else { " Request " };
+        let border = if editing {
+            Style::new().fg(Color::Red)
+        } else {
+            Style::new()
+        };
         frame.render_widget(
-            buffer_pane(&self.repeater.request, title, editing).scroll((self.content_scroll, 0)),
+            buffer_pane(&self.repeater.request, title, editing, editing, border)
+                .scroll((self.content_scroll, 0)),
             left,
         );
 
@@ -1210,9 +1317,9 @@ impl App {
     /// Intercept: four panes. The two legs of an exchange side by side, each a
     /// queue above a preview of its highlighted item.
     ///
-    /// Requests sit left and responses right — the order traffic travels. Both
-    /// previews are editable, so what is on screen is always exactly what
-    /// forwarding would send.
+    /// Requests sit left and responses right — the order traffic travels. The
+    /// request preview is editable, so what is on screen is exactly what
+    /// forwarding would send; the response preview is for reading.
     fn draw_intercept(&mut self, frame: &mut Frame, area: Rect) {
         let [banner, panes] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
@@ -1240,7 +1347,11 @@ impl App {
                     leg_style(legs[1]),
                 ),
                 Span::styled(
-                    "   <Space>i hold  1/2 legs  ^w pane  f fwd  d drop  F/D all",
+                    if self.intercept.pane == Pane::Preview {
+                        "   <Esc> back to queue   i edit"
+                    } else {
+                        "   <CR> open  f forward  d drop  F/D all  ^w pane  <Space>i hold  <Space>1/2 legs"
+                    },
                     muted(),
                 ),
             ])),
@@ -1292,12 +1403,18 @@ impl App {
             .row(requests)
             .min(held.len().saturating_sub(1));
 
-        // The focused pane is the one keys act on, so it says so in its border.
-        let border = if focused {
-            Style::new().fg(Color::Cyan)
-        } else {
-            muted()
+        // Exactly one of the four panes has the keys, and its border says so.
+        // Lighting the whole column would leave it ambiguous whether `j` walks
+        // the queue or the buffer.
+        let active = |pane: Pane| focused && self.intercept.pane == pane;
+        let border_for = |pane: Pane| {
+            if active(pane) {
+                Style::new().fg(Color::Cyan)
+            } else {
+                muted()
+            }
         };
+        let border = border_for(Pane::Table);
         let title = format!(" Queued {plural} ({}) ", held.len());
 
         if held.is_empty() {
@@ -1324,7 +1441,7 @@ impl App {
                 .block(
                     Block::bordered()
                         .title(format!(" {} ", capitalize(noun)))
-                        .border_style(border),
+                        .border_style(border_for(Pane::Preview)),
                 ),
                 view_area,
             );
@@ -1347,9 +1464,10 @@ impl App {
                 };
                 let text = format!(" #{:<5} {summary}", item.flow_id);
                 if i == row {
-                    // Only the focused column's cursor is lit, so it is never
-                    // ambiguous which of the two a keystroke will act on.
-                    let style = if focused {
+                    // Fully lit only while the queue has the keys. Stepping into
+                    // the preview dims it to a marker: still showing which item
+                    // you are looking at, no longer claiming `j` will move it.
+                    let style = if active(Pane::Table) {
                         Style::new().fg(Color::Black).bg(Color::Cyan).bold()
                     } else {
                         Style::new().bg(INACTIVE_BG)
@@ -1372,18 +1490,26 @@ impl App {
             list_area,
         );
 
-        // The edit buffer wins when it belongs to the highlighted item.
+        // The buffer wins when it belongs to the highlighted item.
         let item = &held[row];
-        let editing = focused && self.input.mode() == Mode::Insert;
+        let in_preview = active(Pane::Preview);
+        let inserting = in_preview && self.input.mode() == Mode::Insert;
+        let view_border = border_for(Pane::Preview);
         let view_scroll = if focused { self.content_scroll } else { 0 };
+
         match self.intercept.edit(requests) {
             Some((ticket, buffer)) if *ticket == item.ticket => {
                 let title = format!(
-                    " {}{} ",
+                    " {}{}{} ",
                     capitalize(noun),
-                    if buffer.is_dirty() { "*" } else { "" }
+                    if buffer.is_dirty() { "*" } else { "" },
+                    if requests { "" } else { " (read-only)" }
                 );
-                let widget = buffer_pane(buffer, title, editing).scroll((view_scroll, 0));
+                // Show the cursor whenever the preview has the keys, not only
+                // while inserting — that is what makes it navigable rather than
+                // a block of text that happens to scroll.
+                let widget = buffer_pane(buffer, title, in_preview, inserting, view_border)
+                    .scroll((view_scroll, 0));
                 if focused {
                     self.content_len = buffer.lines().len() as u16;
                 }
@@ -1400,7 +1526,7 @@ impl App {
                         .block(
                             Block::bordered()
                                 .title(format!(" {} ", capitalize(noun)))
-                                .border_style(border),
+                                .border_style(view_border),
                         )
                         .wrap(Wrap { trim: false })
                         .scroll((view_scroll, 0)),
@@ -1618,7 +1744,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/C/R/S/I/A windows, gt/gT cycle · <Space>s→Repeater, i edit, <Space>r send · <Space>i hold, <Space>1/2 legs, ^w pane, <Space>f/d answer (F/D all) · :q";
+const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <Space>s→Repeater, i edit, <Space>r send · Intercept: <Space>i hold, <Space>1/2 legs, ^w pane, <CR> open, f/d answer (F/D all) · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -1858,7 +1984,13 @@ fn pane(lines: Vec<Line<'static>>, title: impl Into<String>) -> Paragraph<'stati
 /// than one screen row, which would put the cursor somewhere other than where
 /// the buffer says it is — and a text editor whose cursor lies about its
 /// position is worse than one that scrolls sideways.
-fn buffer_pane(buffer: &TextBuffer, title: impl Into<String>, focused: bool) -> Paragraph<'static> {
+fn buffer_pane(
+    buffer: &TextBuffer,
+    title: impl Into<String>,
+    focused: bool,
+    inserting: bool,
+    border: Style,
+) -> Paragraph<'static> {
     let cursor = buffer.cursor();
     let lines: Vec<Line<'static>> = buffer
         .lines()
@@ -1878,19 +2010,17 @@ fn buffer_pane(buffer: &TextBuffer, title: impl Into<String>, focused: bool) -> 
                 Some(c) => (c.to_string(), chars[col + 1..].iter().collect::<String>()),
                 None => (" ".to_string(), String::new()),
             };
+            // Two cursors, because they mean different things: white where the
+            // next key inserts text, cyan where it only moves.
+            let cursor_bg = if inserting { Color::White } else { Color::Cyan };
             Line::from(vec![
                 Span::raw(before),
-                Span::styled(at, Style::new().fg(Color::Black).bg(Color::White)),
+                Span::styled(at, Style::new().fg(Color::Black).bg(cursor_bg)),
                 Span::raw(after),
             ])
         })
         .collect();
 
-    let border = if focused {
-        Style::new().fg(Color::Red)
-    } else {
-        Style::new()
-    };
     Paragraph::new(lines).block(Block::bordered().title(title.into()).border_style(border))
 }
 
@@ -2612,7 +2742,9 @@ mod tests {
 
         let mut app = App::new(engine.clone());
         app.refresh();
-        app.window = Window::Intercept;
+        // Through `show_window`, not by assignment: that is what tells the
+        // input layer which window-scoped bindings apply.
+        app.show_window(Window::Intercept);
         (engine, app, rt)
     }
 
@@ -2688,8 +2820,7 @@ mod tests {
         assert_eq!(app.intercept.focus, Column::Left);
     }
 
-    /// Editing happens in the focused column's buffer, and the other column's
-    /// buffer is untouched by it.
+    /// Editing happens in the focused column's buffer.
     #[test]
     fn editing_targets_the_focused_column() {
         let (_engine, mut app, _rt) = app_with_both_legs_held();
@@ -2699,18 +2830,103 @@ mod tests {
             app.intercept.request_edit.is_some(),
             "the left column should have forked a buffer"
         );
-        assert!(
-            app.intercept.response_edit.is_none(),
-            "the right column should not have"
-        );
-
-        app.apply(Action::Focus(Some(Column::Right)));
-        app.apply(Action::Insert(InsertKey::Char('Q')));
-        let (_, buffer) = app.intercept.response_edit.as_ref().unwrap();
-        assert!(buffer.text().starts_with('Q'));
-        // The request buffer still holds its own edit.
         let (_, req) = app.intercept.request_edit.as_ref().unwrap();
         assert!(req.text().starts_with('Z'));
+    }
+
+    /// `i` straight from the queue opens the preview and edits there, rather
+    /// than leaving INSERT mode pointed at nothing.
+    #[test]
+    fn insert_from_the_queue_opens_the_preview() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        assert_eq!(app.intercept.pane, Pane::Table);
+
+        app.apply(Action::Insert(InsertKey::Char('Z')));
+        assert_eq!(app.intercept.pane, Pane::Preview);
+        assert!(app.preview_buffer(true).unwrap().text().starts_with('Z'));
+    }
+
+    /// A held response is shown for reading. Typing into it must not change
+    /// what gets forwarded.
+    #[test]
+    fn the_response_preview_refuses_edits() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Focus(Some(Column::Right)));
+        app.apply(Action::Enter);
+
+        let before = app
+            .preview_buffer(false)
+            .map(|b| b.text())
+            .expect("a response buffer to read");
+        app.apply(Action::Insert(InsertKey::Char('Z')));
+
+        let after = app.preview_buffer(false).map(|b| b.text()).unwrap();
+        assert_eq!(after, before, "the buffer must be unchanged");
+        assert!(
+            !app.preview_buffer(false).unwrap().is_dirty(),
+            "and must not be marked edited"
+        );
+        assert!(render(&mut app).contains("read-only"));
+    }
+
+    /// Enter steps into the preview; Escape steps back out. Movement follows
+    /// whichever has the keys.
+    #[test]
+    fn enter_opens_the_preview_and_escape_leaves() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        assert_eq!(app.intercept.pane, Pane::Table);
+
+        app.apply(Action::Enter);
+        assert_eq!(app.intercept.pane, Pane::Preview);
+
+        // In the preview, `j` walks buffer lines rather than queue rows.
+        let row_before = app.intercept.request_row;
+        app.apply(Action::Move {
+            motion: Motion::Down,
+            count: None,
+        });
+        assert_eq!(
+            app.intercept.request_row, row_before,
+            "the queue row is fixed"
+        );
+        assert_eq!(app.preview_buffer(true).unwrap().cursor().line, 1);
+
+        app.apply(Action::Escape);
+        assert_eq!(app.intercept.pane, Pane::Table);
+    }
+
+    /// Leaving the window puts you back on the queue rather than stranding the
+    /// focus inside a preview you can no longer see.
+    #[test]
+    fn switching_windows_returns_focus_to_the_queue() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        assert_eq!(app.intercept.pane, Pane::Preview);
+
+        app.show_window(Window::Proxy);
+        app.show_window(Window::Intercept);
+        assert_eq!(app.intercept.pane, Pane::Table);
+    }
+
+    /// The whole loop, driven by keys: hold a request, forward it with `f`.
+    #[test]
+    fn bare_f_forwards_from_the_queue() {
+        let (engine, mut app, _rt) = app_with_both_legs_held();
+        assert_eq!(engine.intercept().queue_of(true).len(), 1);
+
+        press(&mut app, "f");
+        assert_eq!(
+            engine.intercept().queue_of(true).len(),
+            0,
+            "f should have forwarded the held request"
+        );
+    }
+
+    #[test]
+    fn bare_d_drops_from_the_queue() {
+        let (engine, mut app, _rt) = app_with_both_legs_held();
+        press(&mut app, "d");
+        assert_eq!(engine.intercept().queue_of(true).len(), 0);
     }
 
     /// Legs can be switched off independently, and the pane says so.
@@ -2759,7 +2975,7 @@ mod tests {
         assert!(out.contains("#42"), "the held flow should be listed: {out}");
         assert!(out.contains("/secret"), "{out}");
 
-        press(&mut app, " f");
+        press(&mut app, "f");
         assert!(engine.intercept().is_empty(), "forwarding should answer it");
     }
 
