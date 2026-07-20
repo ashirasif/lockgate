@@ -3,6 +3,7 @@ mod editor;
 mod http_text;
 mod input;
 mod tui;
+mod vim;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;

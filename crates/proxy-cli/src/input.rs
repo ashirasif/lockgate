@@ -192,68 +192,6 @@ pub enum InsertKey {
     LineEnd,
 }
 
-/// A vim command aimed at the focused text buffer.
-///
-/// Separate from [`Motion`] because the two answer to different things: a
-/// `Motion` moves a cursor through a *list of flows*, where "word" and "line
-/// end" are meaningless. These only make sense against text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferCmd {
-    // Motions.
-    Left,
-    Right,
-    Up,
-    Down,
-    WordForward,
-    WordBackward,
-    WordEnd,
-    LineStart,
-    FirstNonBlank,
-    LineEnd,
-    Top,
-    Bottom,
-    // Operators.
-    DeleteChar,
-    DeleteLine,
-    DeleteToEnd,
-    DeleteWord,
-    ChangeLine,
-    ChangeToEnd,
-    ChangeWord,
-    YankLine,
-    YankWord,
-    PasteAfter,
-    PasteBefore,
-    Undo,
-    Redo,
-    // Entering insert. The buffer positions the cursor, the input layer
-    // switches mode — which is why these are commands and not just `i`.
-    Insert,
-    InsertLineStart,
-    Append,
-    AppendLineEnd,
-    OpenBelow,
-    OpenAbove,
-}
-
-impl BufferCmd {
-    /// Whether this command leaves the buffer in insert mode.
-    fn enters_insert(self) -> bool {
-        matches!(
-            self,
-            BufferCmd::Insert
-                | BufferCmd::InsertLineStart
-                | BufferCmd::Append
-                | BufferCmd::AppendLineEnd
-                | BufferCmd::OpenBelow
-                | BufferCmd::OpenAbove
-                | BufferCmd::ChangeLine
-                | BufferCmd::ChangeToEnd
-                | BufferCmd::ChangeWord
-        )
-    }
-}
-
 /// What the input layer decided the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -303,11 +241,8 @@ pub enum Action {
     Enter,
     /// `e` — open the focused buffer in the operator's own editor.
     ExternalEdit,
-    /// A vim command aimed at the focused buffer, with its count.
-    Buffer {
-        cmd: BufferCmd,
-        count: Option<usize>,
-    },
+    /// A parsed vim command aimed at the focused buffer.
+    Vim(crate::vim::Command),
     /// Escape with nothing half-typed: step back out of wherever you are.
     Escape,
     /// `<C-w>h` / `<C-w>l` / `<C-w>w` — move focus between split panes.
@@ -346,62 +281,11 @@ enum Bind {
     Toggle,
     Enter,
     ExternalEdit,
-    Buffer(BufferCmd),
     /// `None` cycles to the other pane; `Some(c)` focuses that side.
     Focus(Option<Column>),
     ToggleHoldRequests,
     ToggleHoldResponses,
 }
-
-/// Vim in a text buffer, consulted before everything else when a preview has
-/// focus.
-///
-/// This map is where fidelity is cheapest to honour and most valuable: inside a
-/// buffer these keys mean exactly what they mean in vim, because there is
-/// nothing else they could sensibly mean. Window keys (`f`, `d`, `<CR>`) are
-/// shadowed here on purpose — `d` in a buffer is the delete operator, not
-/// "drop this request", and having it drop a request mid-edit would be a
-/// genuinely destructive surprise.
-const BUFFER_MAP: &[(&str, Bind)] = &[
-    // Motions.
-    ("h", Bind::Buffer(BufferCmd::Left)),
-    ("l", Bind::Buffer(BufferCmd::Right)),
-    ("k", Bind::Buffer(BufferCmd::Up)),
-    ("j", Bind::Buffer(BufferCmd::Down)),
-    ("<Left>", Bind::Buffer(BufferCmd::Left)),
-    ("<Right>", Bind::Buffer(BufferCmd::Right)),
-    ("<Up>", Bind::Buffer(BufferCmd::Up)),
-    ("<Down>", Bind::Buffer(BufferCmd::Down)),
-    ("w", Bind::Buffer(BufferCmd::WordForward)),
-    ("b", Bind::Buffer(BufferCmd::WordBackward)),
-    ("e", Bind::Buffer(BufferCmd::WordEnd)),
-    ("0", Bind::Buffer(BufferCmd::LineStart)),
-    ("^", Bind::Buffer(BufferCmd::FirstNonBlank)),
-    ("$", Bind::Buffer(BufferCmd::LineEnd)),
-    ("gg", Bind::Buffer(BufferCmd::Top)),
-    ("G", Bind::Buffer(BufferCmd::Bottom)),
-    // Operators.
-    ("x", Bind::Buffer(BufferCmd::DeleteChar)),
-    ("dd", Bind::Buffer(BufferCmd::DeleteLine)),
-    ("dw", Bind::Buffer(BufferCmd::DeleteWord)),
-    ("D", Bind::Buffer(BufferCmd::DeleteToEnd)),
-    ("cc", Bind::Buffer(BufferCmd::ChangeLine)),
-    ("cw", Bind::Buffer(BufferCmd::ChangeWord)),
-    ("C", Bind::Buffer(BufferCmd::ChangeToEnd)),
-    ("yy", Bind::Buffer(BufferCmd::YankLine)),
-    ("yw", Bind::Buffer(BufferCmd::YankWord)),
-    ("p", Bind::Buffer(BufferCmd::PasteAfter)),
-    ("P", Bind::Buffer(BufferCmd::PasteBefore)),
-    ("u", Bind::Buffer(BufferCmd::Undo)),
-    ("<C-r>", Bind::Buffer(BufferCmd::Redo)),
-    // Insert entry points.
-    ("i", Bind::Buffer(BufferCmd::Insert)),
-    ("I", Bind::Buffer(BufferCmd::InsertLineStart)),
-    ("a", Bind::Buffer(BufferCmd::Append)),
-    ("A", Bind::Buffer(BufferCmd::AppendLineEnd)),
-    ("o", Bind::Buffer(BufferCmd::OpenBelow)),
-    ("O", Bind::Buffer(BufferCmd::OpenAbove)),
-];
 
 /// Bindings that only apply inside one window, checked before [`NORMAL_MAP`].
 ///
@@ -515,9 +399,11 @@ pub struct Input {
     /// Which window is on screen, so [`WINDOW_MAP`] can be consulted. The app
     /// keeps this in step; the input layer never changes it itself.
     window: Window,
-    /// Whether a text buffer has focus, which swaps the whole keymap for
-    /// [`BUFFER_MAP`]. Also set by the app.
+    /// Whether a text buffer has focus, which routes keys to the vim grammar
+    /// instead of the window keymap. Set by the app.
     buffer_focus: bool,
+    /// The vim grammar, used only while a buffer has focus.
+    vim: crate::vim::VimParser,
 }
 
 impl Input {
@@ -536,9 +422,15 @@ impl Input {
     }
 
     /// Tell the input layer whether a text buffer has focus. While it does,
-    /// keys resolve as vim commands against that buffer.
+    /// keys are parsed as vim commands against that buffer.
     pub fn set_buffer_focus(&mut self, focused: bool) {
         self.buffer_focus = focused;
+    }
+
+    /// Keep the grammar's idea of visual mode in step with the buffer's, so an
+    /// operator knows whether it needs a target or already has a selection.
+    pub fn set_vim_visual(&mut self, visual: bool) {
+        self.vim.set_visual(visual);
     }
 
     /// The in-progress `:` or `/` line, for the UI to render at the bottom.
@@ -548,6 +440,9 @@ impl Input {
 
     /// Half-typed input, shown bottom-right the way vim shows `d2` mid-command.
     pub fn pending_display(&self) -> String {
+        if self.buffer_focus {
+            return self.vim.pending();
+        }
         let mut out = self.count.clone();
         for token in &self.pending {
             let _ = write!(out, "{token}");
@@ -561,7 +456,41 @@ impl Input {
             Mode::Command => self.feed_command(key),
             Mode::Palette => self.feed_palette(key),
             Mode::Insert => self.feed_insert(key),
+            // A focused buffer takes every key: inside it these are vim
+            // commands, and falling through to the window map would let `d`
+            // drop a request halfway through typing `diw`.
+            _ if self.buffer_focus => self.feed_vim(key),
             Mode::Normal | Mode::Visual => self.feed_normal(key),
+        }
+    }
+
+    // --- vim grammar ---
+
+    fn feed_vim(&mut self, key: KeyEvent) -> Option<Action> {
+        use crate::vim::Parsed;
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let parsed = match key.code {
+            KeyCode::Esc => self.vim.feed_escape(),
+            KeyCode::Char('r') if ctrl => self.vim.feed_redo(),
+            KeyCode::Char(c) if !ctrl => self.vim.feed(c),
+            // Arrows are the same motions by another name.
+            KeyCode::Left => self.vim.feed('h'),
+            KeyCode::Right => self.vim.feed('l'),
+            KeyCode::Up => self.vim.feed('k'),
+            KeyCode::Down => self.vim.feed('j'),
+            KeyCode::Enter => self.vim.feed('j'),
+            _ => return None,
+        };
+
+        match parsed {
+            Parsed::Command(cmd) => {
+                if cmd.enters_insert() {
+                    self.mode = Mode::Insert;
+                }
+                Some(Action::Vim(cmd))
+            }
+            Parsed::Pending | Parsed::Invalid => None,
         }
     }
 
@@ -650,7 +579,7 @@ impl Input {
         }
 
         self.pending.push(token);
-        match resolve(&self.pending, self.window, self.buffer_focus) {
+        match resolve(&self.pending, self.window) {
             Resolution::Partial => None,
             Resolution::None => {
                 self.reset();
@@ -701,12 +630,6 @@ impl Input {
             Bind::Toggle => Action::Toggle,
             Bind::Enter => Action::Enter,
             Bind::ExternalEdit => Action::ExternalEdit,
-            Bind::Buffer(cmd) => {
-                if cmd.enters_insert() {
-                    self.mode = Mode::Insert;
-                }
-                Action::Buffer { cmd, count }
-            }
             Bind::Focus(column) => Action::Focus(column),
             Bind::ToggleHoldRequests => Action::ToggleHoldRequests,
             Bind::ToggleHoldResponses => Action::ToggleHoldResponses,
@@ -786,26 +709,9 @@ enum Resolution {
 ///
 /// Window-scoped bindings win over global ones, so a window can claim a key
 /// without the global map having to know that any window exists.
-fn resolve(pending: &[String], window: Window, buffer_focus: bool) -> Resolution {
+fn resolve(pending: &[String], window: Window) -> Resolution {
     let typed = pending.concat();
     let mut partial = false;
-
-    // A focused buffer takes the keys outright rather than layering over the
-    // window map. Falling through would let `d` drop a request while the
-    // operator was half-way through typing `dw`.
-    if buffer_focus {
-        for (sequence, bind) in BUFFER_MAP {
-            if *sequence == typed {
-                return Resolution::Match(*bind, None);
-            }
-            partial |= sequence.starts_with(&typed);
-        }
-        return if partial {
-            Resolution::Partial
-        } else {
-            Resolution::None
-        };
-    }
 
     for (scope, sequence, bind) in WINDOW_MAP {
         if *scope != window {

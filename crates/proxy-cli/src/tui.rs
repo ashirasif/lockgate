@@ -16,11 +16,10 @@ use ratatui::{
 };
 
 use crate::command::Command;
-use crate::editor::{TextBuffer, Yank};
+use crate::editor::{Cursor, TextBuffer, Yank};
 use crate::http_text;
-use crate::input::{
-    Action, BufferCmd, Column, Input, InsertKey, Mode, Motion, PaletteKey, Scroll, Window,
-};
+use crate::input::{Action, Column, Input, InsertKey, Mode, Motion, PaletteKey, Scroll, Window};
+use crate::vim;
 
 /// The Repeater's working copy of a request.
 ///
@@ -582,7 +581,7 @@ impl App {
             Action::Toggle => self.toggle_fold(),
             Action::Enter => self.enter_preview(),
             Action::ExternalEdit => self.request_external_edit(),
-            Action::Buffer { cmd, count } => self.buffer_command(cmd, count),
+            Action::Vim(cmd) => self.run_vim(cmd),
             Action::Escape => self.leave_preview(),
             Action::Command(line) => self.run_command(&line),
             Action::Window(window) => self.show_window(window),
@@ -653,107 +652,173 @@ impl App {
         }
     }
 
-    /// Run a vim command against the focused buffer.
+    /// Run a parsed vim command against the focused buffer.
     ///
-    /// Counts repeat the whole command, which is right for motions and for the
-    /// operators we have (`3dd`, `2x`). It is not vim's general rule — vim
-    /// applies the count to the *motion* inside an operator — but with no
-    /// operator-pending state to hang that on, repeating is the reading that
-    /// never does something surprising.
-    fn buffer_command(&mut self, cmd: BufferCmd, count: Option<usize>) {
-        let times = count.unwrap_or(1).min(1000);
-        // Entering insert starts one undo unit for the whole session, so the
-        // checkpoint belongs here rather than on each typed character.
-        if matches!(
-            cmd,
-            BufferCmd::Insert
-                | BufferCmd::InsertLineStart
-                | BufferCmd::Append
-                | BufferCmd::AppendLineEnd
-        ) {
-            if let Some(buffer) = self.active_buffer() {
-                buffer.checkpoint();
+    /// Everything routes through ranges: an operator resolves its target to a
+    /// [`Range`](crate::editor::Range) and then deletes or yanks it. That is why
+    /// adding a motion or a text object needs no new operator code.
+    fn run_vim(&mut self, cmd: vim::Command) {
+        use vim::{Command, Operator, Simple, Target};
+
+        // Escape means "narrow the scope by one": drop the selection if there
+        // is one, otherwise leave the buffer entirely. Handled before the
+        // buffer borrow so the second case can touch the rest of the app.
+        if matches!(cmd, Command::Escape) {
+            let had_selection = self
+                .active_buffer()
+                .map(|b| b.has_selection())
+                .unwrap_or(false);
+            if !had_selection {
+                self.leave_preview();
+                self.input.set_vim_visual(false);
+                return;
             }
         }
 
-        let mut yanked = None;
-        // Cloned up front: the register lives on `self`, and pasting needs to
-        // read it while the buffer is mutably borrowed out of the same struct.
+        // Cloned up front: the register lives on `self`, and pasting reads it
+        // while the buffer is mutably borrowed out of the same struct.
         let register = self.yank.clone();
+        let mut yanked = None;
+        let mut selection_changed = false;
+
         let Some(buffer) = self.active_buffer() else {
             return;
         };
 
-        for _ in 0..times {
-            match cmd {
-                // Motions.
-                BufferCmd::Left => buffer.left(),
-                BufferCmd::Right => buffer.right(),
-                BufferCmd::Up => buffer.up(),
-                BufferCmd::Down => buffer.down(),
-                BufferCmd::WordForward => buffer.word_forward(),
-                BufferCmd::WordBackward => buffer.word_backward(),
-                BufferCmd::WordEnd => buffer.word_end(),
-                BufferCmd::LineStart => buffer.line_start(),
-                BufferCmd::FirstNonBlank => buffer.first_non_blank(),
-                BufferCmd::LineEnd => buffer.line_end(),
-                // `5gg` is line 5; bare `gg` is the top.
-                BufferCmd::Top => match count {
-                    Some(n) => buffer.goto_line(n.saturating_sub(1)),
-                    None => buffer.top(),
-                },
-                BufferCmd::Bottom => match count {
-                    Some(n) => buffer.goto_line(n.saturating_sub(1)),
-                    None => buffer.bottom(),
-                },
-
-                // Operators. Each yields the text it removed, which becomes the
-                // register — deleting in vim yanks, which is what makes `dd`
-                // then `p` a move.
-                BufferCmd::DeleteChar => yanked = Some(buffer.delete_char()),
-                BufferCmd::DeleteLine => yanked = Some(buffer.delete_line()),
-                BufferCmd::DeleteToEnd => yanked = Some(buffer.delete_to_end()),
-                BufferCmd::DeleteWord => yanked = Some(buffer.delete_word()),
-                // Change is delete-then-insert; the mode switch already happened
-                // in the input layer.
-                BufferCmd::ChangeLine => {
-                    let taken = buffer.delete_line();
-                    buffer.open_above();
-                    yanked = Some(taken);
-                }
-                BufferCmd::ChangeToEnd => yanked = Some(buffer.delete_to_end()),
-                BufferCmd::ChangeWord => yanked = Some(buffer.delete_word()),
-                BufferCmd::YankLine => yanked = Some(buffer.yank_line()),
-                BufferCmd::YankWord => yanked = Some(buffer.yank_word()),
-                BufferCmd::PasteAfter => buffer.paste(&register, true),
-                BufferCmd::PasteBefore => buffer.paste(&register, false),
-                BufferCmd::Undo => {
-                    if !buffer.undo() {
-                        break;
-                    }
-                }
-                BufferCmd::Redo => {
-                    if !buffer.redo() {
-                        break;
-                    }
-                }
-
-                // Insert entry points. The cursor move is the whole job.
-                BufferCmd::Insert => {}
-                BufferCmd::InsertLineStart => buffer.first_non_blank(),
-                BufferCmd::Append => buffer.append(),
-                BufferCmd::AppendLineEnd => buffer.line_end(),
-                BufferCmd::OpenBelow => buffer.open_below(),
-                BufferCmd::OpenAbove => buffer.open_above(),
+        match cmd {
+            Command::Move { motion, count } => {
+                let target = buffer.motion_target(motion, count);
+                buffer.set_cursor(target);
             }
+
+            Command::Operate { op, target, count } => {
+                let range = match target {
+                    Target::Motion(motion) => Some(buffer.range_for_motion(motion, count)),
+                    Target::Line => Some(buffer.range_for_lines(count)),
+                    Target::Object(object) => buffer.range_for_object(object),
+                };
+                // `ci"` with the cursor outside any quotes finds no range. Doing
+                // nothing is right; guessing at a nearby pair is not.
+                let Some(range) = range else { return };
+
+                match op {
+                    Operator::Yank => yanked = Some(buffer.yank_range(range)),
+                    Operator::Delete => yanked = Some(buffer.delete_range(range)),
+                    Operator::Change => {
+                        yanked = Some(buffer.delete_range(range));
+                        // `cc` leaves an empty line to type on; `cw` leaves the
+                        // cursor in the gap it just made.
+                        if range.linewise {
+                            buffer.open_above();
+                        }
+                    }
+                }
+            }
+
+            Command::VisualOperate(op) => {
+                let Some(range) = buffer.selection_range() else {
+                    return;
+                };
+                match op {
+                    Operator::Yank => {
+                        yanked = Some(buffer.yank_range(range));
+                        // Vim leaves the cursor at the start of a yanked
+                        // selection rather than where it happened to end.
+                        buffer.set_cursor(range.start);
+                    }
+                    Operator::Delete => yanked = Some(buffer.delete_range(range)),
+                    Operator::Change => {
+                        yanked = Some(buffer.delete_range(range));
+                        if range.linewise {
+                            buffer.open_above();
+                        }
+                    }
+                }
+                buffer.clear_selection();
+                selection_changed = true;
+            }
+
+            Command::Visual { linewise } => {
+                buffer.toggle_selection(linewise);
+                selection_changed = true;
+            }
+            Command::VisualSwapEnds => buffer.swap_selection_ends(),
+            Command::Escape => {
+                buffer.clear_selection();
+                selection_changed = true;
+            }
+
+            Command::Simple { cmd, count } => match cmd {
+                Simple::DeleteChar => {
+                    let range = buffer.range_for_motion(vim::Motion::Right, count);
+                    yanked = Some(buffer.delete_range(range));
+                }
+                Simple::DeleteToEnd => {
+                    let range = buffer.range_for_motion(vim::Motion::LineEnd, 1);
+                    yanked = Some(buffer.delete_range(range));
+                }
+                Simple::ChangeToEnd => {
+                    let range = buffer.range_for_motion(vim::Motion::LineEnd, 1);
+                    yanked = Some(buffer.delete_range(range));
+                }
+                Simple::PasteAfter => buffer.paste(&register, true),
+                Simple::PasteBefore => buffer.paste(&register, false),
+                Simple::Undo => {
+                    for _ in 0..count {
+                        if !buffer.undo() {
+                            break;
+                        }
+                    }
+                }
+                Simple::Redo => {
+                    for _ in 0..count {
+                        if !buffer.redo() {
+                            break;
+                        }
+                    }
+                }
+                Simple::JoinLines => buffer.join_lines(count),
+                Simple::Insert => buffer.checkpoint(),
+                Simple::InsertLineStart => {
+                    buffer.checkpoint();
+                    buffer.first_non_blank();
+                }
+                Simple::Append => {
+                    buffer.checkpoint();
+                    buffer.append();
+                }
+                Simple::AppendLineEnd => {
+                    buffer.checkpoint();
+                    buffer.line_end();
+                }
+                Simple::OpenBelow => buffer.open_below(),
+                Simple::OpenAbove => buffer.open_above(),
+                // Dot-repeat needs a record of the last change, which this
+                // subset does not keep. Saying so beats doing nothing silently.
+                Simple::Repeat => {}
+            },
         }
 
-        // An empty yank means the operator found nothing to take; keeping the
-        // previous register is better than clearing it to nothing.
+        let has_selection = buffer.has_selection();
+
+        // An operator that found nothing leaves the register alone rather than
+        // clearing it to an empty string.
         if let Some(yanked) = yanked {
             if !yanked.text.is_empty() {
                 self.yank = yanked;
             }
+        }
+        if selection_changed {
+            self.input.set_vim_visual(has_selection);
+        }
+        if matches!(
+            cmd,
+            vim::Command::Simple {
+                cmd: Simple::Repeat,
+                ..
+            }
+        ) {
+            self.note("`.` repeat is not implemented — use e for $EDITOR");
         }
     }
 
@@ -1635,7 +1700,7 @@ impl App {
                 ),
                 Span::styled(
                     if self.intercept.pane == Pane::Preview {
-                        "   vim keys: w b dd cw yy p u   <Esc> back to queue"
+                        "   vim: w/W b/B e f{c} v/V ciw di\" 2dd yy p u   <Esc> back"
                     } else {
                         "   <CR> open  e $EDITOR  f forward  d drop  F/D all  ^w pane  <Space>i hold"
                     },
@@ -2031,7 +2096,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <Space>s→Repeater, <CR> edit (vim keys, <Esc> leaves), e $EDITOR, <Space>r send · Intercept: <Space>i hold, <Space>1/2 legs, ^w pane, f/d answer (F/D all) · :q";
+const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · e $EDITOR · Intercept: <Space>i hold, ^w pane, f/d answer · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -2329,27 +2394,65 @@ fn buffer_pane(
         .iter()
         .enumerate()
         .map(|(i, text)| {
-            if !focused || i != cursor.line {
+            let i_line = i;
+            if !focused {
                 return Line::from(text.clone());
+            }
+            if i != cursor.line {
+                // Other lines still need selection shading (V over many lines).
+                if !buffer.has_selection() {
+                    return Line::from(text.clone());
+                }
+                let selected = Style::new().bg(Color::Rgb(60, 60, 100));
+                return Line::from(
+                    text.chars()
+                        .enumerate()
+                        .map(|(col, c)| {
+                            let style = if buffer.in_selection(Cursor { line: i_line, col }) {
+                                selected
+                            } else {
+                                Style::new()
+                            };
+                            Span::styled(c.to_string(), style)
+                        })
+                        .collect::<Vec<_>>(),
+                );
             }
             // Split the line around the cursor so it can be inverted in place.
             // Past the last character there is nothing to invert, so a space
             // stands in for the cell.
             let chars: Vec<char> = text.chars().collect();
             let col = cursor.col.min(chars.len());
-            let before: String = chars[..col].iter().collect();
-            let (at, after) = match chars.get(col) {
-                Some(c) => (c.to_string(), chars[col + 1..].iter().collect::<String>()),
-                None => (" ".to_string(), String::new()),
-            };
             // Two cursors, because they mean different things: white where the
             // next key inserts text, cyan where it only moves.
             let cursor_bg = if inserting { Color::White } else { Color::Cyan };
-            Line::from(vec![
-                Span::raw(before),
-                Span::styled(at, Style::new().fg(Color::Black).bg(cursor_bg)),
-                Span::raw(after),
-            ])
+            let selected = Style::new().bg(Color::Rgb(60, 60, 100));
+
+            // Per-cell so the selection and the cursor can overlap: the cursor
+            // sits inside its own selection, and must stay visible there.
+            let mut spans = Vec::new();
+            for (i, c) in chars.iter().enumerate() {
+                let style = if i == col {
+                    Style::new().fg(Color::Black).bg(cursor_bg)
+                } else if buffer.in_selection(Cursor {
+                    line: i_line,
+                    col: i,
+                }) {
+                    selected
+                } else {
+                    Style::new()
+                };
+                spans.push(Span::styled(c.to_string(), style));
+            }
+            // Past the last character there is nothing to invert, so a space
+            // stands in for the cell.
+            if col >= chars.len() {
+                spans.push(Span::styled(
+                    " ",
+                    Style::new().fg(Color::Black).bg(cursor_bg),
+                ));
+            }
+            Line::from(spans)
         })
         .collect();
 
@@ -3282,6 +3385,127 @@ mod tests {
         key(&mut app, KeyEvent::from(KeyCode::Esc));
         press(&mut app, "P");
         assert_eq!(app.window, Window::Proxy);
+    }
+
+    /// `W` steps over a whole dotted host where `w` stops at each dot — the
+    /// difference that actually matters on a URL.
+    #[test]
+    fn big_word_motions_work_in_the_preview() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        // On "GET /req-path HTTP/1.1" the first step coincides — both land on
+        // the slash. The second is where they diverge: `w` stops inside
+        // `/req-path` at the punctuation, `W` clears the whole chunk.
+        press(&mut app, "ww");
+        let small = app.preview_buffer(true).unwrap().cursor().col;
+        press(&mut app, "0WW");
+        let big = app.preview_buffer(true).unwrap().cursor().col;
+        assert!(
+            big > small,
+            "W should travel further than w ({big} vs {small})"
+        );
+    }
+
+    /// Visual mode selects, and an operator applies to the selection.
+    #[test]
+    fn visual_mode_selects_and_operates() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        press(&mut app, "v");
+        assert!(app.preview_buffer(true).unwrap().has_selection());
+        press(&mut app, "ll");
+        press(&mut app, "d");
+
+        let buffer = app.preview_buffer(true).unwrap();
+        assert!(!buffer.has_selection(), "operating clears the selection");
+        assert!(
+            buffer.text().starts_with(" /req-path"),
+            "GET should have lost its first three chars: {:?}",
+            buffer.text()
+        );
+    }
+
+    /// `V` takes whole lines.
+    #[test]
+    fn visual_line_mode_takes_whole_lines() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        let before = app.preview_buffer(true).unwrap().lines().len();
+
+        press(&mut app, "Vd");
+        assert_eq!(
+            app.preview_buffer(true).unwrap().lines().len(),
+            before - 1,
+            "Vd should remove exactly the current line"
+        );
+    }
+
+    /// Text objects: `ciw` replaces the word under the cursor.
+    #[test]
+    fn text_objects_work_in_the_preview() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        press(&mut app, "ciw");
+        assert_eq!(app.input.mode(), Mode::Insert, "c should enter insert");
+        press(&mut app, "POST");
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(
+            app.preview_buffer(true)
+                .unwrap()
+                .text()
+                .starts_with("POST "),
+            "got: {:?}",
+            app.preview_buffer(true).unwrap().text()
+        );
+    }
+
+    /// `f` finds a character on the line, and an operator can use it.
+    #[test]
+    fn find_char_works_as_an_operator_target() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        press(&mut app, "df/");
+        assert!(
+            app.preview_buffer(true)
+                .unwrap()
+                .text()
+                .starts_with("req-path"),
+            "df/ should delete through the slash: {:?}",
+            app.preview_buffer(true).unwrap().text()
+        );
+    }
+
+    /// The whole point of a grammar: counts multiply across the operator.
+    #[test]
+    fn counts_multiply_across_the_operator() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        let before = app.preview_buffer(true).unwrap().lines().len();
+
+        press(&mut app, "2dd");
+        assert_eq!(app.preview_buffer(true).unwrap().lines().len(), before - 2);
+    }
+
+    /// Escape narrows the scope by one step: drop the selection first, only
+    /// then leave the buffer.
+    #[test]
+    fn escape_drops_the_selection_before_leaving() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        press(&mut app, "v");
+        assert!(app.preview_buffer(true).unwrap().has_selection());
+
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(!app.preview_buffer(true).unwrap().has_selection());
+        assert_eq!(app.intercept.pane, Pane::Preview, "still in the buffer");
+
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.intercept.pane, Pane::Table, "now it leaves");
     }
 
     /// `e` stages the focused buffer for the external editor. The handoff
