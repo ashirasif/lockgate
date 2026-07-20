@@ -160,6 +160,25 @@ pub enum PaletteKey {
     Cancel,
 }
 
+/// Which side of a split window has focus. The Intercept window shows the two
+/// legs of an exchange side by side, each with its own queue and preview, and
+/// keys act on whichever column is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Column {
+    #[default]
+    Left,
+    Right,
+}
+
+impl Column {
+    pub fn flip(self) -> Column {
+        match self {
+            Column::Left => Column::Right,
+            Column::Right => Column::Left,
+        }
+    }
+}
+
 /// A keystroke while an editable buffer has focus. Like [`PaletteKey`], this
 /// reports the gesture without knowing what is being edited — the buffer itself
 /// is the app's business.
@@ -222,6 +241,11 @@ pub enum Action {
     SendToRepeater,
     /// `<CR>` on a sitemap row — fold or unfold it.
     Toggle,
+    /// `<C-w>h` / `<C-w>l` / `<C-w>w` — move focus between split panes.
+    Focus(Option<Column>),
+    /// `<Space>1` / `<Space>2` — choose which legs of an exchange hold.
+    ToggleHoldRequests,
+    ToggleHoldResponses,
 }
 
 /// One entry in the keymap. Kept free of counts and arguments so the table can
@@ -251,6 +275,10 @@ enum Bind {
     ToggleIntercept,
     SendToRepeater,
     Toggle,
+    /// `None` cycles to the other pane; `Some(c)` focuses that side.
+    Focus(Option<Column>),
+    ToggleHoldRequests,
+    ToggleHoldResponses,
 }
 
 /// The keymap is data, not control flow, so that `:map` can later rewrite it
@@ -303,6 +331,13 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     ("<Space>F", Bind::ForwardAll),
     ("<Space>D", Bind::DropAll),
     ("<Space>i", Bind::ToggleIntercept),
+    // Which legs hold, numbered left-to-right the way the panes are laid out.
+    ("<Space>1", Bind::ToggleHoldRequests),
+    ("<Space>2", Bind::ToggleHoldResponses),
+    // Vim's window motions, for a window that is genuinely split.
+    ("<C-w>h", Bind::Focus(Some(Column::Left))),
+    ("<C-w>l", Bind::Focus(Some(Column::Right))),
+    ("<C-w>w", Bind::Focus(None)),
     // `i` starts insert, exactly as in vim — there is something to edit now.
     ("i", Bind::Mode(Mode::Insert)),
     ("<CR>", Bind::Toggle),
@@ -502,6 +537,9 @@ impl Input {
             Bind::ToggleIntercept => Action::ToggleIntercept,
             Bind::SendToRepeater => Action::SendToRepeater,
             Bind::Toggle => Action::Toggle,
+            Bind::Focus(column) => Action::Focus(column),
+            Bind::ToggleHoldRequests => Action::ToggleHoldRequests,
+            Bind::ToggleHoldResponses => Action::ToggleHoldResponses,
             Bind::Window(window) => Action::Window(window),
             Bind::WindowStep(direction) => Action::WindowStep(direction),
             // Enter palette mode and tell the app to start with a clean filter.
@@ -652,6 +690,13 @@ mod tests {
     fn last(keys: &str) -> Action {
         let mut input = Input::new();
         feed(&mut input, keys).pop().expect("no action from {keys}")
+    }
+
+    /// Like `last`, but the sequence opens with a key `feed` cannot spell.
+    fn last_with(first: KeyEvent, rest: &str) -> Action {
+        let mut input = Input::new();
+        input.feed(first);
+        feed(&mut input, rest).pop().expect("no action")
     }
 
     #[test]
@@ -929,6 +974,30 @@ mod tests {
             input.feed(KeyEvent::from(KeyCode::Enter)),
             Some(Action::Insert(InsertKey::Newline))
         );
+    }
+
+    /// `<C-w>` window motions, for the split Intercept window.
+    #[test]
+    fn ctrl_w_moves_focus_between_panes() {
+        let mut input = Input::new();
+        assert!(
+            input.feed(ctrl('w')).is_none(),
+            "should wait for a direction"
+        );
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Char('l'))),
+            Some(Action::Focus(Some(Column::Right)))
+        );
+        assert_eq!(last_with(ctrl('w'), "h"), Action::Focus(Some(Column::Left)));
+        assert_eq!(last_with(ctrl('w'), "w"), Action::Focus(None));
+    }
+
+    /// A digit after the leader is an argument, not a count — the count rule
+    /// only applies to digits typed before a sequence starts.
+    #[test]
+    fn leader_digits_choose_which_legs_hold() {
+        assert_eq!(last(" 1"), Action::ToggleHoldRequests);
+        assert_eq!(last(" 2"), Action::ToggleHoldResponses);
     }
 
     #[test]

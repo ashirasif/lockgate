@@ -18,7 +18,7 @@ use ratatui::{
 use crate::command::Command;
 use crate::editor::TextBuffer;
 use crate::http_text;
-use crate::input::{Action, Input, InsertKey, Mode, Motion, PaletteKey, Scroll, Window};
+use crate::input::{Action, Column, Input, InsertKey, Mode, Motion, PaletteKey, Scroll, Window};
 
 /// The Repeater's working copy of a request.
 ///
@@ -42,15 +42,47 @@ struct Repeater {
     error: Option<String>,
 }
 
-/// The Intercept window's view state. The queue itself lives on the engine.
+/// The Intercept window's view state. The queues themselves live on the engine.
+///
+/// Four panes: the two legs of an exchange side by side, each a queue above its
+/// own preview. The legs are answered independently, so each column carries its
+/// own cursor and its own edit buffer, and `<C-w>h`/`<C-w>l` choose which one
+/// the keys act on.
 #[derive(Default)]
 struct InterceptView {
-    /// Row cursor into the queue as it was last rendered.
-    selected: usize,
-    /// The edit buffer for one held item, created on the first `i` and dropped
-    /// once the item is answered. Keyed by ticket so a queue that reorders
-    /// underneath the operator cannot silently retarget their edits.
-    editing: Option<(TicketId, TextBuffer)>,
+    focus: Column,
+    /// Row cursor per column, into that leg's queue as last rendered.
+    request_row: usize,
+    response_row: usize,
+    /// The edit buffer for one held item per column, created on the first `i`
+    /// and dropped once that item is answered. Keyed by ticket so a queue that
+    /// reorders underneath the operator cannot silently retarget their edits.
+    request_edit: Option<(TicketId, TextBuffer)>,
+    response_edit: Option<(TicketId, TextBuffer)>,
+}
+
+impl InterceptView {
+    fn row(&self, requests: bool) -> usize {
+        if requests {
+            self.request_row
+        } else {
+            self.response_row
+        }
+    }
+
+    fn edit(&mut self, requests: bool) -> &mut Option<(TicketId, TextBuffer)> {
+        if requests {
+            &mut self.request_edit
+        } else {
+            &mut self.response_edit
+        }
+    }
+
+    /// The focused column holds requests on the left, responses on the right —
+    /// the order traffic actually travels in.
+    fn showing_requests(&self) -> bool {
+        self.focus == Column::Left
+    }
 }
 
 /// The Sitemap window's view state.
@@ -125,10 +157,12 @@ struct App {
     repeater: Repeater,
     intercept: InterceptView,
     sitemap: SitemapView,
-    /// The intercept queue as of this tick. Snapshotted in `refresh` so drawing
-    /// and key handling within one frame agree on what is held — re-reading the
-    /// live queue mid-frame could answer a ticket the operator never saw.
-    queue: Vec<Held>,
+    /// The two intercept queues as of this tick. Snapshotted in `refresh` so
+    /// drawing and key handling within one frame agree on what is held —
+    /// re-reading the live queue mid-frame could answer a ticket the operator
+    /// never saw.
+    held_requests: Vec<Held>,
+    held_responses: Vec<Held>,
 }
 
 impl App {
@@ -156,7 +190,17 @@ impl App {
             repeater: Repeater::default(),
             intercept: InterceptView::default(),
             sitemap: SitemapView::default(),
-            queue: Vec::new(),
+            held_requests: Vec::new(),
+            held_responses: Vec::new(),
+        }
+    }
+
+    /// The queue for one leg, as snapshotted this tick.
+    fn held(&self, requests: bool) -> &[Held] {
+        if requests {
+            &self.held_requests
+        } else {
+            &self.held_responses
         }
     }
 
@@ -203,19 +247,22 @@ impl App {
 
         self.detail = self.selected_id().and_then(|id| self.engine.get_flow(id));
 
-        self.queue = self.engine.intercept().queue();
-        self.intercept.selected = self
+        self.held_requests = self.engine.intercept().queue_of(true);
+        self.held_responses = self.engine.intercept().queue_of(false);
+        self.intercept.request_row = self
             .intercept
-            .selected
-            .min(self.queue.len().saturating_sub(1));
-        // An item answered (by us, by a timeout, by disabling interception)
+            .request_row
+            .min(self.held_requests.len().saturating_sub(1));
+        self.intercept.response_row = self
+            .intercept
+            .response_row
+            .min(self.held_responses.len().saturating_sub(1));
+
+        // An item answered (by us, by a timeout, by a leg being switched off)
         // takes its edit buffer with it, rather than leaving edits that would
         // silently attach to whichever item next takes that ticket's place.
-        if let Some((ticket, _)) = &self.intercept.editing {
-            if !self.queue.iter().any(|h| h.ticket == *ticket) {
-                self.intercept.editing = None;
-            }
-        }
+        drop_stale_edit(&mut self.intercept.request_edit, &self.held_requests);
+        drop_stale_edit(&mut self.intercept.response_edit, &self.held_responses);
     }
 
     fn selected_id(&self) -> Option<u64> {
@@ -249,8 +296,14 @@ impl App {
                 self.move_cursor(motion, count)
             }
             Action::Move { motion, count } if self.window == Window::Intercept => {
-                let last = self.queue.len().saturating_sub(1);
-                self.intercept.selected = step_row(self.intercept.selected, last, motion, count);
+                let requests = self.intercept.showing_requests();
+                let last = self.held(requests).len().saturating_sub(1);
+                let row = step_row(self.intercept.row(requests), last, motion, count);
+                if requests {
+                    self.intercept.request_row = row;
+                } else {
+                    self.intercept.response_row = row;
+                }
             }
             Action::Move { motion, count } if self.window == Window::Sitemap => {
                 let last = self.sitemap_rows().len().saturating_sub(1);
@@ -310,6 +363,24 @@ impl App {
                 self.note(&format!("dropped {n} held item(s)"));
             }
             Action::ToggleIntercept => self.toggle_intercept(),
+            Action::ToggleHoldRequests => {
+                let intercept = self.engine.intercept();
+                let on = !intercept.holds_requests();
+                let released = intercept.set_hold_requests(on);
+                self.note(&leg_note("requests", on, released));
+            }
+            Action::ToggleHoldResponses => {
+                let intercept = self.engine.intercept();
+                let on = !intercept.holds_responses();
+                let released = intercept.set_hold_responses(on);
+                self.note(&leg_note("responses", on, released));
+            }
+            Action::Focus(column) => {
+                self.intercept.focus = column.unwrap_or_else(|| self.intercept.focus.flip());
+                // The two columns scroll independently; carrying an offset from
+                // one into the other lands you somewhere arbitrary.
+                self.content_scroll = 0;
+            }
             Action::Toggle => self.toggle_fold(),
             Action::Command(line) => self.run_command(&line),
             Action::Window(window) => self.show_window(window),
@@ -353,16 +424,15 @@ impl App {
                 .is_some()
                 .then(|| &mut self.repeater.request),
             Window::Intercept => {
-                let held = self.queue.get(self.intercept.selected)?;
+                let requests = self.intercept.showing_requests();
+                let held = self.held(requests).get(self.intercept.row(requests))?;
                 let ticket = held.ticket;
-                if self.intercept.editing.as_ref().map(|(t, _)| *t) != Some(ticket) {
-                    let text = match &held.pending {
-                        Pending::Request(r) => http_text::render_request(r),
-                        Pending::Response(r) => http_text::render_response(r),
-                    };
-                    self.intercept.editing = Some((ticket, TextBuffer::from_text(&text)));
+                let text = render_pending(&held.pending);
+                let slot = self.intercept.edit(requests);
+                if slot.as_ref().map(|(t, _)| *t) != Some(ticket) {
+                    *slot = Some((ticket, TextBuffer::from_text(&text)));
                 }
-                self.intercept.editing.as_mut().map(|(_, b)| b)
+                slot.as_mut().map(|(_, b)| b)
             }
             _ => None,
         }
@@ -381,26 +451,28 @@ impl App {
         });
     }
 
-    /// Answer the highlighted held item, forwarding any edits made to it.
+    /// Answer the highlighted item in the focused column, forwarding any edits.
     fn answer_held(&mut self, forward: bool) {
-        let Some(held) = self.queue.get(self.intercept.selected) else {
-            self.note("nothing held");
+        let requests = self.intercept.showing_requests();
+        let leg = if requests { "request" } else { "response" };
+        let Some(held) = self.held(requests).get(self.intercept.row(requests)) else {
+            self.note(&format!("no {leg} held"));
             return;
         };
-        let ticket = held.ticket;
+        let (ticket, flow_id, pending) = (held.ticket, held.flow_id, held.pending.clone());
 
         if !forward {
             self.engine.intercept().discard(ticket);
-            self.intercept.editing = None;
-            self.note(&format!("dropped #{}", held.flow_id));
+            *self.intercept.edit(requests) = None;
+            self.note(&format!("dropped {leg} #{flow_id}"));
             return;
         }
 
         // Only reparse if this item was actually edited; an untouched item
         // forwards its original bytes rather than a re-rendered approximation.
-        let edited = match &self.intercept.editing {
+        let edited = match self.intercept.edit(requests) {
             Some((t, buffer)) if *t == ticket && buffer.is_dirty() => {
-                match reparse(&held.pending, &buffer.text()) {
+                match reparse(&pending, &buffer.text()) {
                     Ok(pending) => Some(pending),
                     Err(e) => {
                         // Refuse rather than silently forwarding the original:
@@ -414,14 +486,13 @@ impl App {
             _ => None,
         };
 
-        let flow_id = held.flow_id;
         let was_edited = edited.is_some();
         self.engine.intercept().forward(ticket, edited);
-        self.intercept.editing = None;
+        *self.intercept.edit(requests) = None;
         self.note(&if was_edited {
-            format!("forwarded #{flow_id} (edited)")
+            format!("forwarded {leg} #{flow_id} (edited)")
         } else {
-            format!("forwarded #{flow_id}")
+            format!("forwarded {leg} #{flow_id}")
         });
     }
 
@@ -579,10 +650,30 @@ impl App {
             },
             Action::ToggleIntercept,
         ));
-        if !self.queue.is_empty() {
-            let n = self.queue.len();
-            commands.push((format!("Forward all {n} held item(s)"), Action::ForwardAll));
-            commands.push((format!("Drop all {n} held item(s)"), Action::DropAll));
+        let intercept = self.engine.intercept();
+        commands.push((
+            if intercept.holds_requests() {
+                "Stop holding requests".into()
+            } else {
+                "Hold requests".into()
+            },
+            Action::ToggleHoldRequests,
+        ));
+        commands.push((
+            if intercept.holds_responses() {
+                "Stop holding responses".into()
+            } else {
+                "Hold responses".into()
+            },
+            Action::ToggleHoldResponses,
+        ));
+        let held = self.held_requests.len() + self.held_responses.len();
+        if held > 0 {
+            commands.push((
+                format!("Forward all {held} held item(s)"),
+                Action::ForwardAll,
+            ));
+            commands.push((format!("Drop all {held} held item(s)"), Action::DropAll));
         }
         commands.push((
             "Go to first request".into(),
@@ -950,11 +1041,11 @@ impl App {
 
     /// A Telescope-style overlay: a filter prompt over a ranked command list,
     /// centred on the screen with everything behind it cleared.
+    /// The list scrolls to keep the highlight visible. Sizing the box to fit the
+    /// whole catalog was the old approach and it does not hold: the catalog
+    /// grows, and an entry below the fold is simply unreachable.
     fn draw_palette(&self, frame: &mut Frame) {
-        // Tall enough for the whole catalog: the list does not scroll, so an
-        // entry that falls off the bottom is simply unreachable. Two more
-        // windows made 60% too short for that to stay true.
-        let area = centered_rect(frame.area(), 60, 80);
+        let area = centered_rect(frame.area(), 60, 70);
         frame.render_widget(Clear, area);
 
         let [prompt, list] =
@@ -1002,7 +1093,17 @@ impl App {
                 })
                 .collect()
         };
-        frame.render_widget(Paragraph::new(rows).block(Block::bordered()), list);
+        // Scroll so the highlight is always on screen, keeping it as far up the
+        // list as it can be — the highlight only leaves the top once you have
+        // paged past what fits.
+        let visible = list.height.saturating_sub(2).max(1) as usize;
+        let scroll = self.palette_selected.saturating_sub(visible - 1) as u16;
+        frame.render_widget(
+            Paragraph::new(rows)
+                .block(Block::bordered())
+                .scroll((scroll, 0)),
+            list,
+        );
     }
 
     /// Mason's tool strip: each window a chip, `Name (key)`, active one lit.
@@ -1113,109 +1214,204 @@ impl App {
         );
     }
 
-    /// Intercept: the queue on the left, the highlighted item on the right.
-    /// `f`/`d` answer one, `F`/`D` answer all, `i` edits before forwarding.
+    /// Intercept: four panes. The two legs of an exchange side by side, each a
+    /// queue above a preview of its highlighted item.
+    ///
+    /// Requests sit left and responses right — the order traffic travels. Both
+    /// previews are editable, so what is on screen is always exactly what
+    /// forwarding would send.
     fn draw_intercept(&mut self, frame: &mut Frame, area: Rect) {
         let [banner, panes] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-        self.viewport = panes.height.saturating_sub(2) as usize;
 
-        let on = self.engine.intercept().is_enabled();
+        let intercept = self.engine.intercept();
+        let (on, legs) = (
+            intercept.is_enabled(),
+            [intercept.holds_requests(), intercept.holds_responses()],
+        );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    if on { " ON " } else { " OFF " },
+                    if on { " HOLDING " } else { " OFF " },
                     Style::new()
                         .fg(Color::Black)
                         .bg(if on { Color::Red } else { Color::DarkGray })
                         .bold(),
                 ),
-                Span::raw(format!("  {} held", self.queue.len())),
                 Span::styled(
-                    "   <Space>i toggle   <Space>f forward   <Space>d drop   <Space>F/D all",
+                    format!("  [{}] requests", if legs[0] { "x" } else { " " }),
+                    leg_style(legs[0]),
+                ),
+                Span::styled(
+                    format!("  [{}] responses", if legs[1] { "x" } else { " " }),
+                    leg_style(legs[1]),
+                ),
+                Span::styled(
+                    "   <Space>i hold  1/2 legs  ^w pane  f fwd  d drop  F/D all",
                     Style::new().fg(Color::DarkGray),
                 ),
             ])),
             banner,
         );
 
-        let [list, detail] =
-            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+        // Two columns, each split into a queue over its preview — the shape in
+        // the reference UI, and the shape the two independent legs call for.
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(panes);
+        let [req_list, req_view] =
+            Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(left);
+        let [res_list, res_view] =
+            Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(right);
 
-        if self.queue.is_empty() {
-            self.content_len = 0;
+        // The focused queue is what `j`/`k` walks, so it sets the page size.
+        self.viewport = req_list.height.saturating_sub(2) as usize;
+
+        self.draw_intercept_column(frame, true, req_list, req_view, on);
+        self.draw_intercept_column(frame, false, res_list, res_view, on);
+    }
+
+    /// One leg of the Intercept window: its queue, and a preview of the
+    /// highlighted item beneath it.
+    fn draw_intercept_column(
+        &mut self,
+        frame: &mut Frame,
+        requests: bool,
+        list_area: Rect,
+        view_area: Rect,
+        on: bool,
+    ) {
+        let focused = self.intercept.showing_requests() == requests;
+        let (noun, plural) = if requests {
+            ("request", "requests")
+        } else {
+            ("response", "responses")
+        };
+        let leg_on = if requests {
+            self.engine.intercept().holds_requests()
+        } else {
+            self.engine.intercept().holds_responses()
+        };
+
+        let held = self.held(requests).to_vec();
+        let row = self
+            .intercept
+            .row(requests)
+            .min(held.len().saturating_sub(1));
+
+        // The focused pane is the one keys act on, so it says so in its border.
+        let border = if focused {
+            Style::new().fg(Color::Cyan)
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
+        let title = format!(" Queued {plural} ({}) ", held.len());
+
+        if held.is_empty() {
+            let why = if !on {
+                format!("intercept is off — <Space>i to queue {plural}")
+            } else if !leg_on {
+                format!(
+                    "{plural} are not being held — <Space>{} to hold them",
+                    if requests { "1" } else { "2" }
+                )
+            } else {
+                format!("no {plural} queued")
+            };
             frame.render_widget(
-                empty_pane(
-                    " Queue ",
-                    if on {
-                        "nothing held yet — traffic will queue here"
-                    } else {
-                        "intercept is off — press <Space>i to hold traffic"
-                    },
-                ),
-                list,
+                Paragraph::new(Line::styled(why, Style::new().fg(Color::DarkGray)))
+                    .block(Block::bordered().title(title).border_style(border)),
+                list_area,
             );
-            frame.render_widget(empty_pane(" Held Item ", "nothing to inspect"), detail);
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!("select a {noun} to view it here"),
+                    Style::new().fg(Color::DarkGray),
+                ))
+                .block(
+                    Block::bordered()
+                        .title(format!(" {} ", capitalize(noun)))
+                        .border_style(border),
+                ),
+                view_area,
+            );
             return;
         }
 
-        let rows: Vec<Line> = self
-            .queue
+        let rows: Vec<Line> = held
             .iter()
             .enumerate()
-            .map(|(i, held)| {
-                let (dir, arrow, summary) = match &held.pending {
-                    Pending::Request(r) => (
-                        "REQ",
-                        "→",
-                        format!(
-                            "{} {}",
-                            r.method,
-                            r.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
-                        ),
+            .map(|(i, item)| {
+                let summary = match &item.pending {
+                    Pending::Request(r) => format!(
+                        "{:<6} {}",
+                        r.method.as_str(),
+                        r.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
                     ),
                     Pending::Response(r) => {
-                        ("RES", "←", format!("{} ({} bytes)", r.status, r.body.len()))
+                        format!("{:<6} {} bytes", r.status.as_u16(), r.body.len())
                     }
                 };
-                let text = format!(" {arrow} #{:<4} {dir}  {summary}", held.flow_id);
-                if i == self.intercept.selected {
-                    Line::styled(text, Style::new().fg(Color::Black).bg(Color::Cyan).bold())
+                let text = format!(" #{:<5} {summary}", item.flow_id);
+                if i == row {
+                    // Only the focused column's cursor is lit, so it is never
+                    // ambiguous which of the two a keystroke will act on.
+                    let style = if focused {
+                        Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+                    } else {
+                        Style::new().bg(Color::DarkGray)
+                    };
+                    Line::styled(text, style)
                 } else {
                     Line::from(text)
                 }
             })
             .collect();
-        frame.render_widget(pane(rows, " Queue ").scroll((self.content_scroll, 0)), list);
 
-        // The edit buffer wins when it belongs to the highlighted item, so what
-        // is on screen is always exactly what forwarding would send.
-        let held = &self.queue[self.intercept.selected];
-        let editing = self.input.mode() == Mode::Insert;
-        match &self.intercept.editing {
-            Some((ticket, buffer)) if *ticket == held.ticket => {
-                self.content_len = buffer.lines().len() as u16;
-                let title = if buffer.is_dirty() {
-                    " Held Item* "
-                } else {
-                    " Held Item "
-                };
-                frame.render_widget(
-                    buffer_pane(buffer, title, editing).scroll((self.content_scroll, 0)),
-                    detail,
+        // Keep the cursor on screen; this pane scrolls by offset, so nothing
+        // does it for us.
+        let visible = list_area.height.saturating_sub(2).max(1) as usize;
+        let scroll = row.saturating_sub(visible.saturating_sub(1)) as u16;
+        frame.render_widget(
+            Paragraph::new(rows)
+                .block(Block::bordered().title(title).border_style(border))
+                .scroll((scroll, 0)),
+            list_area,
+        );
+
+        // The edit buffer wins when it belongs to the highlighted item.
+        let item = &held[row];
+        let editing = focused && self.input.mode() == Mode::Insert;
+        let view_scroll = if focused { self.content_scroll } else { 0 };
+        match self.intercept.edit(requests) {
+            Some((ticket, buffer)) if *ticket == item.ticket => {
+                let title = format!(
+                    " {}{} ",
+                    capitalize(noun),
+                    if buffer.is_dirty() { "*" } else { "" }
                 );
+                let widget = buffer_pane(buffer, title, editing).scroll((view_scroll, 0));
+                if focused {
+                    self.content_len = buffer.lines().len() as u16;
+                }
+                frame.render_widget(widget, view_area);
             }
             _ => {
-                let text = match &held.pending {
-                    Pending::Request(r) => http_text::render_request(r),
-                    Pending::Response(r) => http_text::render_response(r),
-                };
+                let text = render_pending(&item.pending);
                 let lines: Vec<Line> = text.lines().map(|l| Line::from(l.to_string())).collect();
-                self.content_len = lines.len() as u16;
+                if focused {
+                    self.content_len = lines.len() as u16;
+                }
                 frame.render_widget(
-                    pane(lines, " Held Item ").scroll((self.content_scroll, 0)),
-                    detail,
+                    Paragraph::new(lines)
+                        .block(
+                            Block::bordered()
+                                .title(format!(" {} ", capitalize(noun)))
+                                .border_style(border),
+                        )
+                        .wrap(Wrap { trim: false })
+                        .scroll((view_scroll, 0)),
+                    view_area,
                 );
             }
         }
@@ -1449,7 +1645,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/C/R/S/I/A windows, gt/gT cycle · <Space>s→Repeater, i edit, <Space>r send · <Space>i intercept, f/d answer (F/D all) · :q";
+const HELP: &str = "^k palette · P/C/R/S/I/A windows, gt/gT cycle · <Space>s→Repeater, i edit, <Space>r send · <Space>i hold, <Space>1/2 legs, ^w pane, <Space>f/d answer (F/D all) · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -1468,6 +1664,48 @@ fn step_row(current: usize, last: usize, motion: Motion, count: Option<usize>) -
         _ => current as isize,
     };
     target.clamp(0, last as isize) as usize
+}
+
+/// Render a held item as wire text, whichever leg it is.
+fn render_pending(pending: &Pending) -> String {
+    match pending {
+        Pending::Request(r) => http_text::render_request(r),
+        Pending::Response(r) => http_text::render_response(r),
+    }
+}
+
+/// Forget an edit buffer whose item is no longer held. Without this, edits made
+/// to an answered item would silently attach to whatever took its place.
+fn drop_stale_edit(slot: &mut Option<(TicketId, TextBuffer)>, held: &[Held]) {
+    if let Some((ticket, _)) = slot {
+        if !held.iter().any(|h| h.ticket == *ticket) {
+            *slot = None;
+        }
+    }
+}
+
+fn leg_style(on: bool) -> Style {
+    if on {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    }
+}
+
+fn leg_note(leg: &str, on: bool, released: usize) -> String {
+    if on {
+        format!("holding {leg}")
+    } else {
+        format!("not holding {leg} — released {released}")
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Reparse edited text as the same kind of message it started as. The queue
@@ -2217,7 +2455,35 @@ mod tests {
         let out = render(&mut app);
         assert!(out.contains("Command Palette"), "{out}");
         assert!(out.contains("Go to Repeater"), "{out}");
-        assert!(out.contains("Quit"), "{out}");
+    }
+
+    /// The catalog outgrew the box, so the list scrolls. An entry below the
+    /// fold has to be reachable by moving the highlight onto it.
+    #[test]
+    fn palette_scrolls_to_keep_the_highlight_visible() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+
+        let last = app.palette_matches().len() - 1;
+        assert!(last > 0);
+        let hidden = &app.palette_matches()[last].0.clone();
+        assert!(
+            !render(&mut app).contains(hidden.as_str()),
+            "the last entry should start below the fold"
+        );
+
+        for _ in 0..last {
+            app.palette(PaletteKey::Down);
+        }
+        assert_eq!(app.palette_selected, last);
+        assert!(
+            render(&mut app).contains(hidden.as_str()),
+            "moving onto it should scroll it into view"
+        );
     }
 
     /// Typing filters the list; Enter runs the highlighted command — here,
@@ -2389,6 +2655,159 @@ mod tests {
 
         press(&mut app, " i");
         assert!(!app.engine.intercept().is_enabled());
+    }
+
+    /// Hold one request and one response, so the two columns each have content.
+    fn app_with_both_legs_held() -> (Arc<Engine>, App, tokio::runtime::Runtime) {
+        let engine = Engine::new();
+        engine.intercept().set_enabled(true);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let e = engine.clone();
+        rt.spawn(async move {
+            e.intercept()
+                .hold_request(7, get_request("http://example.com/req-path"))
+                .await
+        });
+        let e = engine.clone();
+        rt.spawn(async move {
+            e.intercept()
+                .hold_response(
+                    8,
+                    CapturedResponse {
+                        status: hudsucker::hyper::StatusCode::NOT_FOUND,
+                        version: Version::HTTP_11,
+                        headers: HeaderMap::new(),
+                        body: Bytes::from_static(b"res-marker"),
+                    },
+                )
+                .await
+        });
+        for _ in 0..200 {
+            if engine.intercept().len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.window = Window::Intercept;
+        (engine, app, rt)
+    }
+
+    /// The reference layout: requests and responses in their own queues, side by
+    /// side, each above its own preview.
+    #[test]
+    fn intercept_shows_four_panes() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        let rows = render_rows(&mut app);
+        let out = rows.join("\n");
+
+        assert!(out.contains("Queued requests (1)"), "{out}");
+        assert!(out.contains("Queued responses (1)"), "{out}");
+        // Each column's queue title shares a row with the other's, and each
+        // preview title likewise — that is what makes it a 2x2.
+        let queue_row = rows
+            .iter()
+            .position(|r| r.contains("Queued requests"))
+            .unwrap();
+        assert!(
+            rows[queue_row].contains("Queued responses"),
+            "queues should be side by side, got: {}",
+            rows[queue_row]
+        );
+        let view_row = rows.iter().position(|r| r.contains(" Request ")).unwrap();
+        assert!(
+            rows[view_row].contains(" Response "),
+            "previews should be side by side, got: {}",
+            rows[view_row]
+        );
+        assert!(view_row > queue_row, "previews sit below their queues");
+    }
+
+    /// Each column previews its own leg.
+    #[test]
+    fn each_column_previews_its_own_leg() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        let out = render(&mut app);
+        assert!(out.contains("/req-path"), "request preview: {out}");
+        assert!(out.contains("res-marker"), "response preview: {out}");
+    }
+
+    /// `<C-w>` moves focus, and the focused column is the one keys act on.
+    #[test]
+    fn focus_moves_between_columns_and_directs_answers() {
+        let (engine, mut app, _rt) = app_with_both_legs_held();
+        assert_eq!(app.intercept.focus, Column::Left);
+
+        // Forwarding with the left column focused answers the request.
+        app.apply(Action::Forward);
+        app.refresh();
+        assert_eq!(engine.intercept().queue_of(true).len(), 0);
+        assert_eq!(
+            engine.intercept().queue_of(false).len(),
+            1,
+            "the response must be untouched"
+        );
+
+        // Move to the right column; now it answers the response.
+        app.apply(Action::Focus(Some(Column::Right)));
+        assert_eq!(app.intercept.focus, Column::Right);
+        app.apply(Action::Forward);
+        app.refresh();
+        assert_eq!(engine.intercept().queue_of(false).len(), 0);
+    }
+
+    #[test]
+    fn focus_cycles_with_ctrl_w_w() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Focus(None));
+        assert_eq!(app.intercept.focus, Column::Right);
+        app.apply(Action::Focus(None));
+        assert_eq!(app.intercept.focus, Column::Left);
+    }
+
+    /// Editing happens in the focused column's buffer, and the other column's
+    /// buffer is untouched by it.
+    #[test]
+    fn editing_targets_the_focused_column() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+
+        app.apply(Action::Insert(InsertKey::Char('Z')));
+        assert!(
+            app.intercept.request_edit.is_some(),
+            "the left column should have forked a buffer"
+        );
+        assert!(
+            app.intercept.response_edit.is_none(),
+            "the right column should not have"
+        );
+
+        app.apply(Action::Focus(Some(Column::Right)));
+        app.apply(Action::Insert(InsertKey::Char('Q')));
+        let (_, buffer) = app.intercept.response_edit.as_ref().unwrap();
+        assert!(buffer.text().starts_with('Q'));
+        // The request buffer still holds its own edit.
+        let (_, req) = app.intercept.request_edit.as_ref().unwrap();
+        assert!(req.text().starts_with('Z'));
+    }
+
+    /// Legs can be switched off independently, and the pane says so.
+    #[test]
+    fn holding_can_be_limited_to_one_leg() {
+        let mut app = App::new(Engine::new());
+        app.refresh();
+        press(&mut app, "C");
+        press(&mut app, " i");
+        assert!(app.engine.intercept().holds_responses());
+
+        press(&mut app, " 2");
+        assert!(!app.engine.intercept().holds_responses());
+        assert!(app.engine.intercept().holds_requests(), "only one leg off");
+        let out = render(&mut app);
+        assert!(out.contains("[x] requests"), "{out}");
+        assert!(out.contains("[ ] responses"), "{out}");
     }
 
     #[test]

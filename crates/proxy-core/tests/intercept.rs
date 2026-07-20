@@ -194,3 +194,57 @@ async fn answering_an_unknown_ticket_is_a_no_op() {
     assert!(!intercept.forward(999, None));
     assert!(!intercept.discard(999));
 }
+
+/// Holding both legs means an exchange stops twice, which is a lot of
+/// keystrokes when only one direction matters. Each leg can be switched off
+/// on its own.
+#[tokio::test]
+async fn each_leg_can_be_held_independently() {
+    let intercept = Arc::new(Intercept::default());
+    intercept.set_enabled(true);
+    assert!(intercept.holds_requests() && intercept.holds_responses());
+
+    intercept.set_hold_responses(false);
+    // A response now passes straight through...
+    let verdict = intercept.hold_response(1, response(200)).await;
+    assert!(matches!(verdict, Verdict::Forward(_)));
+    assert!(intercept.is_empty());
+
+    // ...while a request still holds.
+    let held = tokio::spawn({
+        let intercept = Arc::clone(&intercept);
+        async move { intercept.hold_request(1, request("http://a/x")).await }
+    });
+    wait_for_queue(&intercept, 1).await;
+    assert_eq!(intercept.queue_of(true).len(), 1);
+    assert_eq!(intercept.queue_of(false).len(), 0);
+    intercept.forward_all();
+    held.await.unwrap();
+}
+
+/// Switching a leg off must release what it is already holding, for the same
+/// reason disabling entirely does: nobody is watching that queue any more.
+#[tokio::test]
+async fn turning_a_leg_off_releases_what_it_holds() {
+    let intercept = Arc::new(Intercept::default());
+    intercept.set_enabled(true);
+
+    let req = tokio::spawn({
+        let intercept = Arc::clone(&intercept);
+        async move { intercept.hold_request(1, request("http://a/x")).await }
+    });
+    wait_for_queue(&intercept, 1).await;
+    let res = tokio::spawn({
+        let intercept = Arc::clone(&intercept);
+        async move { intercept.hold_response(1, response(200)).await }
+    });
+    wait_for_queue(&intercept, 2).await;
+
+    // Only the response leg is released; the request stays held.
+    assert_eq!(intercept.set_hold_responses(false), 1);
+    assert!(matches!(res.await.unwrap(), Verdict::Forward(_)));
+    assert_eq!(intercept.len(), 1, "the request should still be held");
+
+    intercept.forward_all();
+    req.await.unwrap();
+}

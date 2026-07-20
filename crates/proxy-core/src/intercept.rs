@@ -67,20 +67,68 @@ struct Entry {
 
 /// The intercept queue. Lives on the [`Engine`](crate::Engine) so the proxy
 /// handlers, the TUI, and the MCP all address the same one.
-#[derive(Default)]
 pub struct Intercept {
     /// Checked before anything else on the capture path: when off, holding is a
     /// single relaxed atomic load and traffic flows untouched.
     enabled: AtomicBool,
+    /// Which legs to hold. Both on by default, but an exchange holds *twice*
+    /// when they are — once out, once back — which is a lot of keystrokes when
+    /// you only care about one direction. These make that choice.
+    hold_requests: AtomicBool,
+    hold_responses: AtomicBool,
     next_ticket: AtomicU64,
     /// `BTreeMap` so `queue()` yields items in the order they were held, which is
     /// the order an operator expects to answer them in.
     queue: Mutex<BTreeMap<TicketId, Entry>>,
 }
 
+impl Default for Intercept {
+    fn default() -> Self {
+        Self {
+            // Off: an engine nobody is watching must never hold anything.
+            enabled: AtomicBool::new(false),
+            // But once switched on, hold both legs — the conservative default is
+            // to show the operator everything and let them narrow it.
+            hold_requests: AtomicBool::new(true),
+            hold_responses: AtomicBool::new(true),
+            next_ticket: AtomicU64::new(0),
+            queue: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
 impl Intercept {
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn holds_requests(&self) -> bool {
+        self.hold_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn holds_responses(&self) -> bool {
+        self.hold_responses.load(Ordering::Relaxed)
+    }
+
+    /// Choose whether requests hold. Turning it off releases any that already
+    /// are, for the same reason disabling entirely does.
+    pub fn set_hold_requests(&self, on: bool) -> usize {
+        self.hold_requests.store(on, Ordering::Relaxed);
+        if on {
+            0
+        } else {
+            self.release(|p| p.is_request())
+        }
+    }
+
+    /// Choose whether responses hold.
+    pub fn set_hold_responses(&self, on: bool) -> usize {
+        self.hold_responses.store(on, Ordering::Relaxed);
+        if on {
+            0
+        } else {
+            self.release(|p| !p.is_request())
+        }
     }
 
     /// Turn interception on or off.
@@ -107,7 +155,12 @@ impl Intercept {
     }
 
     async fn hold(&self, flow_id: FlowId, pending: Pending) -> Verdict {
-        if !self.is_enabled() {
+        let wanted = if pending.is_request() {
+            self.holds_requests()
+        } else {
+            self.holds_responses()
+        };
+        if !self.is_enabled() || !wanted {
             return Verdict::Forward(Box::new(pending));
         }
 
@@ -172,6 +225,41 @@ impl Intercept {
         // is off the queue either way, so this is still a successful answer.
         let _ = entry.reply.send(Verdict::Forward(Box::new(payload)));
         true
+    }
+
+    /// Everything currently held on one leg, oldest first. The two legs are
+    /// answered independently, so the frontend lists them independently.
+    pub fn queue_of(&self, requests: bool) -> Vec<Held> {
+        self.queue
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.held.pending.is_request() == requests)
+            .map(|e| e.held.clone())
+            .collect()
+    }
+
+    /// Forward every held item matching `wanted`, unmodified.
+    fn release(&self, wanted: impl Fn(&Pending) -> bool) -> usize {
+        let drained: Vec<Entry> = {
+            let mut queue = self.queue.lock().unwrap();
+            let tickets: Vec<TicketId> = queue
+                .iter()
+                .filter(|(_, e)| wanted(&e.held.pending))
+                .map(|(t, _)| *t)
+                .collect();
+            tickets
+                .into_iter()
+                .filter_map(|t| queue.remove(&t))
+                .collect()
+        };
+        let n = drained.len();
+        for entry in drained {
+            let _ = entry
+                .reply
+                .send(Verdict::Forward(Box::new(entry.held.pending)));
+        }
+        n
     }
 
     /// Release everything held, unmodified. Returns how many were released.
