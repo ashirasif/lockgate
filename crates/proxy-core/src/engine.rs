@@ -237,6 +237,9 @@ impl Engine {
     /// task, so anything still queued dies with the process otherwise. A no-op
     /// for in-memory engines, and safe to call more than once.
     pub async fn shutdown(&self) {
+        // Anything still held would otherwise die with the process, leaving the
+        // client's socket hanging until it times out. Release it first.
+        self.intercept.forward_all();
         if let Persist::Async { writer, .. } = &self.persist {
             writer.shutdown().await;
         }

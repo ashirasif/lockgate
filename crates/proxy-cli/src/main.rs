@@ -1,4 +1,6 @@
 mod command;
+mod editor;
+mod http_text;
 mod input;
 mod tui;
 
