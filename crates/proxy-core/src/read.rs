@@ -354,6 +354,10 @@ pub struct FlowQuery {
     pub uri_contains: Option<String>,
     /// Only responses with this exact status.
     pub status: Option<u16>,
+    /// Include `automate`-source flows (Intruder/Automate output). When false
+    /// they are excluded — unless `source` is set, which selects explicitly and
+    /// overrides this. Default (via `Default`) is false: exclude them.
+    pub include_automate: bool,
 }
 
 const FLOW_COLUMNS: &str = "id, method, uri, host, path, status, mime, resp_len,
@@ -412,6 +416,11 @@ pub fn flows(
     if let Some(status) = q.status {
         where_clauses.push(format!("status = ?{}", binds.len() + 1));
         binds.push(Box::new(status as i64));
+    }
+    // Automate output shares the flow table; keep it out of a default survey
+    // unless asked for, or unless a specific source was named (which wins).
+    if !q.include_automate && q.source.is_none() {
+        where_clauses.push("source != 'automate'".to_string());
     }
 
     if !where_clauses.is_empty() {

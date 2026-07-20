@@ -90,6 +90,15 @@ impl From<reqwest::Error> for ResendError {
     }
 }
 
+/// A successful resend: the fresh response, plus the id of the new flow the
+/// replay was recorded as (parented to the original). Callers want the id so
+/// they can point at the replay in history, not just see its response.
+#[derive(Debug)]
+pub struct Resent {
+    pub replay_id: FlowId,
+    pub response: CapturedResponse,
+}
+
 impl Engine {
     /// In-memory only: nothing survives the process. Backed by an in-memory
     /// database written synchronously, so reads see writes immediately.
@@ -272,7 +281,7 @@ impl Engine {
     ///
     /// The replay is itself recorded as a new flow carrying `parent_id = id`,
     /// so a send and its origin stay linked instead of the result vanishing.
-    pub async fn resend(&self, id: FlowId) -> Result<CapturedResponse, ResendError> {
+    pub async fn resend(&self, id: FlowId) -> Result<Resent, ResendError> {
         let flow = self.get_flow(id).ok_or(ResendError::NotFound(id))?;
         let req = flow.request;
         let url = target_url(&req).ok_or(ResendError::NoTarget)?;
@@ -315,7 +324,10 @@ impl Engine {
         };
         self.record_response(replay_id, response.clone());
 
-        Ok(response)
+        Ok(Resent {
+            replay_id,
+            response,
+        })
     }
 
     // --- read verbs backed by the project database (used by the MCP) ---

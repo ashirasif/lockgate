@@ -460,7 +460,12 @@ impl App {
                 match engine.resend(*id).await {
                     Ok(r) => {
                         ok += 1;
-                        last = format!("#{id} → {} ({} bytes)", r.status, r.body.len());
+                        last = format!(
+                            "#{id} → {} ({} bytes) as #{}",
+                            r.response.status,
+                            r.response.body.len(),
+                            r.replay_id
+                        );
                     }
                     Err(e) => {
                         failed += 1;

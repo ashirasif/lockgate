@@ -23,3 +23,8 @@ axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+
+[dev-dependencies]
+# Tests build `CapturedRequest`/`CapturedResponse`, whose fields are `http`
+# types re-exported by hudsucker (the same version proxy-core captures with).
+hudsucker = { workspace = true }

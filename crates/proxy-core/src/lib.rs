@@ -16,7 +16,7 @@ pub mod server;
 pub mod writer;
 
 pub use db::ProjectPaths;
-pub use engine::{Engine, ResendError};
+pub use engine::{Engine, ResendError, Resent};
 pub use finding::{Finding, NewFinding};
 pub use read::{BodySlice, FlowDetail, FlowQuery, FlowRow, Side, SitemapNode};
 pub use registry::{Project, Registry};
