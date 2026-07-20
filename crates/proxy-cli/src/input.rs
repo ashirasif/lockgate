@@ -90,20 +90,17 @@ pub enum Window {
     Intercept,
     /// The tree of what has been seen: host, then path.
     Sitemap,
-    /// A decomposed view of one flow — headers, params, cookies, timing.
-    Inspect,
     /// Batch and automation scaffolding built on top of a base request set.
     Automate,
 }
 
 impl Window {
     /// Left-to-right tab order, and the set `gt` / `gT` cycle through.
-    pub const ALL: [Window; 6] = [
+    pub const ALL: [Window; 5] = [
         Window::Proxy,
         Window::Intercept,
         Window::Repeater,
         Window::Sitemap,
-        Window::Inspect,
         Window::Automate,
     ];
 
@@ -114,21 +111,20 @@ impl Window {
             Window::Intercept => "Intercept",
             Window::Repeater => "Repeater",
             Window::Sitemap => "Sitemap",
-            Window::Inspect => "Inspect",
             Window::Automate => "Automate",
         }
     }
 
     /// The single key that jumps straight here, shown in the tab strip.
     ///
-    /// `C` for Intercept: `I` is Inspect, and vim spends `i` on insert.
+    /// Uppercase `I` is free for Intercept because vim only spends the
+    /// *lowercase* `i` on insert.
     pub fn key(self) -> char {
         match self {
             Window::Proxy => 'P',
-            Window::Intercept => 'C',
+            Window::Intercept => 'I',
             Window::Repeater => 'R',
             Window::Sitemap => 'S',
-            Window::Inspect => 'I',
             Window::Automate => 'A',
         }
     }
@@ -347,10 +343,9 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     // cycles tabs. Lowercase `i` stays vim's insert, which is why Intercept
     // takes `C`.
     ("P", Bind::Window(Window::Proxy)),
-    ("C", Bind::Window(Window::Intercept)),
+    ("I", Bind::Window(Window::Intercept)),
     ("R", Bind::Window(Window::Repeater)),
     ("S", Bind::Window(Window::Sitemap)),
-    ("I", Bind::Window(Window::Inspect)),
     ("A", Bind::Window(Window::Automate)),
     ("gt", Bind::WindowStep(1)),
     ("gT", Bind::WindowStep(-1)),
@@ -934,18 +929,22 @@ mod tests {
     #[test]
     fn uppercase_keys_jump_to_windows() {
         assert_eq!(last("P"), Action::Window(Window::Proxy));
-        assert_eq!(last("C"), Action::Window(Window::Intercept));
+        assert_eq!(last("I"), Action::Window(Window::Intercept));
         assert_eq!(last("R"), Action::Window(Window::Repeater));
         assert_eq!(last("S"), Action::Window(Window::Sitemap));
-        assert_eq!(last("I"), Action::Window(Window::Inspect));
         assert_eq!(last("A"), Action::Window(Window::Automate));
     }
 
-    /// `i` is vim's insert, and must stay it — Intercept takes `C` precisely so
-    /// this key is free.
+    /// Uppercase `I` jumps to Intercept while lowercase `i` still starts insert.
+    /// Only the lowercase key is vim's, so the pair does not conflict.
     #[test]
     fn i_enters_insert_mode_and_escape_leaves() {
         let mut input = Input::new();
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Char('I'))),
+            Some(Action::Window(Window::Intercept)),
+            "uppercase I is the window jump"
+        );
         assert_eq!(
             input.feed(KeyEvent::from(KeyCode::Char('i'))),
             Some(Action::ModeChange(Mode::Insert))

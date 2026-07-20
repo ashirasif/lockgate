@@ -19,6 +19,10 @@ ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 regex = "1"
+# Only for rendering capture times in the local zone. `clock` is the feature
+# that reads the system zone; the default feature set drags in serde and
+# wasm shims we have no use for.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [workspace.package]
 version = "0.1.0"

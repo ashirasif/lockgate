@@ -54,4 +54,7 @@ pub struct FlowSummary {
     pub method: Method,
     pub uri: Uri,
     pub status: Option<StatusCode>,
+    /// When the request was captured, in unix microseconds — the same clock
+    /// `Flow::started_at` uses.
+    pub started_at: i64,
 }

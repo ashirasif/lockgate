@@ -38,13 +38,14 @@ use crate::scope::{Matcher, Target};
 /// at, and on a busy target it would otherwise be somewhere far below the fold.
 /// Matches the order the MCP's `query_flows` already returns.
 pub fn list_flows(conn: &Connection) -> rusqlite::Result<Vec<FlowSummary>> {
-    conn.prepare("SELECT id, method, uri, status FROM flow ORDER BY id DESC")?
+    conn.prepare("SELECT id, method, uri, status, started_at FROM flow ORDER BY id DESC")?
         .query_map([], |r| {
             Ok(summary(
                 r.get(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<i64>>(3)?,
+                r.get(4)?,
             ))
         })?
         .collect()
@@ -64,8 +65,9 @@ pub fn list_flows_in_scope(
         return list_flows(conn);
     }
 
-    let mut stmt = conn
-        .prepare("SELECT id, method, uri, status, host, port, path FROM flow ORDER BY id DESC")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, method, uri, status, started_at, host, port, path FROM flow ORDER BY id DESC",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             summary(
@@ -73,10 +75,11 @@ pub fn list_flows_in_scope(
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<i64>>(3)?,
+                r.get(4)?,
             ),
-            r.get::<_, String>(4)?,
-            r.get::<_, Option<i64>>(5)?.unwrap_or(0) as u16,
-            r.get::<_, String>(6)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<i64>>(6)?.unwrap_or(0) as u16,
+            r.get::<_, String>(7)?,
         ))
     })?;
 
@@ -169,12 +172,19 @@ struct ReconRow {
     ended_at: Option<i64>,
 }
 
-fn summary(id: i64, method: String, uri: String, status: Option<i64>) -> FlowSummary {
+fn summary(
+    id: i64,
+    method: String,
+    uri: String,
+    status: Option<i64>,
+    started_at: i64,
+) -> FlowSummary {
     FlowSummary {
         id: id as FlowId,
         method: parse_method(&method),
         uri: parse_uri(&uri),
         status: parse_status(status),
+        started_at,
     }
 }
 

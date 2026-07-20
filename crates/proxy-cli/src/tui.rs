@@ -10,7 +10,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyEventKind},
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
@@ -969,7 +969,7 @@ impl App {
             }
             lines.push(Line::styled(
                 "  <Space>r replays this set through the Repeater",
-                Style::new().fg(Color::DarkGray),
+                muted(),
             ));
         }
 
@@ -1007,7 +1007,7 @@ impl App {
         section(&mut lines, "RUNNER");
         lines.push(Line::styled(
             "  Intruder-style runs are not wired up yet.",
-            Style::new().fg(Color::DarkGray),
+            muted(),
         ));
         lines
     }
@@ -1029,7 +1029,6 @@ impl App {
             Window::Intercept => self.draw_intercept(frame, body),
             Window::Repeater => self.draw_repeater(frame, body),
             Window::Sitemap => self.draw_sitemap(frame, body),
-            Window::Inspect => self.draw_inspect(frame, body),
             Window::Automate => self.draw_automate(frame, body),
         }
         self.draw_status(frame, status_bar);
@@ -1070,10 +1069,7 @@ impl App {
         );
 
         let rows: Vec<Line> = if matches.is_empty() {
-            vec![Line::styled(
-                "  no matching command",
-                Style::new().fg(Color::DarkGray),
-            )]
+            vec![Line::styled("  no matching command", muted())]
         } else {
             matches
                 .iter()
@@ -1174,7 +1170,7 @@ impl App {
             } else {
                 "  i edit   <Space>r send".to_string()
             },
-            Style::new().fg(Color::DarkGray),
+            muted(),
         ));
         frame.render_widget(Paragraph::new(Line::from(chips)), banner);
 
@@ -1195,10 +1191,7 @@ impl App {
                 Style::new().fg(Color::Red),
             )],
             None => match &response {
-                None => vec![Line::styled(
-                    "(not sent yet — <Space>r)",
-                    Style::new().fg(Color::DarkGray),
-                )],
+                None => vec![Line::styled("(not sent yet — <Space>r)", muted())],
                 Some(text) => text.lines().map(|l| Line::from(l.to_string())).collect(),
             },
         };
@@ -1235,7 +1228,7 @@ impl App {
                     if on { " HOLDING " } else { " OFF " },
                     Style::new()
                         .fg(Color::Black)
-                        .bg(if on { Color::Red } else { Color::DarkGray })
+                        .bg(if on { Color::Red } else { INACTIVE_BG })
                         .bold(),
                 ),
                 Span::styled(
@@ -1248,7 +1241,7 @@ impl App {
                 ),
                 Span::styled(
                     "   <Space>i hold  1/2 legs  ^w pane  f fwd  d drop  F/D all",
-                    Style::new().fg(Color::DarkGray),
+                    muted(),
                 ),
             ])),
             banner,
@@ -1303,7 +1296,7 @@ impl App {
         let border = if focused {
             Style::new().fg(Color::Cyan)
         } else {
-            Style::new().fg(Color::DarkGray)
+            muted()
         };
         let title = format!(" Queued {plural} ({}) ", held.len());
 
@@ -1319,14 +1312,14 @@ impl App {
                 format!("no {plural} queued")
             };
             frame.render_widget(
-                Paragraph::new(Line::styled(why, Style::new().fg(Color::DarkGray)))
+                Paragraph::new(Line::styled(why, muted()))
                     .block(Block::bordered().title(title).border_style(border)),
                 list_area,
             );
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     format!("select a {noun} to view it here"),
-                    Style::new().fg(Color::DarkGray),
+                    muted(),
                 ))
                 .block(
                     Block::bordered()
@@ -1359,7 +1352,7 @@ impl App {
                     let style = if focused {
                         Style::new().fg(Color::Black).bg(Color::Cyan).bold()
                     } else {
-                        Style::new().bg(Color::DarkGray)
+                        Style::new().bg(INACTIVE_BG)
                     };
                     Line::styled(text, style)
                 } else {
@@ -1467,28 +1460,6 @@ impl App {
         );
     }
 
-    /// Inspect: the selected flow taken apart — request line, query params,
-    /// headers, cookies, body size, then the response and its timing.
-    fn draw_inspect(&mut self, frame: &mut Frame, area: Rect) {
-        self.viewport = area.height.saturating_sub(2) as usize;
-
-        let Some(flow) = self.detail.clone() else {
-            self.content_len = 0;
-            frame.render_widget(
-                empty_pane(" Inspect ", "no flow selected — pick one in Proxy (P)"),
-                area,
-            );
-            return;
-        };
-
-        let lines = inspect_lines(&flow);
-        self.content_len = lines.len() as u16;
-        frame.render_widget(
-            pane(lines, " Inspect ").scroll((self.content_scroll, 0)),
-            area,
-        );
-    }
-
     /// Automate: the base request set (the Proxy selection) an attack would run
     /// against, plus a live breakdown of captured traffic. The runner itself is
     /// not wired yet — `<Space>r` replays the base set in the meantime.
@@ -1536,6 +1507,7 @@ impl App {
                 let row = Row::new(vec![
                     sign.to_string(),
                     gutter,
+                    clock_time(f.started_at),
                     f.method.to_string(),
                     code,
                     f.uri.to_string(),
@@ -1555,14 +1527,15 @@ impl App {
             [
                 Constraint::Length(1),
                 Constraint::Length(5),
+                Constraint::Length(8),
                 Constraint::Length(7),
                 Constraint::Length(5),
                 Constraint::Min(20),
             ],
         )
-        .header(Row::new(vec![" ", "ID", "METHOD", "CODE", "URL"]).bold())
+        .header(Row::new(vec![" ", "ID", "TIME", "METHOD", "CODE", "URL"]).bold())
         .block(Block::bordered().title(format!(" HTTP History ({}) ", self.flows.len())))
-        .row_highlight_style(Style::new().bg(Color::DarkGray))
+        .row_highlight_style(Style::new().bg(INACTIVE_BG))
         .highlight_symbol("▶ ");
 
         frame.render_stateful_widget(table, area, &mut self.table);
@@ -1637,7 +1610,7 @@ impl App {
                 Span::styled(format!(" {} ", mode.label()), mode_style),
                 Span::raw(format!(" {message}")),
                 Span::raw(gap),
-                Span::styled(right, Style::new().fg(Color::DarkGray)),
+                Span::styled(right, muted()),
             ])),
             area,
         );
@@ -1688,7 +1661,7 @@ fn leg_style(on: bool) -> Style {
     if on {
         Style::new().fg(Color::Yellow)
     } else {
-        Style::new().fg(Color::DarkGray)
+        muted()
     }
 }
 
@@ -1832,6 +1805,45 @@ fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     }
 }
 
+/// Capture time as a wall clock, in the operator's own timezone.
+///
+/// Local rather than UTC: the point of the column is to line traffic up against
+/// what you were doing when it fired, and you were doing it in local time. Falls
+/// back to `--:--:--` for a timestamp that will not convert, which beats
+/// rendering a misleading epoch.
+fn clock_time(micros: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_micros(micros) {
+        chrono::LocalResult::Single(t) => t.format("%H:%M:%S").to_string(),
+        _ => "--:--:--".to_string(),
+    }
+}
+
+// --- theme ---
+//
+// Secondary text is defined here and nowhere else. It was `Color::DarkGray`
+// inline at sixteen call sites, which made it both invisible on some terminals
+// and tedious to change.
+
+/// Secondary text: hints, empty states, field labels, inactive borders.
+///
+/// Dims the terminal's *own* foreground rather than naming a colour.
+/// `Color::DarkGray` is ANSI bright-black — one specific dark value, which
+/// disappears against a transparent or light background. `DIM` is relative to
+/// whatever foreground the user actually has, so it stays readable in terminals
+/// we cannot see, and degrades to plain (still legible) text where the terminal
+/// ignores it.
+///
+/// Change this one function to restyle every hint in the UI.
+fn muted() -> Style {
+    Style::new().add_modifier(Modifier::DIM)
+}
+
+/// Background fill for a highlighted-but-unfocused row. Backgrounds are a
+/// different problem from text — they need a real colour to shade a cell — so
+/// they deliberately do not go through [`muted`].
+const INACTIVE_BG: Color = Color::DarkGray;
+
 /// A bordered, wrapping pane — the shared shell for Request and Response.
 fn pane(lines: Vec<Line<'static>>, title: impl Into<String>) -> Paragraph<'static> {
     Paragraph::new(lines)
@@ -1885,11 +1897,10 @@ fn buffer_pane(buffer: &TextBuffer, title: impl Into<String>, focused: bool) -> 
 /// A bordered pane with a single muted message — used when a window has nothing
 /// to show because no flow is selected.
 fn empty_pane(title: &'static str, message: &'static str) -> Paragraph<'static> {
-    Paragraph::new(Line::styled(message, Style::new().fg(Color::DarkGray)))
-        .block(Block::bordered().title(title))
+    Paragraph::new(Line::styled(message, muted())).block(Block::bordered().title(title))
 }
 
-/// A section header inside the Inspect / Automate panes.
+/// A section header inside the Automate pane.
 fn section(lines: &mut Vec<Line<'static>>, title: &str) {
     if !lines.is_empty() {
         lines.push(Line::from(""));
@@ -1903,105 +1914,9 @@ fn section(lines: &mut Vec<Line<'static>>, title: &str) {
 /// A right-aligned label and its value, so fields line up in a column.
 fn field(lines: &mut Vec<Line<'static>>, label: &str, value: impl Into<String>) {
     lines.push(Line::from(vec![
-        Span::styled(format!("{label:>13}  "), Style::new().fg(Color::DarkGray)),
+        Span::styled(format!("{label:>13}  "), muted()),
         Span::raw(value.into()),
     ]));
-}
-
-/// Take a flow apart into a scannable report: where the request is going, what
-/// it carries, and what came back.
-fn inspect_lines(flow: &Flow) -> Vec<Line<'static>> {
-    let req = &flow.request;
-    let mut lines = Vec::new();
-
-    section(&mut lines, "REQUEST");
-    field(&mut lines, "method", req.method.to_string());
-    field(
-        &mut lines,
-        "scheme",
-        req.uri.scheme_str().unwrap_or("—").to_string(),
-    );
-    let host = req
-        .uri
-        .host()
-        .map(str::to_owned)
-        .or_else(|| header(&req.headers, "host"))
-        .unwrap_or_else(|| "—".to_string());
-    field(&mut lines, "host", host);
-    if let Some(port) = req.uri.port_u16() {
-        field(&mut lines, "port", port.to_string());
-    }
-    field(&mut lines, "path", req.uri.path().to_string());
-    field(&mut lines, "version", format!("{:?}", req.version));
-
-    if let Some(query) = req.uri.query() {
-        section(&mut lines, "QUERY");
-        for (key, value) in parse_pairs(query, '&') {
-            field(&mut lines, &key, value);
-        }
-    }
-
-    if let Some(cookies) = header(&req.headers, "cookie") {
-        section(&mut lines, "COOKIES");
-        for (key, value) in parse_pairs(&cookies, ';') {
-            field(&mut lines, &key, value);
-        }
-    }
-
-    section(&mut lines, "REQUEST HEADERS");
-    header_lines(&mut lines, &req.headers);
-    field(&mut lines, "body", format!("{} bytes", req.body.len()));
-
-    section(&mut lines, "RESPONSE");
-    match &flow.response {
-        None => field(&mut lines, "status", "(pending)"),
-        Some(resp) => {
-            field(&mut lines, "status", resp.status.to_string());
-            field(&mut lines, "version", format!("{:?}", resp.version));
-            if let Some(end) = flow.ended_at {
-                let ms = (end - flow.started_at) as f64 / 1000.0;
-                field(&mut lines, "duration", format!("{ms:.1} ms"));
-            }
-            section(&mut lines, "RESPONSE HEADERS");
-            header_lines(&mut lines, &resp.headers);
-            field(&mut lines, "body", format!("{} bytes", resp.body.len()));
-        }
-    }
-    lines
-}
-
-/// A header value as an owned `String`, case-insensitively, or `None`.
-fn header(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-}
-
-fn header_lines(lines: &mut Vec<Line<'static>>, headers: &HeaderMap) {
-    if headers.is_empty() {
-        field(lines, "—", "(none)");
-        return;
-    }
-    for (name, value) in headers {
-        field(
-            lines,
-            name.as_str(),
-            value.to_str().unwrap_or("<binary>").to_string(),
-        );
-    }
-}
-
-/// Split `a=1&b=2` style text into pairs, tolerating a missing `=`.
-fn parse_pairs(text: &str, separator: char) -> Vec<(String, String)> {
-    text.split(separator)
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| match part.split_once('=') {
-            Some((key, value)) => (key.to_string(), value.to_string()),
-            None => (part.to_string(), String::new()),
-        })
-        .collect()
 }
 
 /// Start line, then headers, then a blank line and the body preview.
@@ -2274,6 +2189,33 @@ mod tests {
         );
     }
 
+    /// Capture time is a column in the history, rendered as a local wall clock.
+    #[test]
+    fn history_shows_capture_time() {
+        let engine = Engine::new();
+        engine.record_request(get_request("http://example.com/foo"));
+        let mut app = App::new(engine);
+        app.refresh();
+
+        let out = render(&mut app);
+        assert!(out.contains("TIME"), "expected a TIME column: {out}");
+
+        // The recorded row should carry a real clock time, not the fallback.
+        let stamped = clock_time(app.flows[0].started_at);
+        assert!(
+            stamped.contains(':') && stamped != "--:--:--",
+            "expected a formatted time, got {stamped}"
+        );
+        assert!(out.contains(&stamped), "{stamped} should be shown: {out}");
+    }
+
+    /// A timestamp that cannot be represented renders as a placeholder rather
+    /// than a misleading number.
+    #[test]
+    fn an_unrepresentable_time_falls_back() {
+        assert_eq!(clock_time(i64::MAX), "--:--:--");
+    }
+
     /// Newest first, so the request you just made is at the top rather than
     /// somewhere below the fold on a busy target.
     #[test]
@@ -2349,7 +2291,13 @@ mod tests {
         let mut app = App::new(engine_with(1));
         app.refresh();
         let out = render(&mut app);
-        for chip in ["Proxy (P)", "Repeater (R)", "Inspect (I)", "Automate (A)"] {
+        for chip in [
+            "Proxy (P)",
+            "Intercept (I)",
+            "Repeater (R)",
+            "Sitemap (S)",
+            "Automate (A)",
+        ] {
             assert!(out.contains(chip), "missing tab {chip}:\n{out}");
         }
     }
@@ -2366,12 +2314,8 @@ mod tests {
         assert!(render(&mut app).contains("Repeater"));
 
         press(&mut app, "I");
-        assert_eq!(app.window, Window::Inspect);
-        assert!(
-            render(&mut app).contains("REQUEST HEADERS"),
-            "{}",
-            render(&mut app)
-        );
+        assert_eq!(app.window, Window::Intercept);
+        assert!(render(&mut app).contains("Queued requests"));
 
         press(&mut app, "A");
         assert_eq!(app.window, Window::Automate);
@@ -2392,30 +2336,6 @@ mod tests {
         assert_eq!(app.window, Window::Intercept);
         press(&mut app, "gT");
         assert_eq!(app.window, Window::Proxy);
-    }
-
-    /// Inspect pulls a request apart: query params and headers become fields.
-    #[test]
-    fn inspect_decomposes_the_selected_flow() {
-        let engine = Engine::new();
-        engine.record_request(CapturedRequest {
-            method: hudsucker::hyper::Method::GET,
-            uri: Uri::from_static("http://example.com/search?q=admin&page=2"),
-            version: Version::HTTP_11,
-            headers: {
-                let mut h = HeaderMap::new();
-                h.insert("x-token", "secret".parse().unwrap());
-                h
-            },
-            body: Bytes::new(),
-        });
-        let mut app = App::new(engine);
-        app.refresh();
-        press(&mut app, "I");
-        let out = render(&mut app);
-        assert!(out.contains("QUERY"), "{out}");
-        assert!(out.contains("admin"), "{out}");
-        assert!(out.contains("x-token"), "{out}");
     }
 
     /// Outside Proxy the motions scroll the content instead of a row cursor,
@@ -2496,17 +2416,17 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
         );
-        press(&mut app, "inspect");
+        press(&mut app, "sitemap");
         // The filter has narrowed to the one obvious match.
         let matches = app.palette_matches();
         assert_eq!(
             matches.first().map(|(l, _)| l.as_str()),
-            Some("Go to Inspect")
+            Some("Go to Sitemap")
         );
 
         key(&mut app, KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.input.mode(), Mode::Normal, "Enter closes the palette");
-        assert_eq!(app.window, Window::Inspect, "the chosen command ran");
+        assert_eq!(app.window, Window::Sitemap, "the chosen command ran");
     }
 
     #[test]
@@ -2646,7 +2566,7 @@ mod tests {
     fn intercept_starts_off_and_toggles() {
         let mut app = App::new(Engine::new());
         app.refresh();
-        press(&mut app, "C");
+        press(&mut app, "I");
         assert!(render(&mut app).contains("OFF"));
 
         press(&mut app, " i");
@@ -2798,7 +2718,7 @@ mod tests {
     fn holding_can_be_limited_to_one_leg() {
         let mut app = App::new(Engine::new());
         app.refresh();
-        press(&mut app, "C");
+        press(&mut app, "I");
         press(&mut app, " i");
         assert!(app.engine.intercept().holds_responses());
 
@@ -2834,7 +2754,7 @@ mod tests {
         }
 
         app.refresh();
-        press(&mut app, "C");
+        press(&mut app, "I");
         let out = render(&mut app);
         assert!(out.contains("#42"), "the held flow should be listed: {out}");
         assert!(out.contains("/secret"), "{out}");
