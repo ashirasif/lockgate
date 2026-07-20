@@ -32,9 +32,13 @@ use crate::scope::{Matcher, Target};
 // TUI reads: reconstruct `model` types from the database.
 // ===================================================================
 
-/// Lightweight history rows in id order, which is also capture order.
+/// Lightweight history rows, newest first.
+///
+/// Reverse capture order: the request you just made is the one you want to look
+/// at, and on a busy target it would otherwise be somewhere far below the fold.
+/// Matches the order the MCP's `query_flows` already returns.
 pub fn list_flows(conn: &Connection) -> rusqlite::Result<Vec<FlowSummary>> {
-    conn.prepare("SELECT id, method, uri, status FROM flow ORDER BY id")?
+    conn.prepare("SELECT id, method, uri, status FROM flow ORDER BY id DESC")?
         .query_map([], |r| {
             Ok(summary(
                 r.get(0)?,
@@ -60,8 +64,8 @@ pub fn list_flows_in_scope(
         return list_flows(conn);
     }
 
-    let mut stmt =
-        conn.prepare("SELECT id, method, uri, status, host, port, path FROM flow ORDER BY id")?;
+    let mut stmt = conn
+        .prepare("SELECT id, method, uri, status, host, port, path FROM flow ORDER BY id DESC")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             summary(

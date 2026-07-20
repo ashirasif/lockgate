@@ -181,14 +181,24 @@ impl App {
 
     /// Pull the latest history from the engine and keep the selection valid.
     fn refresh(&mut self) {
+        // History is newest-first, so every captured request inserts at row 0
+        // and pushes everything below it down. A selection kept as a row index
+        // would slide onto a different flow while the operator is reading it —
+        // so remember the flow *id* and put the cursor back on it.
+        let pinned = self.selected_id();
         self.flows = self.engine.list_flows();
 
-        match self.table.selected() {
-            None if !self.flows.is_empty() => self.table.select(Some(0)),
-            Some(i) if i >= self.flows.len() => {
-                self.table.select(self.flows.len().checked_sub(1));
-            }
-            _ => {}
+        match pinned.and_then(|id| self.flows.iter().position(|f| f.id == id)) {
+            Some(row) => self.table.select(Some(row)),
+            // Nothing pinned (first draw), or the pinned flow is gone: fall back
+            // to keeping the cursor in range.
+            None => match self.table.selected() {
+                None if !self.flows.is_empty() => self.table.select(Some(0)),
+                Some(i) if i >= self.flows.len() => {
+                    self.table.select(self.flows.len().checked_sub(1));
+                }
+                _ => {}
+            },
         }
 
         self.detail = self.selected_id().and_then(|id| self.engine.get_flow(id));
@@ -657,8 +667,13 @@ impl App {
         match command {
             Command::Quit => self.should_quit = true,
             Command::Resend => self.resend_selected(),
-            // `:42` is one-based, like vim's line numbers.
-            Command::Goto(n) => self.jump_to(n.saturating_sub(1)),
+            // `:42` addresses flow #42 — the number the gutter shows — not the
+            // 42nd row. With history newest-first the two no longer coincide,
+            // and the gutter is what the operator is reading off the screen.
+            Command::Goto(n) => match self.flows.iter().position(|f| f.id == n as u64) {
+                Some(row) => self.jump_to(row),
+                None => self.note(&format!("E486: no flow #{n}")),
+            },
             Command::Set { option, value } => {
                 self.options.insert(option.clone(), value);
                 self.note(&format!("set {option}={value}"));
@@ -1935,7 +1950,9 @@ mod tests {
             pattern: "/17".into(),
             backward: false,
         });
-        assert_eq!(app.cursor(), 17);
+        // Newest first: `/17` is the 17th of 20 captured, so it sits at row 2.
+        assert_eq!(app.cursor(), 2);
+        assert_eq!(app.selected_id(), Some(17));
     }
 
     /// `q` no longer quits — that key belongs to macro recording — so the
@@ -2002,15 +2019,70 @@ mod tests {
         let mut app = App::new(engine);
         app.refresh();
 
-        // Selection starts on the first flow, so the second's body isn't shown.
-        assert!(!render(&mut app).contains("missing-marker"));
-
-        // `j` moves down; the detail pane should follow to the second flow.
-        app.move_cursor(Motion::Down, None);
-        app.refresh();
+        // History is newest-first, so the cursor starts on `second` — the flow
+        // that has the response.
         let out = render(&mut app);
         assert!(out.contains("404"), "{out}");
         assert!(out.contains("missing-marker"), "{out}");
+
+        // `j` moves *down* the list, which is backwards in time, to `first`.
+        app.move_cursor(Motion::Down, None);
+        app.refresh();
+        let out = render(&mut app);
+        assert!(out.contains("/first"), "{out}");
+        assert!(
+            !out.contains("missing-marker"),
+            "the older flow has no response: {out}"
+        );
+    }
+
+    /// Newest first, so the request you just made is at the top rather than
+    /// somewhere below the fold on a busy target.
+    #[test]
+    fn history_is_newest_first() {
+        let engine = Engine::new();
+        engine.record_request(get_request("http://example.com/oldest"));
+        engine.record_request(get_request("http://example.com/newest"));
+
+        let mut app = App::new(engine);
+        app.refresh();
+        assert_eq!(app.flows[0].uri.path(), "/newest");
+        assert_eq!(app.flows[1].uri.path(), "/oldest");
+    }
+
+    /// New traffic inserts at the top and pushes rows down. The cursor has to
+    /// stay on the flow it was on, or it silently drifts onto another request
+    /// while the operator is reading it.
+    #[test]
+    fn selection_survives_new_traffic_arriving() {
+        let engine = Engine::new();
+        engine.record_request(get_request("http://example.com/watched"));
+
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        let watched = app.selected_id();
+        assert_eq!(app.cursor(), 0);
+
+        // Three more requests arrive; the watched flow is now three rows down.
+        for _ in 0..3 {
+            engine.record_request(get_request("http://example.com/noise"));
+        }
+        app.refresh();
+
+        assert_eq!(app.cursor(), 3, "the cursor should have followed its flow");
+        assert_eq!(app.selected_id(), watched, "and still point at it");
+    }
+
+    /// `:N` addresses the flow id shown in the gutter, not the Nth row.
+    #[test]
+    fn goto_addresses_a_flow_by_id() {
+        let mut app = App::new(engine_with(20));
+        app.refresh();
+        app.run_command("7");
+        assert_eq!(app.selected_id(), Some(7));
+
+        app.run_command("999");
+        assert_eq!(app.selected_id(), Some(7), "an unknown id should not move");
     }
 
     #[test]
