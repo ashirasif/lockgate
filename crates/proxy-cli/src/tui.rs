@@ -3080,7 +3080,55 @@ impl App {
                 &resp.body,
             ),
         };
-        frame.render_widget(pane(lines, " Response "), area);
+
+        // An upgraded flow's interesting part is not its response — that is a
+        // bare 101 — but the conversation that followed it.
+        let (title, lines) = match self.ws_messages() {
+            Some(frames) if !frames.is_empty() => {
+                (format!(" WebSocket ({}) ", frames.len()), frames)
+            }
+            _ => (" Response ".to_string(), lines),
+        };
+        frame.render_widget(pane(lines, title), area);
+    }
+
+    /// The frames on the selected flow, rendered oldest first.
+    ///
+    /// `None` when this flow is not an upgrade, so the caller can fall back to
+    /// showing the response.
+    fn ws_messages(&self) -> Option<Vec<Line<'static>>> {
+        let flow = self.detail.as_ref()?;
+        let is_upgrade = flow
+            .response
+            .as_ref()
+            .is_some_and(|r| r.status == hudsucker::hyper::StatusCode::SWITCHING_PROTOCOLS);
+        if !is_upgrade {
+            return None;
+        }
+
+        Some(
+            self.engine
+                .ws_messages(flow.id)
+                .iter()
+                .map(|m| {
+                    // Arrows rather than the stored "c2s"/"s2c": direction is
+                    // the thing you scan for, and a glyph reads faster.
+                    let (arrow, style) = match m.direction.as_str() {
+                        "c2s" => ("▶ ", Style::new().fg(Color::Cyan)),
+                        _ => ("◀ ", Style::new().fg(Color::Green)),
+                    };
+                    let text = match m.opcode.as_str() {
+                        "text" => String::from_utf8_lossy(&m.payload).to_string(),
+                        "close" => "(close)".to_string(),
+                        other => format!("({other}, {} bytes)", m.payload.len()),
+                    };
+                    Line::from(vec![
+                        Span::styled(arrow, style),
+                        Span::raw(text.replace('\n', " ")),
+                    ])
+                })
+                .collect(),
+        )
     }
 
     /// Vim's statusline: mode on the left, position and pending keys right.

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use http_body_util::BodyExt;
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse, WebSocketContext, WebSocketHandler,
-    hyper::{Method, Request, Response},
+    hyper::{Method, Request, Response, body::Bytes},
     tokio_tungstenite::tungstenite::Message,
 };
 
@@ -73,6 +73,41 @@ fn self_service(path: &str) -> Response<Body> {
         .expect("a fixed body always assembles")
 }
 
+fn is_websocket_upgrade(headers: &hudsucker::hyper::HeaderMap) -> bool {
+    headers
+        .get(hudsucker::hyper::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+}
+
+/// The `ws://`/`wss://` form of an upgrade target, matching how hudsucker
+/// rewrites the URI before handing frames to the handler.
+fn websocket_uri(uri: &hudsucker::hyper::Uri) -> String {
+    let mut parts = uri.clone().into_parts();
+    parts.scheme = Some(
+        match parts.scheme.as_ref().map(|s| s.as_str()) {
+            Some("https") => "wss",
+            _ => "ws",
+        }
+        .try_into()
+        .expect("ws and wss are valid schemes"),
+    );
+    hudsucker::hyper::Uri::from_parts(parts)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| uri.to_string())
+}
+
+/// Stands in for the 101 hudsucker sends on our behalf, so an upgraded flow
+/// reads as completed rather than as a request still in flight.
+fn switching_protocols() -> CapturedResponse {
+    CapturedResponse {
+        status: hudsucker::hyper::StatusCode::SWITCHING_PROTOCOLS,
+        version: hudsucker::hyper::Version::HTTP_11,
+        headers: hudsucker::hyper::HeaderMap::new(),
+        body: Bytes::new(),
+    }
+}
+
 /// One of these is cloned per connection by hudsucker. `pending` is therefore a
 /// per-connection FIFO: for HTTP/1.1 requests and responses are strictly ordered,
 /// so pushing the id in `handle_request` and popping it in `handle_response`
@@ -93,11 +128,7 @@ impl ProxyHandler {
 }
 
 impl HttpHandler for ProxyHandler {
-    async fn handle_request(
-        &mut self,
-        _ctx: &HttpContext,
-        req: Request<Body>,
-    ) -> RequestOrResponse {
+    async fn handle_request(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
         let (parts, body) = req.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
 
@@ -118,6 +149,36 @@ impl HttpHandler for ProxyHandler {
             .is_some_and(|host| SELF_HOSTS.contains(&host.to_ascii_lowercase().as_str()))
         {
             return RequestOrResponse::Response(self_service(parts.uri.path()));
+        }
+
+        // A WebSocket upgrade never reaches `handle_response`: hudsucker answers
+        // the 101 itself via hyper_tungstenite and then pumps frames, so this
+        // exchange has no response leg to pair with. It therefore must not join
+        // the pending FIFO — an id pushed here and never popped would pair the
+        // *next* response on this connection with the wrong request.
+        if is_websocket_upgrade(&parts.headers) {
+            let id = self.engine.reserve_flow_id();
+            let captured = CapturedRequest {
+                method: parts.method.clone(),
+                uri: parts.uri.clone(),
+                version: parts.version,
+                headers: parts.headers.clone(),
+                body: bytes.clone(),
+            };
+            self.engine.record_request_as(id, captured);
+            // Synthesized, because the real 101 is hudsucker's and we never see
+            // it. Without this the flow sits pending forever, which reads as a
+            // request that never completed rather than a socket that opened.
+            self.engine.record_response(id, switching_protocols());
+
+            // Frames name the endpoint with a ws/wss scheme — hudsucker rewrites
+            // it before upgrading — so register under that form or the lookup
+            // will never match.
+            self.engine
+                .note_upgrade(ctx.client_addr, &websocket_uri(&parts.uri), id);
+
+            let req = Request::from_parts(parts, Body::from(bytes));
+            return RequestOrResponse::Request(req);
         }
 
         // Reserve the id before holding: the operator may edit the request, and
@@ -221,7 +282,33 @@ impl HttpHandler for ProxyHandler {
 }
 
 impl WebSocketHandler for ProxyHandler {
-    async fn handle_message(&mut self, _ctx: &WebSocketContext, msg: Message) -> Option<Message> {
+    /// Record the frame and pass it through untouched.
+    ///
+    /// Observation only, deliberately: intercepting a frame means holding one
+    /// side of a live full-duplex conversation, which reorders it relative to
+    /// the other side. Recording is the useful half and cannot break anything.
+    async fn handle_message(&mut self, ctx: &WebSocketContext, msg: Message) -> Option<Message> {
+        let (client, server, direction) = match ctx {
+            WebSocketContext::ClientToServer { src, dst, .. } => (*src, dst.to_string(), "c2s"),
+            WebSocketContext::ServerToClient { src, dst, .. } => (*dst, src.to_string(), "s2c"),
+        };
+
+        // No slot means the upgrade was not recorded — a socket opened before
+        // this handler existed, or a reconnect that lost the race on the key.
+        // Nothing to attach the frame to, so let it through unrecorded rather
+        // than inventing a flow for it.
+        if let Some((flow, seq)) = self.engine.ws_frame_slot(client, &server) {
+            let (opcode, payload) = match &msg {
+                Message::Text(text) => ("text", Bytes::copy_from_slice(text.as_bytes())),
+                Message::Binary(bytes) => ("binary", Bytes::copy_from_slice(bytes)),
+                Message::Ping(bytes) => ("ping", Bytes::copy_from_slice(bytes)),
+                Message::Pong(bytes) => ("pong", Bytes::copy_from_slice(bytes)),
+                Message::Close(_) => ("close", Bytes::new()),
+                Message::Frame(_) => ("binary", Bytes::new()),
+            };
+            self.engine
+                .record_ws_message(flow, seq, direction, opcode, payload);
+        }
         Some(msg)
     }
 }

@@ -19,5 +19,8 @@ regex = { workspace = true }
 
 # Integration tests read the database back with their own connection.
 [dev-dependencies]
+# WebSocket client for the capture tests. The proxy speaks this via hudsucker.
+tokio-tungstenite = "0.24"
+futures = "0.3"
 rusqlite = { workspace = true }
 tokio = { workspace = true }

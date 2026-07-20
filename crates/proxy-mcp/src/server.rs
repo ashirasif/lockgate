@@ -62,6 +62,35 @@ const STATUSES: &[&str] = &[
     "wont_fix",
 ];
 
+// --- websockets ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct FlowIdParams {
+    pub flow_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct WsMessageDto {
+    /// Order on the socket, from 0.
+    pub seq: i64,
+    /// "c2s" (client to server) or "s2c".
+    pub direction: String,
+    /// "text", "binary", "ping", "pong" or "close".
+    pub opcode: String,
+    pub sent_at: i64,
+    pub len: i64,
+    /// The payload as text when it is valid UTF-8, base64 otherwise.
+    pub text: Option<String>,
+    pub base64: Option<String>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListWsMessagesResult {
+    pub flow_id: i64,
+    pub count: i64,
+    pub messages: Vec<WsMessageDto>,
+}
+
 // --- intercept ---
 
 /// One held item, as listed. The payload is summarised rather than inlined:
@@ -610,6 +639,39 @@ impl ProxyServer {
                 None,
             )
         })
+    }
+
+    #[tool(
+        description = "List the WebSocket frames on a flow, oldest first. A flow is a \
+                       WebSocket if its status is 101; the frames are the conversation \
+                       that followed the upgrade. Frames are observed, not intercepted."
+    )]
+    async fn list_ws_messages(
+        &self,
+        Parameters(p): Parameters<FlowIdParams>,
+    ) -> Result<Json<ListWsMessagesResult>, ErrorData> {
+        let messages: Vec<WsMessageDto> = self
+            .engine
+            .ws_messages(p.flow_id as u64)
+            .into_iter()
+            .map(|m| {
+                let (text, base64) = encode_bytes(&m.payload);
+                WsMessageDto {
+                    seq: m.seq,
+                    direction: m.direction,
+                    opcode: m.opcode,
+                    sent_at: m.sent_at,
+                    len: m.payload.len() as i64,
+                    text,
+                    base64,
+                }
+            })
+            .collect();
+        Ok(Json(ListWsMessagesResult {
+            flow_id: p.flow_id,
+            count: messages.len() as i64,
+            messages,
+        }))
     }
 
     // --- scope ---

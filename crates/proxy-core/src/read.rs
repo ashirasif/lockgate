@@ -582,6 +582,53 @@ pub fn flow_detail(conn: &Connection, id: i64) -> rusqlite::Result<Option<FlowDe
 /// Bodies live in the `body` table (inline) or in `blobs/` (spilled), keyed by
 /// digest; this resolves whichever and returns the requested slice. `blobs_root`
 /// is the project's `blobs/` directory, needed only for the spilled case.
+/// One WebSocket frame, as stored.
+#[derive(Debug, Clone)]
+pub struct WsMessage {
+    pub seq: i64,
+    /// "c2s" (client to server) or "s2c".
+    pub direction: String,
+    /// "text", "binary", "ping", "pong" or "close".
+    pub opcode: String,
+    pub sent_at: i64,
+    pub payload: Bytes,
+}
+
+/// Every frame on one flow, oldest first.
+///
+/// Payloads are read in full rather than windowed: frames are individually
+/// small — a socket carries many, not one large one — and the interesting thing
+/// about them is the sequence, which a window would break up.
+pub fn ws_messages(
+    conn: &Connection,
+    paths: &ProjectPaths,
+    flow_id: i64,
+) -> rusqlite::Result<Vec<WsMessage>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, direction, opcode, sent_at, body_id
+           FROM ws_message WHERE flow_id = ?1 ORDER BY seq",
+    )?;
+    let rows: Vec<(i64, String, String, i64, Option<i64>)> = stmt
+        .query_map([flow_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    // Bodies are loaded after the statement rather than inside the mapping, so
+    // the same spill-aware path serves frames as serves HTTP bodies.
+    rows.into_iter()
+        .map(|(seq, direction, opcode, sent_at, body_id)| {
+            Ok(WsMessage {
+                seq,
+                direction,
+                opcode,
+                sent_at,
+                payload: load_body(conn, paths, body_id)?,
+            })
+        })
+        .collect()
+}
+
 pub fn body_slice(
     conn: &Connection,
     blobs_root: &Path,

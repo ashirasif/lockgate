@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
@@ -34,7 +35,18 @@ pub struct Engine {
     /// Traffic held in flight awaiting an operator verdict. Off by default, so
     /// an engine nobody is watching never holds anything.
     intercept: Intercept,
+    /// Open WebSocket upgrades, keyed by the only thing a frame carries: the
+    /// client address and the server URI. The value is the flow the upgrade
+    /// came from, plus a per-socket frame counter.
+    sockets: Mutex<HashMap<SocketKey, OpenSocket>>,
 }
+
+/// What a WebSocket frame can identify itself by: nothing more than where it
+/// came from and where it is going.
+type SocketKey = (std::net::SocketAddr, String);
+
+/// The flow whose upgrade opened a socket, and its running frame counter.
+type OpenSocket = (FlowId, Arc<AtomicI64>);
 
 /// How captured traffic is stored, and where reads come from.
 enum Persist {
@@ -120,6 +132,7 @@ impl Engine {
                 paths: ProjectPaths::new(std::env::temp_dir()),
             },
             intercept: Intercept::default(),
+            sockets: Mutex::new(HashMap::new()),
         })
     }
 
@@ -143,6 +156,7 @@ impl Engine {
                 paths,
             },
             intercept: Intercept::default(),
+            sockets: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -300,6 +314,64 @@ impl Engine {
                 None
             })
             .unwrap_or_default()
+    }
+
+    // --- websockets ---
+    //
+    // Frames arrive with no reference to the exchange that opened the socket —
+    // hudsucker gives a client address and a server URI and nothing else. So an
+    // upgrade registers itself here, and frames look themselves up by the same
+    // pair. Rapid reconnects to the same endpoint are ambiguous under that key,
+    // which is why the newest upgrade wins.
+
+    /// Remember that this flow's response was a 101, so its frames can find it.
+    pub fn note_upgrade(&self, client: std::net::SocketAddr, server: &str, flow: FlowId) {
+        let mut sockets = self.sockets.lock().unwrap();
+        // Bounded: a long session opens and closes many sockets, and this map
+        // would otherwise grow for the life of the process.
+        if sockets.len() > 512 {
+            sockets.clear();
+        }
+        sockets.insert(
+            (client, server.to_string()),
+            (flow, Arc::new(AtomicI64::new(0))),
+        );
+    }
+
+    /// The flow a frame belongs to, and the next sequence number on it.
+    pub fn ws_frame_slot(
+        &self,
+        client: std::net::SocketAddr,
+        server: &str,
+    ) -> Option<(FlowId, i64)> {
+        let sockets = self.sockets.lock().unwrap();
+        let (flow, seq) = sockets.get(&(client, server.to_string()))?;
+        Some((*flow, seq.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    /// Record one frame.
+    pub fn record_ws_message(
+        &self,
+        flow_id: FlowId,
+        seq: i64,
+        direction: &'static str,
+        opcode: &'static str,
+        payload: hudsucker::hyper::body::Bytes,
+    ) {
+        self.write(WriteEvent::WsMessage {
+            flow_id,
+            seq,
+            direction,
+            opcode,
+            sent_at: now_micros(),
+            payload,
+        });
+    }
+
+    /// Every frame on a flow, in order.
+    pub fn ws_messages(&self, flow_id: FlowId) -> Vec<crate::read::WsMessage> {
+        let paths = self.paths().clone();
+        self.read(|conn| crate::read::ws_messages(conn, &paths, flow_id as i64))
     }
 
     // --- scope ---

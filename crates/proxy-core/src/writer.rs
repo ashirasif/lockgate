@@ -6,6 +6,7 @@
 
 use std::sync::Mutex;
 
+use hudsucker::hyper::body::Bytes;
 use hudsucker::hyper::header::{CONTENT_TYPE, HOST};
 use hudsucker::hyper::{HeaderMap, Uri};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -90,6 +91,22 @@ pub enum WriteEvent {
         id: FlowId,
         ended_at: i64,
         response: CapturedResponse,
+    },
+    /// One WebSocket frame, on a connection that was upgraded from `flow_id`.
+    ///
+    /// Frames are not requests: there is no pairing, no status, and a
+    /// connection may carry thousands. They get their own table and their
+    /// bodies go through the same interning as HTTP bodies, so a chat client
+    /// repeating the same heartbeat costs one copy.
+    WsMessage {
+        flow_id: FlowId,
+        seq: i64,
+        /// "c2s" or "s2c".
+        direction: &'static str,
+        /// "text", "binary", "ping", "pong", "close".
+        opcode: &'static str,
+        sent_at: i64,
+        payload: Bytes,
     },
     /// Set a flow's triage comment and/or highlight. `None` leaves that column
     /// unchanged; `Some` sets it (an empty string clears it to the empty string).
@@ -289,6 +306,22 @@ pub(crate) fn write_batch(
                 touch_sitemap(&tx, &host, &path, started_at)?;
             }
 
+            WriteEvent::WsMessage {
+                flow_id,
+                seq,
+                direction,
+                opcode,
+                sent_at,
+                payload,
+            } => {
+                let body_id = intern_body(&tx, paths, &payload)?;
+                tx.execute(
+                    "INSERT INTO ws_message
+                        (flow_id, seq, direction, opcode, sent_at, body_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![flow_id, seq, direction, opcode, sent_at, body_id],
+                )?;
+            }
             WriteEvent::Response {
                 id,
                 ended_at,
