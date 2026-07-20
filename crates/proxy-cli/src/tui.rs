@@ -680,6 +680,17 @@ impl App {
         let register = self.yank.clone();
         let mut yanked = None;
         let mut selection_changed = false;
+        // Only an explicit yank reaches the system clipboard. Deleting fills
+        // the internal register too — that is what makes `dd` then `p` a move —
+        // but having every `x` and `dw` clobber the clipboard would make it
+        // useless for carrying a token to another window.
+        let copies_out = matches!(
+            cmd,
+            Command::Operate {
+                op: Operator::Yank,
+                ..
+            } | Command::VisualOperate(Operator::Yank)
+        );
 
         let Some(buffer) = self.active_buffer() else {
             return;
@@ -805,6 +816,9 @@ impl App {
         // clearing it to an empty string.
         if let Some(yanked) = yanked {
             if !yanked.text.is_empty() {
+                if copies_out {
+                    self.copy_out(&yanked.text);
+                }
                 self.yank = yanked;
             }
         }
@@ -819,6 +833,24 @@ impl App {
             }
         ) {
             self.note("`.` repeat is not implemented — use e for $EDITOR");
+        }
+    }
+
+    /// Put a yank on the system clipboard, reporting rather than failing.
+    ///
+    /// A clipboard that did not take is worth saying out loud: the text is
+    /// still in our own register, so `p` works, and the operator would
+    /// otherwise only discover it after switching windows to paste.
+    fn copy_out(&self, text: &str) {
+        let chars = text.chars().count();
+        match crate::clipboard::copy(text) {
+            Ok(()) => self.note(&format!("yanked {chars} char(s) → clipboard")),
+            // Off a terminal there is no clipboard to reach and nothing went
+            // wrong, so report the yank plainly rather than as a failure.
+            Err(crate::clipboard::ClipboardError::NotATerminal) => {
+                self.note(&format!("yanked {chars} char(s)"))
+            }
+            Err(e) => self.note(&format!("yanked {chars} char(s); clipboard failed: {e}")),
         }
     }
 
@@ -1700,7 +1732,7 @@ impl App {
                 ),
                 Span::styled(
                     if self.intercept.pane == Pane::Preview {
-                        "   vim: w/W b/B e f{c} v/V ciw di\" 2dd yy p u   <Esc> back"
+                        "   vim: w/W b/B f{c} v/V ciw di\" 2dd  yy→clipboard  u   <Esc> back"
                     } else {
                         "   <CR> open  e $EDITOR  f forward  d drop  F/D all  ^w pane  <Space>i hold"
                     },
@@ -3528,6 +3560,45 @@ mod tests {
             assert_eq!(app.yank.text, expected, "`{keys}` yanked the wrong text");
             assert_eq!(app.yank.linewise, linewise, "`{keys}` wrong shape");
         }
+    }
+
+    /// An explicit yank reports going to the clipboard; a delete does not.
+    /// Deletes fill the internal register so `dd`+`p` is a move, but having
+    /// every `x` clobber the system clipboard would make it useless for
+    /// carrying a token to another window.
+    #[test]
+    fn only_explicit_yanks_reach_the_clipboard() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        press(&mut app, "yy");
+        let note = app.status.lock().unwrap().clone();
+        assert!(
+            note.starts_with("yanked"),
+            "expected a yank note, got {note:?}"
+        );
+
+        // Clear it, or the previous yank's note is what we would read back.
+        app.note("");
+        press(&mut app, "dd");
+        let note = app.status.lock().unwrap().clone();
+        assert!(
+            !note.contains("yanked"),
+            "a delete should not announce a clipboard write: {note:?}"
+        );
+        // ...but it still filled the register.
+        assert_eq!(app.yank.text, "GET /req-path HTTP/1.1");
+    }
+
+    /// Visual yank copies out too — it is just as explicit as `yy`.
+    #[test]
+    fn visual_yank_reaches_the_clipboard() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        press(&mut app, "vlly");
+        let note = app.status.lock().unwrap().clone();
+        assert!(note.starts_with("yanked"), "got {note:?}");
+        assert_eq!(app.yank.text, "GET");
     }
 
     /// A yank must not change the buffer — the classic way to get this wrong is
