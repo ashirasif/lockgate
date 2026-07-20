@@ -22,6 +22,57 @@ fn dropped_response() -> Response<Body> {
         .expect("a status and a fixed body always assemble")
 }
 
+/// Hosts that mean "the proxy itself" rather than somewhere to forward to.
+///
+/// Burp answers on `burp`, mitmproxy on `mitm.it`; the idea is the same and it
+/// is the only practical way to get a CA onto a phone, where you cannot copy a
+/// file off the laptop. Anything already configured to use this proxy can just
+/// browse here.
+const SELF_HOSTS: &[&str] = &["proxy", "proxy.local", "proxy.ca"];
+
+/// Serve the CA certificate, or a page pointing at it.
+///
+/// Deliberately HTTP-only and only reachable *through* the proxy: it is not
+/// bound to a port anyone else can reach, and a client that is not already
+/// using this proxy cannot get here at all.
+fn self_service(path: &str) -> Response<Body> {
+    // `application/x-x509-ca-cert` is what makes iOS and Android offer to
+    // install it rather than download it as a file.
+    if path.starts_with("/ca.cer") || path.starts_with("/ca.crt") {
+        return Response::builder()
+            .status(hudsucker::hyper::StatusCode::OK)
+            .header("content-type", "application/x-x509-ca-cert")
+            .header(
+                "content-disposition",
+                "attachment; filename=\"proxy-ca.cer\"",
+            )
+            .body(Body::from(crate::ca::certificate_pem()))
+            .expect("a fixed body always assembles");
+    }
+
+    let page = concat!(
+        "<!doctype html><html><head><title>proxy</title>",
+        "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
+        "<style>body{font:16px/1.5 system-ui;margin:3rem auto;max-width:34rem;padding:0 1rem}",
+        "a{display:inline-block;padding:.6rem 1rem;border:1px solid;border-radius:.4rem;",
+        "text-decoration:none}code{background:#8881;padding:.1rem .3rem}</style></head><body>",
+        "<h1>proxy</h1><p>You are going through this proxy. Install its CA to intercept HTTPS.</p>",
+        "<p><a href=\"/ca.cer\">Download CA certificate</a></p>",
+        "<p><small>macOS: open it, then trust it in Keychain Access. ",
+        "iOS: install the profile, then enable it under General &rarr; About &rarr; ",
+        "Certificate Trust Settings. Android: Settings &rarr; Security &rarr; ",
+        "Install from storage. Firefox has its own store &mdash; import it in Settings.</small></p>",
+        "<p><small>Anything trusting this CA can have its traffic read by whoever holds ",
+        "the key. Remove it when you are done.</small></p>",
+        "</body></html>"
+    );
+    Response::builder()
+        .status(hudsucker::hyper::StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from(page))
+        .expect("a fixed body always assembles")
+}
+
 /// One of these is cloned per connection by hudsucker. `pending` is therefore a
 /// per-connection FIFO: for HTTP/1.1 requests and responses are strictly ordered,
 /// so pushing the id in `handle_request` and popping it in `handle_response`
@@ -56,6 +107,17 @@ impl HttpHandler for ProxyHandler {
         if parts.method == Method::CONNECT {
             let req = Request::from_parts(parts, Body::from(bytes));
             return RequestOrResponse::Request(req);
+        }
+
+        // Answered by us rather than forwarded, and not recorded: this is the
+        // proxy's own console, not captured traffic, and putting it in history
+        // would be noise in the one view you want clean.
+        if parts
+            .uri
+            .host()
+            .is_some_and(|host| SELF_HOSTS.contains(&host.to_ascii_lowercase().as_str()))
+        {
+            return RequestOrResponse::Response(self_service(parts.uri.path()));
         }
 
         // Reserve the id before holding: the operator may edit the request, and

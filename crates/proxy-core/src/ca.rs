@@ -9,6 +9,14 @@ use hudsucker::{
 /// The CA is embedded at compile time. `ca.key` is gitignored, so a fresh clone
 /// won't build until you generate your own — which is intentional: a CA private
 /// key is a per-machine secret.
+/// The CA certificate in PEM form, for installing on a device under test.
+///
+/// The same bytes the authority signs with, so what you trust is what is doing
+/// the intercepting — no chance of handing out a stale or unrelated cert.
+pub fn certificate_pem() -> &'static str {
+    include_str!("ca/ca.cer")
+}
+
 pub fn authority() -> RcgenAuthority {
     let key_pem = include_str!("ca/ca.key");
     let cert_pem = include_str!("ca/ca.cer");
