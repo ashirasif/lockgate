@@ -1,3 +1,4 @@
+mod args;
 mod clipboard;
 mod command;
 mod editor;
@@ -7,19 +8,11 @@ mod syntax;
 mod tui;
 mod vim;
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use proxy_core::model::now_micros;
 use proxy_core::{Engine, Registry};
 use tracing::{error, info, warn};
-
-const LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000);
-
-/// The MCP server binds here; clients connect to `http://127.0.0.1:3001/mcp`.
-/// Loopback only, so captured traffic is never exposed off the machine. A port
-/// beside the proxy's, not stdio, because the TUI owns this process's stdio.
-const MCP_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3001);
 
 /// How long to wait for the writer to drain before giving up on it.
 ///
@@ -80,24 +73,56 @@ fn init_logging() {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let args = match args::parse(std::env::args().skip(1)) {
+        args::Parsed::Run(args) => *args,
+        args::Parsed::Print(text) => {
+            print!("{text}");
+            return Ok(());
+        }
+        args::Parsed::Error(e) => {
+            eprintln!("proxy: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Before logging or any of the setup: this writes a file and leaves, and
+    // has no business opening a database or claiming a port to do it.
+    if let Some(path) = &args.export_ca {
+        std::fs::write(path, proxy_core::ca::certificate_pem())?;
+        println!("wrote the CA certificate to {}", path.display());
+        return Ok(());
+    }
+
     init_logging();
 
-    let data_dir = data_dir();
+    let data_dir = args.data_dir.clone().unwrap_or_else(data_dir);
     let registry =
         Registry::open(&data_dir.join("registry.db")).expect("failed to open project registry");
+    // `create` is idempotent on the path, so this both makes a new project and
+    // reopens an existing one — naming a project is how you switch to it.
     let project = registry
-        .create("default", &data_dir.join("projects/default"), now_micros())
-        .expect("failed to create default project");
+        .create(
+            &args.project,
+            &data_dir.join("projects").join(&args.project),
+            now_micros(),
+        )
+        .expect("failed to open project");
     registry
         .touch(project.id, now_micros())
         .expect("failed to update project");
 
     let engine = Engine::open_project(&project.path).expect("failed to open project");
+    info!(
+        project = %args.project,
+        proxy = %args.proxy_addr(),
+        "started"
+    );
 
     // Proxy runs in the background; the TUI runs on the main task.
     let proxy_engine = engine.clone();
+    let proxy_addr = args.proxy_addr();
     tokio::spawn(async move {
-        if let Err(e) = proxy_core::serve(proxy_engine, LISTEN_ADDR).await {
+        if let Err(e) = proxy_core::serve(proxy_engine, proxy_addr).await {
             error!(error = %e, "proxy stopped");
         }
     });
@@ -105,12 +130,18 @@ async fn main() -> std::io::Result<()> {
     // MCP server shares the same engine, in-process, so there is one SQLite
     // writer. A failure here (e.g. the port is taken) must not take the proxy or
     // TUI down: log it and carry on without the MCP.
-    let mcp_engine = engine.clone();
-    tokio::spawn(async move {
-        if let Err(e) = proxy_mcp::serve(mcp_engine, MCP_ADDR).await {
-            error!(error = %e, "MCP server stopped");
-        }
-    });
+    //
+    // Port 0 means the operator turned it off — running a second instance
+    // otherwise logs a bind failure that looks like a bug.
+    if args.mcp_port != 0 {
+        let mcp_engine = engine.clone();
+        let mcp_addr = args.mcp_addr();
+        tokio::spawn(async move {
+            if let Err(e) = proxy_mcp::serve(mcp_engine, mcp_addr).await {
+                error!(error = %e, "MCP server stopped");
+            }
+        });
+    }
 
     // Whichever way we leave — clean quit, TUI error, or a signal — the writer
     // has to drain first, or the last batch of captured traffic dies with the
