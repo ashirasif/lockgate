@@ -170,8 +170,8 @@ impl HostMatcher {
                 .map(HostMatcher::Regex)
                 .map_err(|_| ScopeError::BadRegex(pattern.to_string())),
             HostKind::Cidr => {
-                let (addr, bits) = parse_cidr(pattern)
-                    .ok_or_else(|| ScopeError::BadCidr(pattern.to_string()))?;
+                let (addr, bits) =
+                    parse_cidr(pattern).ok_or_else(|| ScopeError::BadCidr(pattern.to_string()))?;
                 Ok(HostMatcher::Cidr(addr, bits))
             }
         }

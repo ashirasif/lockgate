@@ -90,8 +90,12 @@ pub enum Window {
 
 impl Window {
     /// Left-to-right tab order, and the set `gt` / `gT` cycle through.
-    pub const ALL: [Window; 4] =
-        [Window::Proxy, Window::Repeater, Window::Inspect, Window::Automate];
+    pub const ALL: [Window; 4] = [
+        Window::Proxy,
+        Window::Repeater,
+        Window::Inspect,
+        Window::Automate,
+    ];
 
     /// The name shown in the tab strip.
     pub fn label(self) -> &'static str {
@@ -145,7 +149,10 @@ pub enum PaletteKey {
 pub enum Action {
     /// `count` is `None` when the user typed no count, which matters: bare `G`
     /// goes to the last line, but `12G` goes to line 12.
-    Move { motion: Motion, count: Option<usize> },
+    Move {
+        motion: Motion,
+        count: Option<usize>,
+    },
     Scroll(Scroll),
     SetMark(char),
     GotoMark(char),
@@ -156,7 +163,10 @@ pub enum Action {
     /// A completed `:` line, without the leading colon.
     Command(String),
     /// A completed `/` or `?` line, without the leading slash.
-    Search { pattern: String, backward: bool },
+    Search {
+        pattern: String,
+        backward: bool,
+    },
     /// `<Space>r` — replay the selection through the Repeater.
     Resend,
     /// `P` / `R` / `I` / `A` — jump straight to a named window.
@@ -367,7 +377,11 @@ impl Input {
             Bind::JumpForward => Action::JumpForward,
             Bind::Mode(mode) => {
                 // `v` in Visual mode toggles back out, as in vim.
-                let next = if self.mode == mode { Mode::Normal } else { mode };
+                let next = if self.mode == mode {
+                    Mode::Normal
+                } else {
+                    mode
+                };
                 self.mode = next;
                 Action::ModeChange(next)
             }
@@ -415,7 +429,10 @@ impl Input {
                 let rest = chars.as_str().to_string();
                 Some(match kind {
                     ':' => Action::Command(rest),
-                    _ => Action::Search { pattern: rest, backward: kind == '?' },
+                    _ => Action::Search {
+                        pattern: rest,
+                        backward: kind == '?',
+                    },
                 })
             }
             KeyCode::Char(c) => {
@@ -472,7 +489,11 @@ fn resolve(pending: &[String]) -> Resolution {
         partial |= sequence.starts_with(&typed);
     }
 
-    if partial { Resolution::Partial } else { Resolution::None }
+    if partial {
+        Resolution::Partial
+    } else {
+        Resolution::None
+    }
 }
 
 /// A mark argument must be one plain character — `ma`, never `m<C-d>`.
@@ -527,20 +548,44 @@ mod tests {
 
     #[test]
     fn plain_motion_carries_no_count() {
-        assert_eq!(last("j"), Action::Move { motion: Motion::Down, count: None });
+        assert_eq!(
+            last("j"),
+            Action::Move {
+                motion: Motion::Down,
+                count: None
+            }
+        );
     }
 
     #[test]
     fn digits_accumulate_into_a_count() {
-        assert_eq!(last("12j"), Action::Move { motion: Motion::Down, count: Some(12) });
+        assert_eq!(
+            last("12j"),
+            Action::Move {
+                motion: Motion::Down,
+                count: Some(12)
+            }
+        );
     }
 
     /// Bare `G` means "last line" but `12G` means "line 12" — so the absence of
     /// a count has to survive as `None` rather than collapsing to 1.
     #[test]
     fn count_presence_is_distinguishable() {
-        assert_eq!(last("G"), Action::Move { motion: Motion::Bottom, count: None });
-        assert_eq!(last("12G"), Action::Move { motion: Motion::Bottom, count: Some(12) });
+        assert_eq!(
+            last("G"),
+            Action::Move {
+                motion: Motion::Bottom,
+                count: None
+            }
+        );
+        assert_eq!(
+            last("12G"),
+            Action::Move {
+                motion: Motion::Bottom,
+                count: Some(12)
+            }
+        );
     }
 
     /// A leading `0` is a motion in vim, not the start of a number.
@@ -548,18 +593,35 @@ mod tests {
     fn leading_zero_is_not_a_count() {
         let mut input = Input::new();
         assert!(feed(&mut input, "0").is_empty());
-        assert_eq!(input.pending_display(), "", "0 should not be buffered as a count");
-        assert_eq!(last("10j"), Action::Move { motion: Motion::Down, count: Some(10) });
+        assert_eq!(
+            input.pending_display(),
+            "",
+            "0 should not be buffered as a count"
+        );
+        assert_eq!(
+            last("10j"),
+            Action::Move {
+                motion: Motion::Down,
+                count: Some(10)
+            }
+        );
     }
 
     #[test]
     fn multi_key_sequences_wait_for_completion() {
         let mut input = Input::new();
         assert!(input.feed(KeyEvent::from(KeyCode::Char('g'))).is_none());
-        assert_eq!(input.pending_display(), "g", "half-typed keys should be visible");
+        assert_eq!(
+            input.pending_display(),
+            "g",
+            "half-typed keys should be visible"
+        );
         assert_eq!(
             input.feed(KeyEvent::from(KeyCode::Char('g'))),
-            Some(Action::Move { motion: Motion::Top, count: None })
+            Some(Action::Move {
+                motion: Motion::Top,
+                count: None
+            })
         );
         assert_eq!(input.pending_display(), "");
     }
@@ -591,9 +653,15 @@ mod tests {
     #[test]
     fn visual_mode_toggles_and_escape_exits() {
         let mut input = Input::new();
-        assert_eq!(input.feed(KeyEvent::from(KeyCode::Char('v'))), Some(Action::ModeChange(Mode::Visual)));
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Char('v'))),
+            Some(Action::ModeChange(Mode::Visual))
+        );
         assert_eq!(input.mode(), Mode::Visual);
-        assert_eq!(input.feed(KeyEvent::from(KeyCode::Esc)), Some(Action::ModeChange(Mode::Normal)));
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Esc)),
+            Some(Action::ModeChange(Mode::Normal))
+        );
         assert_eq!(input.mode(), Mode::Normal);
     }
 
@@ -602,7 +670,13 @@ mod tests {
     fn visual_mode_still_moves() {
         let mut input = Input::new();
         input.feed(KeyEvent::from(KeyCode::Char('v')));
-        assert_eq!(last("j"), Action::Move { motion: Motion::Down, count: None });
+        assert_eq!(
+            last("j"),
+            Action::Move {
+                motion: Motion::Down,
+                count: None
+            }
+        );
         assert_eq!(input.mode(), Mode::Visual);
     }
 
@@ -627,7 +701,10 @@ mod tests {
         feed(&mut input, "admin");
         assert_eq!(
             input.feed(KeyEvent::from(KeyCode::Enter)),
-            Some(Action::Search { pattern: "admin".into(), backward: false })
+            Some(Action::Search {
+                pattern: "admin".into(),
+                backward: false
+            })
         );
 
         let mut input = Input::new();
@@ -635,7 +712,10 @@ mod tests {
         feed(&mut input, "admin");
         assert_eq!(
             input.feed(KeyEvent::from(KeyCode::Enter)),
-            Some(Action::Search { pattern: "admin".into(), backward: true })
+            Some(Action::Search {
+                pattern: "admin".into(),
+                backward: true
+            })
         );
     }
 
@@ -647,7 +727,11 @@ mod tests {
         input.feed(KeyEvent::from(KeyCode::Backspace));
         assert_eq!(input.mode(), Mode::Command);
         input.feed(KeyEvent::from(KeyCode::Backspace));
-        assert_eq!(input.mode(), Mode::Normal, "erasing the ':' should abandon the prompt");
+        assert_eq!(
+            input.mode(),
+            Mode::Normal,
+            "erasing the ':' should abandon the prompt"
+        );
     }
 
     #[test]
@@ -655,7 +739,10 @@ mod tests {
         let mut input = Input::new();
         assert_eq!(
             input.feed(ctrl('d')),
-            Some(Action::Move { motion: Motion::HalfPageDown, count: None })
+            Some(Action::Move {
+                motion: Motion::HalfPageDown,
+                count: None
+            })
         );
         assert_eq!(input.feed(ctrl('o')), Some(Action::JumpBack));
     }
@@ -665,7 +752,10 @@ mod tests {
     fn leader_sequence_triggers_resend() {
         let mut input = Input::new();
         assert!(input.feed(KeyEvent::from(KeyCode::Char(' '))).is_none());
-        assert_eq!(input.feed(KeyEvent::from(KeyCode::Char('r'))), Some(Action::Resend));
+        assert_eq!(
+            input.feed(KeyEvent::from(KeyCode::Char('r'))),
+            Some(Action::Resend)
+        );
     }
 
     /// The keys vim reserves must stay reserved, or muscle memory starts lying.
@@ -673,7 +763,10 @@ mod tests {
     fn vim_reserved_keys_are_unbound() {
         for key in ["q", "r", "i", "x", "d", "c", "y", "p"] {
             let mut input = Input::new();
-            assert!(feed(&mut input, key).is_empty(), "{key} should not be bound yet");
+            assert!(
+                feed(&mut input, key).is_empty(),
+                "{key} should not be bound yet"
+            );
         }
     }
 
@@ -696,14 +789,28 @@ mod tests {
     fn gt_cycles_windows_without_shadowing_gg() {
         assert_eq!(last("gt"), Action::WindowStep(1));
         assert_eq!(last("gT"), Action::WindowStep(-1));
-        assert_eq!(last("gg"), Action::Move { motion: Motion::Top, count: None });
+        assert_eq!(
+            last("gg"),
+            Action::Move {
+                motion: Motion::Top,
+                count: None
+            }
+        );
     }
 
     #[test]
     fn windows_cycle_and_wrap_in_tab_order() {
         assert_eq!(Window::Proxy.step(1), Window::Repeater);
-        assert_eq!(Window::Automate.step(1), Window::Proxy, "last wraps to first");
-        assert_eq!(Window::Proxy.step(-1), Window::Automate, "first wraps to last");
+        assert_eq!(
+            Window::Automate.step(1),
+            Window::Proxy,
+            "last wraps to first"
+        );
+        assert_eq!(
+            Window::Proxy.step(-1),
+            Window::Automate,
+            "first wraps to last"
+        );
     }
 
     /// Both Cmd-K and the Ctrl-K fallback open the palette and enter its mode.
@@ -739,7 +846,10 @@ mod tests {
     fn palette_navigates_with_ctrl_and_arrows_and_escapes() {
         let mut input = Input::new();
         input.feed(ctrl('k'));
-        assert_eq!(input.feed(ctrl('n')), Some(Action::Palette(PaletteKey::Down)));
+        assert_eq!(
+            input.feed(ctrl('n')),
+            Some(Action::Palette(PaletteKey::Down))
+        );
         assert_eq!(input.feed(ctrl('p')), Some(Action::Palette(PaletteKey::Up)));
         assert_eq!(
             input.feed(KeyEvent::from(KeyCode::Down)),

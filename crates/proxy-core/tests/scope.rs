@@ -28,7 +28,11 @@ fn hit(matcher: &Matcher, url: &str) -> bool {
         .map(|(h, p)| (h, p.parse().unwrap()))
         .unwrap_or((authority, 443));
     let path = format!("/{path}");
-    matcher.matches(&Target { host, port, path: &path })
+    matcher.matches(&Target {
+        host,
+        port,
+        path: &path,
+    })
 }
 
 #[test]
@@ -141,10 +145,16 @@ fn cidr_matches_ip_literals_only() {
 fn disabled_rules_are_ignored() {
     let mut disabled = exclude(RuleSpec::host(HostKind::Glob, "cdn.linear.app"));
     disabled.enabled = false;
-    let rules = vec![include(RuleSpec::host(HostKind::Glob, "*.linear.app")), disabled];
+    let rules = vec![
+        include(RuleSpec::host(HostKind::Glob, "*.linear.app")),
+        disabled,
+    ];
 
     let matcher = Matcher::compile(&rules).unwrap();
-    assert!(hit(&matcher, "cdn.linear.app/x"), "disabled exclude must not apply");
+    assert!(
+        hit(&matcher, "cdn.linear.app/x"),
+        "disabled exclude must not apply"
+    );
 }
 
 /// A malformed pattern must fail loudly. Silently skipping it would widen scope
@@ -236,7 +246,11 @@ fn exactly_one_scope_is_active() {
     scope::set_active(&conn, b).unwrap();
     assert_eq!(scope::active_scope(&conn).unwrap().unwrap().id, b);
     assert_eq!(
-        scope::list_scopes(&conn).unwrap().iter().filter(|s| s.is_active).count(),
+        scope::list_scopes(&conn)
+            .unwrap()
+            .iter()
+            .filter(|s| s.is_active)
+            .count(),
         1
     );
 }
@@ -256,17 +270,27 @@ fn sitemap_nodes_convert_to_rules() {
     )
     .unwrap();
     let host_node: i64 = conn
-        .query_row("SELECT id FROM sitemap_node WHERE kind = 'host'", [], |r| r.get(0))
+        .query_row("SELECT id FROM sitemap_node WHERE kind = 'host'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     let dir_node: i64 = conn
-        .query_row("SELECT id FROM sitemap_node WHERE kind = 'dir'", [], |r| r.get(0))
+        .query_row("SELECT id FROM sitemap_node WHERE kind = 'dir'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
 
     scope::add_node(&conn, scope_id, dir_node, Action::Include).unwrap();
     let matcher = scope::load_matcher(&conn, scope_id).unwrap();
     assert!(hit(&matcher, "linear.app/api/v1"));
-    assert!(!hit(&matcher, "linear.app/docs"), "should scope the subtree only");
-    assert!(!hit(&matcher, "other.com/api"), "should not leak to other hosts");
+    assert!(
+        !hit(&matcher, "linear.app/docs"),
+        "should scope the subtree only"
+    );
+    assert!(
+        !hit(&matcher, "other.com/api"),
+        "should not leak to other hosts"
+    );
 
     // A host node scopes the whole host.
     scope::add_node(&conn, scope_id, host_node, Action::Include).unwrap();
@@ -278,5 +302,8 @@ fn sitemap_nodes_convert_to_rules() {
     assert_eq!(removed, 1);
     let matcher = scope::load_matcher(&conn, scope_id).unwrap();
     assert!(!hit(&matcher, "linear.app/docs"));
-    assert!(hit(&matcher, "linear.app/api/v1"), "the dir rule must survive");
+    assert!(
+        hit(&matcher, "linear.app/api/v1"),
+        "the dir rule must survive"
+    );
 }

@@ -69,20 +69,36 @@ async fn persists_request_and_response() {
     engine.record_response(id, response("<html/>"));
 
     assert!(
-        await_rows(&path, "SELECT COUNT(*) FROM flow WHERE ended_at IS NOT NULL", 1),
+        await_rows(
+            &path,
+            "SELECT COUNT(*) FROM flow WHERE ended_at IS NOT NULL",
+            1
+        ),
         "flow never reached the database"
     );
 
     let conn = rusqlite::Connection::open(db_of(&path)).unwrap();
     let (method, host, scheme, dbpath, status, mime, len): (
-        String, String, String, String, i64, String, i64,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
     ) = conn
         .query_row(
             "SELECT method, host, scheme, path, status, mime, resp_len FROM flow WHERE id = ?1",
             [id as i64],
             |r| {
                 Ok((
-                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )
@@ -98,7 +114,11 @@ async fn persists_request_and_response() {
 
     // Duplicate headers survive as separate lines, in order.
     let headers: Vec<u8> = conn
-        .query_row("SELECT req_headers FROM flow WHERE id = ?1", [id as i64], |r| r.get(0))
+        .query_row(
+            "SELECT req_headers FROM flow WHERE id = ?1",
+            [id as i64],
+            |r| r.get(0),
+        )
         .unwrap();
     let headers = String::from_utf8(headers).unwrap();
     assert!(headers.contains("x-dup: one\r\n"), "got: {headers:?}");
@@ -308,7 +328,11 @@ async fn reads_reconstruct_spilled_bodies() {
     let engine = Engine::open_project(&path).unwrap();
     let flow = engine.get_flow(id).expect("flow reconstructs");
     let resp = flow.response.expect("response reconstructs");
-    assert_eq!(resp.body.len(), big.len(), "spilled body read back from blobs/");
+    assert_eq!(
+        resp.body.len(),
+        big.len(),
+        "spilled body read back from blobs/"
+    );
     assert_eq!(resp.body, Bytes::from(big));
 
     engine.shutdown().await;

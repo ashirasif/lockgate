@@ -8,6 +8,7 @@ use hudsucker::hyper::header::HOST;
 
 use crate::db::ProjectPaths;
 use crate::finding::{Finding, NewFinding};
+use crate::intercept::Intercept;
 use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary, now_micros};
 use crate::read::{self, BodySlice, FlowDetail, FlowQuery, FlowRow, Side, SitemapNode};
 use crate::scope::{Matcher, Target};
@@ -30,6 +31,9 @@ pub struct Engine {
     /// One reused client (and its connection pool) for all Repeater resends.
     http: reqwest::Client,
     persist: Persist,
+    /// Traffic held in flight awaiting an operator verdict. Off by default, so
+    /// an engine nobody is watching never holds anything.
+    intercept: Intercept,
 }
 
 /// How captured traffic is stored, and where reads come from.
@@ -115,6 +119,7 @@ impl Engine {
                 // never produce one, so this directory is never created.
                 paths: ProjectPaths::new(std::env::temp_dir()),
             },
+            intercept: Intercept::default(),
         })
     }
 
@@ -137,13 +142,43 @@ impl Engine {
                 read: Mutex::new(read),
                 paths,
             },
+            intercept: Intercept::default(),
         }))
+    }
+
+    /// The intercept queue. Frontends toggle it and answer held items through
+    /// this; the proxy handlers hold traffic on it.
+    pub fn intercept(&self) -> &Intercept {
+        &self.intercept
     }
 
     // --- capture verbs (called by the proxy handlers) ---
 
     pub fn record_request(&self, request: CapturedRequest) -> FlowId {
         self.record_request_from(request, Source::Proxy, None)
+    }
+
+    /// Reserve a flow id without recording anything yet.
+    ///
+    /// The proxy handler needs an id up front to correlate the response that
+    /// follows, but when interception is on it does not yet know what the
+    /// request will *be* — the operator may still edit it. So it reserves here,
+    /// holds, then calls [`Engine::record_request_as`] with whatever actually
+    /// went on the wire, keeping history honest about it.
+    pub fn reserve_flow_id(&self) -> FlowId {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record a proxied request under an id already handed out by
+    /// [`Engine::reserve_flow_id`].
+    pub fn record_request_as(&self, id: FlowId, request: CapturedRequest) {
+        self.write(WriteEvent::Request {
+            id,
+            source: Source::Proxy,
+            parent_id: None,
+            started_at: now_micros(),
+            request,
+        });
     }
 
     fn record_request_from(
@@ -181,7 +216,10 @@ impl Engine {
         match &self.persist {
             Persist::Async { writer, .. } => writer.send(event),
             Persist::Memory {
-                conn, run_id, paths, ..
+                conn,
+                run_id,
+                paths,
+                ..
             } => {
                 let mut conn = conn.lock().unwrap();
                 if let Err(e) = write_batch(&mut conn, paths, *run_id, vec![event]) {
@@ -283,7 +321,20 @@ impl Engine {
     /// so a send and its origin stay linked instead of the result vanishing.
     pub async fn resend(&self, id: FlowId) -> Result<Resent, ResendError> {
         let flow = self.get_flow(id).ok_or(ResendError::NotFound(id))?;
-        let req = flow.request;
+        self.send_request(flow.request, Some(id)).await
+    }
+
+    /// Send an arbitrary request — typically one the operator edited in the
+    /// Repeater — and record it as a new flow.
+    ///
+    /// `origin` links the send back to the flow it was derived from, so an
+    /// edited replay still shows its lineage. `None` for a request composed from
+    /// scratch.
+    pub async fn send_request(
+        &self,
+        req: CapturedRequest,
+        origin: Option<FlowId>,
+    ) -> Result<Resent, ResendError> {
         let url = target_url(&req).ok_or(ResendError::NoTarget)?;
 
         // Replaying puts traffic on the wire, so it must respect the active
@@ -301,7 +352,7 @@ impl Engine {
             }
         }
 
-        let replay_id = self.record_request_from(req.clone(), Source::Repeater, Some(id));
+        let replay_id = self.record_request_from(req.clone(), Source::Repeater, origin);
 
         let resp = self
             .http

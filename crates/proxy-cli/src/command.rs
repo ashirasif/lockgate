@@ -12,7 +12,10 @@ pub enum Command {
     /// `:resend` — replay the selection, same as `<Space>r`.
     Resend,
     /// `:set rnu`, `:set nornu`, … — a boolean option and its new value.
-    Set { option: String, value: bool },
+    Set {
+        option: String,
+        value: bool,
+    },
     /// `:12` — a bare line number jumps to that flow.
     Goto(usize),
     Help,
@@ -46,10 +49,14 @@ impl Command {
 /// `:set foo` turns an option on, `:set nofoo` turns it off.
 fn parse_set(rest: &str) -> Command {
     match rest.strip_prefix("no") {
-        Some(option) if !option.is_empty() => {
-            Command::Set { option: option.to_string(), value: false }
-        }
-        _ => Command::Set { option: rest.to_string(), value: true },
+        Some(option) if !option.is_empty() => Command::Set {
+            option: option.to_string(),
+            value: false,
+        },
+        _ => Command::Set {
+            option: rest.to_string(),
+            value: true,
+        },
     }
 }
 
@@ -86,16 +93,25 @@ mod tests {
     fn set_toggles_on_the_no_prefix() {
         assert_eq!(
             Command::parse("set rnu"),
-            Some(Command::Set { option: "rnu".into(), value: true })
+            Some(Command::Set {
+                option: "rnu".into(),
+                value: true
+            })
         );
         assert_eq!(
             Command::parse("set nornu"),
-            Some(Command::Set { option: "rnu".into(), value: false })
+            Some(Command::Set {
+                option: "rnu".into(),
+                value: false
+            })
         );
     }
 
     #[test]
     fn unknown_commands_are_reported_not_swallowed() {
-        assert_eq!(Command::parse("frobnicate"), Some(Command::Unknown("frobnicate".into())));
+        assert_eq!(
+            Command::parse("frobnicate"),
+            Some(Command::Unknown("frobnicate".into()))
+        );
     }
 }

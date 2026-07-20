@@ -185,7 +185,11 @@ impl App {
             Action::Search { pattern, backward } => {
                 self.search = pattern;
                 self.move_cursor(
-                    if backward { Motion::MatchBackward } else { Motion::MatchForward },
+                    if backward {
+                        Motion::MatchBackward
+                    } else {
+                        Motion::MatchForward
+                    },
                     None,
                 );
             }
@@ -220,8 +224,10 @@ impl App {
                 self.palette_selected = (self.palette_selected + 1).min(last);
             }
             PaletteKey::Accept => {
-                if let Some((_, action)) =
-                    self.palette_matches().into_iter().nth(self.palette_selected)
+                if let Some((_, action)) = self
+                    .palette_matches()
+                    .into_iter()
+                    .nth(self.palette_selected)
                 {
                     self.apply(action);
                 }
@@ -243,11 +249,17 @@ impl App {
         commands.push(("Resend selection".into(), Action::Resend));
         commands.push((
             "Go to first request".into(),
-            Action::Move { motion: Motion::Top, count: None },
+            Action::Move {
+                motion: Motion::Top,
+                count: None,
+            },
         ));
         commands.push((
             "Go to last request".into(),
-            Action::Move { motion: Motion::Bottom, count: None },
+            Action::Move {
+                motion: Motion::Bottom,
+                count: None,
+            },
         ));
         // The toggle reads its own state so the label says what will happen.
         let (rnu_label, rnu_cmd) = if self.option("rnu") {
@@ -274,7 +286,10 @@ impl App {
             .collect();
         // Best score wins; original order breaks ties so the list stays stable.
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        scored.into_iter().map(|(_, _, label, action)| (label, action)).collect()
+        scored
+            .into_iter()
+            .map(|(_, _, label, action)| (label, action))
+            .collect()
     }
 
     /// Switch windows. Scrolling is per-window, so leaving one abandons its
@@ -309,7 +324,9 @@ impl App {
     }
 
     fn run_command(&mut self, line: &str) {
-        let Some(command) = Command::parse(line) else { return };
+        let Some(command) = Command::parse(line) else {
+            return;
+        };
         match command {
             Command::Quit => self.should_quit = true,
             Command::Resend => self.resend_selected(),
@@ -354,8 +371,10 @@ impl App {
 
         let target = target.clamp(0, last as isize) as usize;
         // Long-range moves are jumps, so `<C-o>` can bring you back.
-        if matches!(motion, Motion::Top | Motion::Bottom | Motion::MatchForward | Motion::MatchBackward)
-        {
+        if matches!(
+            motion,
+            Motion::Top | Motion::Bottom | Motion::MatchForward | Motion::MatchBackward
+        ) {
             self.push_jump(current);
         }
         self.table.select(Some(target));
@@ -363,7 +382,12 @@ impl App {
 
     /// `}` / `{` — the next row whose host differs from the current one.
     fn group_edge(&self, from: usize, direction: isize) -> isize {
-        let host_of = |i: usize| self.flows.get(i).and_then(|f| f.uri.host()).map(str::to_owned);
+        let host_of = |i: usize| {
+            self.flows
+                .get(i)
+                .and_then(|f| f.uri.host())
+                .map(str::to_owned)
+        };
         let start = host_of(from);
         let mut i = from as isize;
         loop {
@@ -387,7 +411,12 @@ impl App {
         let needle = self.search.to_lowercase();
         for offset in 1..=len {
             let i = (from as isize + direction * offset as isize).rem_euclid(len as isize) as usize;
-            if self.flows[i].uri.to_string().to_lowercase().contains(&needle) {
+            if self.flows[i]
+                .uri
+                .to_string()
+                .to_lowercase()
+                .contains(&needle)
+            {
                 return i as isize;
             }
         }
@@ -419,10 +448,15 @@ impl App {
             self.jumps.push(self.cursor());
         }
         let next = self.jump_cursor as isize + direction;
-        let Ok(next) = usize::try_from(next) else { return };
-        let Some(&row) = self.jumps.get(next) else { return };
+        let Ok(next) = usize::try_from(next) else {
+            return;
+        };
+        let Some(&row) = self.jumps.get(next) else {
+            return;
+        };
         self.jump_cursor = next;
-        self.table.select(Some(row.min(self.flows.len().saturating_sub(1))));
+        self.table
+            .select(Some(row.min(self.flows.len().saturating_sub(1))));
     }
 
     fn note(&self, message: &str) {
@@ -487,13 +521,18 @@ impl App {
         let mut lines = Vec::new();
 
         section(&mut lines, "BASE SET");
-        let base: Vec<&FlowSummary> =
-            self.selected_rows().filter_map(|row| self.flows.get(row)).collect();
+        let base: Vec<&FlowSummary> = self
+            .selected_rows()
+            .filter_map(|row| self.flows.get(row))
+            .collect();
         if base.is_empty() {
             field(&mut lines, "—", "no flow selected in Proxy (P)");
         } else {
             for flow in &base {
-                lines.push(Line::from(format!("  #{}  {}  {}", flow.id, flow.method, flow.uri)));
+                lines.push(Line::from(format!(
+                    "  #{}  {}  {}",
+                    flow.id, flow.method, flow.uri
+                )));
             }
             lines.push(Line::styled(
                 "  <Space>r replays this set through the Repeater",
@@ -580,19 +619,23 @@ impl App {
                 Span::styled("  ", Style::new().fg(Color::Cyan)),
                 Span::raw(format!("{}█", self.palette_query)),
             ]))
-            .block(
-                Block::bordered()
-                    .title(" Command Palette ")
-                    .title_bottom(format!(" {} ", match matches.len() {
+            .block(Block::bordered().title(" Command Palette ").title_bottom(
+                format!(
+                    " {} ",
+                    match matches.len() {
                         1 => "1 match".to_string(),
                         n => format!("{n} matches"),
-                    })),
-            ),
+                    }
+                ),
+            )),
             prompt,
         );
 
         let rows: Vec<Line> = if matches.is_empty() {
-            vec![Line::styled("  no matching command", Style::new().fg(Color::DarkGray))]
+            vec![Line::styled(
+                "  no matching command",
+                Style::new().fg(Color::DarkGray),
+            )]
         } else {
             matches
                 .iter()
@@ -663,7 +706,10 @@ impl App {
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!(" #{} ", flow.id), Style::new().fg(Color::Black).bg(Color::Cyan)),
+                Span::styled(
+                    format!(" #{} ", flow.id),
+                    Style::new().fg(Color::Black).bg(Color::Cyan),
+                ),
                 Span::raw(format!("  {} {}", flow.request.method, flow.request.uri)),
                 Span::styled("   <Space>r send", Style::new().fg(Color::DarkGray)),
             ])),
@@ -681,7 +727,10 @@ impl App {
         let response = match &flow.response {
             None => vec![Line::styled("(pending)", Style::new().fg(Color::Yellow))],
             Some(resp) => message_lines(
-                Line::styled(resp.status.to_string(), Style::new().bold().fg(status_color(resp.status))),
+                Line::styled(
+                    resp.status.to_string(),
+                    Style::new().bold().fg(status_color(resp.status)),
+                ),
                 &resp.headers,
                 &resp.body,
             ),
@@ -891,7 +940,11 @@ fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
     for needle in query.to_lowercase().chars() {
         let found = haystack[from..].iter().position(|&c| c == needle)? + from;
         // Reward adjacency (a real substring) and matching near the start.
-        score += if previous == Some(found.saturating_sub(1)) { 8 } else { 1 };
+        score += if previous == Some(found.saturating_sub(1)) {
+            8
+        } else {
+            1
+        };
         score -= found as i32 / 4;
         previous = Some(found);
         from = found + 1;
@@ -930,7 +983,10 @@ fn section(lines: &mut Vec<Line<'static>>, title: &str) {
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
-    lines.push(Line::styled(title.to_string(), Style::new().bold().fg(Color::Cyan)));
+    lines.push(Line::styled(
+        title.to_string(),
+        Style::new().bold().fg(Color::Cyan),
+    ));
 }
 
 /// A right-aligned label and its value, so fields line up in a column.
@@ -949,7 +1005,11 @@ fn inspect_lines(flow: &Flow) -> Vec<Line<'static>> {
 
     section(&mut lines, "REQUEST");
     field(&mut lines, "method", req.method.to_string());
-    field(&mut lines, "scheme", req.uri.scheme_str().unwrap_or("—").to_string());
+    field(
+        &mut lines,
+        "scheme",
+        req.uri.scheme_str().unwrap_or("—").to_string(),
+    );
     let host = req
         .uri
         .host()
@@ -1013,7 +1073,11 @@ fn header_lines(lines: &mut Vec<Line<'static>>, headers: &HeaderMap) {
         return;
     }
     for (name, value) in headers {
-        field(lines, name.as_str(), value.to_str().unwrap_or("<binary>").to_string());
+        field(
+            lines,
+            name.as_str(),
+            value.to_str().unwrap_or("<binary>").to_string(),
+        );
     }
 }
 
@@ -1209,7 +1273,10 @@ mod tests {
     fn search_moves_to_the_next_match() {
         let mut app = App::new(engine_with(20));
         app.refresh();
-        app.apply(Action::Search { pattern: "/17".into(), backward: false });
+        app.apply(Action::Search {
+            pattern: "/17".into(),
+            backward: false,
+        });
         assert_eq!(app.cursor(), 17);
     }
 
@@ -1332,7 +1399,11 @@ mod tests {
 
         press(&mut app, "I");
         assert_eq!(app.window, Window::Inspect);
-        assert!(render(&mut app).contains("REQUEST HEADERS"), "{}", render(&mut app));
+        assert!(
+            render(&mut app).contains("REQUEST HEADERS"),
+            "{}",
+            render(&mut app)
+        );
 
         press(&mut app, "A");
         assert_eq!(app.window, Window::Automate);
@@ -1392,7 +1463,11 @@ mod tests {
         render(&mut app);
         press(&mut app, "3j");
         assert_eq!(app.content_scroll, 3);
-        assert_eq!(app.selected_id(), selected, "scrolling must not move the selection");
+        assert_eq!(
+            app.selected_id(),
+            selected,
+            "scrolling must not move the selection"
+        );
         // Switching windows starts you back at the top.
         press(&mut app, "P");
         press(&mut app, "A");
@@ -1404,7 +1479,10 @@ mod tests {
     fn palette_opens_over_the_window_and_lists_commands() {
         let mut app = App::new(engine_with(3));
         app.refresh();
-        key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
         assert_eq!(app.input.mode(), Mode::Palette);
         let out = render(&mut app);
         assert!(out.contains("Command Palette"), "{out}");
@@ -1418,11 +1496,17 @@ mod tests {
     fn palette_filters_and_runs_the_chosen_command() {
         let mut app = App::new(engine_with(3));
         app.refresh();
-        key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
         press(&mut app, "inspect");
         // The filter has narrowed to the one obvious match.
         let matches = app.palette_matches();
-        assert_eq!(matches.first().map(|(l, _)| l.as_str()), Some("Go to Inspect"));
+        assert_eq!(
+            matches.first().map(|(l, _)| l.as_str()),
+            Some("Go to Inspect")
+        );
 
         key(&mut app, KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.input.mode(), Mode::Normal, "Enter closes the palette");
@@ -1433,7 +1517,10 @@ mod tests {
     fn palette_escape_dismisses_without_running_anything() {
         let mut app = App::new(engine_with(3));
         app.refresh();
-        key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
         press(&mut app, "quit");
         key(&mut app, KeyEvent::from(KeyCode::Esc));
         assert_eq!(app.input.mode(), Mode::Normal);
@@ -1445,16 +1532,28 @@ mod tests {
     fn palette_selection_moves_with_ctrl_n() {
         let mut app = App::new(engine_with(3));
         app.refresh();
-        key(&mut app, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
         assert_eq!(app.palette_selected, 0);
-        key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        );
         assert_eq!(app.palette_selected, 1);
     }
 
     #[test]
     fn fuzzy_score_requires_order_and_prefers_contiguous() {
-        assert!(fuzzy_score("", "anything").is_some(), "empty query matches all");
-        assert!(fuzzy_score("xyz", "Go to Proxy").is_none(), "missing chars fail");
+        assert!(
+            fuzzy_score("", "anything").is_some(),
+            "empty query matches all"
+        );
+        assert!(
+            fuzzy_score("xyz", "Go to Proxy").is_none(),
+            "missing chars fail"
+        );
         // A contiguous substring should beat the same letters scattered.
         let contiguous = fuzzy_score("proxy", "Go to Proxy").unwrap();
         let scattered = fuzzy_score("proxy", "Prod runs on x, y").unwrap();
@@ -1471,4 +1570,3 @@ mod tests {
         assert!(render(&mut app).contains("(pending)"));
     }
 }
-

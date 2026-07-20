@@ -217,9 +217,7 @@ fn run(
 
         // `Stop` is only ever the last thing sent, so anything ahead of it in
         // this batch still gets committed before we go.
-        let stopping = batch
-            .iter()
-            .any(|event| matches!(event, WriteEvent::Stop));
+        let stopping = batch.iter().any(|event| matches!(event, WriteEvent::Stop));
 
         let count = batch.len();
         if let Err(e) = write_batch(&mut conn, &paths, run_id, batch) {
@@ -535,7 +533,11 @@ fn target_parts(req: &CapturedRequest) -> (String, String, u16, String) {
     // Origin-form target: the host only exists in the `Host` header. We assume
     // https because plain-HTTP requests reach us in absolute-form and would
     // have taken the branch above.
-    let raw = req.headers.get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let raw = req
+        .headers
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     // A Host header may carry a port ("example.com:8443"); split it back out so
     // it lands in `port` rather than corrupting `host`.
     let (host, port) = match raw.rsplit_once(':') {

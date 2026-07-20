@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use proxy_core::{Engine, FlowQuery, NewFinding, ResendError, Side};
-use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     ErrorData, ListResourceTemplatesResult, PaginatedRequestParams, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResult, ResourceContents, ResourceTemplate,
@@ -291,7 +291,11 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<ResendFlowParams>,
     ) -> Result<Json<ResendFlowResult>, ErrorData> {
-        let resent = self.engine.resend(p.id as u64).await.map_err(resend_error)?;
+        let resent = self
+            .engine
+            .resend(p.id as u64)
+            .await
+            .map_err(resend_error)?;
         let response = &resent.response;
         // "text/html; charset=utf-8" -> "text/html", matching how capture stores mime.
         let mime = response
@@ -377,7 +381,11 @@ impl ProxyServer {
             path: p.path,
             evidence: evidence.into_iter().map(|e| (e.flow_id, e.label)).collect(),
         };
-        let id = self.engine.create_finding(finding).await.map_err(write_error)?;
+        let id = self
+            .engine
+            .create_finding(finding)
+            .await
+            .map_err(write_error)?;
         Ok(Json(CreateFindingResult { id }))
     }
 
@@ -557,7 +565,10 @@ fn validate_one(field: &str, value: &str, allowed: &[&str]) -> Result<String, Er
         Ok(value.to_string())
     } else {
         Err(ErrorData::invalid_params(
-            format!("invalid {field} {value:?}; expected one of {}", allowed.join(", ")),
+            format!(
+                "invalid {field} {value:?}; expected one of {}",
+                allowed.join(", ")
+            ),
             None,
         ))
     }
@@ -565,9 +576,7 @@ fn validate_one(field: &str, value: &str, allowed: &[&str]) -> Result<String, Er
 
 fn resend_error(e: ResendError) -> ErrorData {
     match e {
-        ResendError::NotFound(id) => {
-            ErrorData::resource_not_found(format!("no flow #{id}"), None)
-        }
+        ResendError::NotFound(id) => ErrorData::resource_not_found(format!("no flow #{id}"), None),
         ResendError::NoTarget => {
             ErrorData::invalid_params("flow has no absolute URL to resend to".to_string(), None)
         }
@@ -672,14 +681,21 @@ mod tests {
         });
 
         // Default: automate is hidden.
-        let r = server.list_flows(Parameters(list_params())).await.unwrap().0;
+        let r = server
+            .list_flows(Parameters(list_params()))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(r.returned, 1);
         assert_eq!(r.flows[0].id, a);
 
         // Opt in: both show.
         let mut p = list_params();
         p.include_automate = Some(true);
-        assert_eq!(server.list_flows(Parameters(p)).await.unwrap().0.returned, 2);
+        assert_eq!(
+            server.list_flows(Parameters(p)).await.unwrap().0.returned,
+            2
+        );
 
         // Explicit source wins over the default hide.
         let mut p = list_params();
@@ -704,7 +720,10 @@ mod tests {
         // Over-large limit is clamped, not honoured verbatim.
         let mut p = list_params();
         p.limit = Some(100_000);
-        assert_eq!(server.list_flows(Parameters(p)).await.unwrap().0.limit, MAX_LIMIT);
+        assert_eq!(
+            server.list_flows(Parameters(p)).await.unwrap().0.limit,
+            MAX_LIMIT
+        );
     }
 
     #[tokio::test]
@@ -756,7 +775,8 @@ mod tests {
                 body_limit: None,
             }))
             .await
-            .map(|_| ()).unwrap_err();
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.message.contains("4242"));
     }
 
@@ -776,7 +796,11 @@ mod tests {
             .0;
         assert_eq!(res.rows_changed, 1);
 
-        let r = server.list_flows(Parameters(list_params())).await.unwrap().0;
+        let r = server
+            .list_flows(Parameters(list_params()))
+            .await
+            .unwrap()
+            .0;
         let f = r.flows.iter().find(|f| f.id == id).unwrap();
         assert_eq!(f.comment.as_deref(), Some("look here"));
         assert_eq!(f.highlight.as_deref(), Some("red"));
@@ -789,7 +813,8 @@ mod tests {
                 highlight: None,
             }))
             .await
-            .map(|_| ()).unwrap_err();
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.message.contains("comment or a highlight"));
     }
 
@@ -828,7 +853,11 @@ mod tests {
 
         let mut bad_sev = finding_params();
         bad_sev.severity = "spicy".into();
-        let err = server.create_finding(Parameters(bad_sev)).await.map(|_| ()).unwrap_err();
+        let err = server
+            .create_finding(Parameters(bad_sev))
+            .await
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.message.contains("invalid severity"));
 
         let mut bad_status = finding_params();
@@ -836,7 +865,8 @@ mod tests {
         let err = server
             .create_finding(Parameters(bad_status))
             .await
-            .map(|_| ()).unwrap_err();
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.message.contains("invalid status"));
 
         // A dangling evidence id is caught up front, not as an opaque write error.
@@ -845,7 +875,11 @@ mod tests {
             flow_id: id + 999,
             label: None,
         }]);
-        let err = server.create_finding(Parameters(bad_ev)).await.map(|_| ()).unwrap_err();
+        let err = server
+            .create_finding(Parameters(bad_ev))
+            .await
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.message.contains("does not exist"));
 
         // Nothing was written by the rejected calls.
@@ -876,8 +910,13 @@ mod tests {
         let err = server
             .resend_flow(Parameters(ResendFlowParams { id }))
             .await
-            .map(|_| ()).unwrap_err();
-        assert!(err.message.contains("scope"), "message was: {}", err.message);
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.message.contains("scope"),
+            "message was: {}",
+            err.message
+        );
     }
 
     #[test]

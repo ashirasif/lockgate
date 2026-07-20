@@ -108,7 +108,11 @@ pub struct FlowDetailDto {
 pub fn detail_headers(d: &FlowDetail) -> (Vec<HeaderDto>, Vec<HeaderDto>) {
     (
         d.req_headers.iter().cloned().map(HeaderDto::from).collect(),
-        d.resp_headers.iter().cloned().map(HeaderDto::from).collect(),
+        d.resp_headers
+            .iter()
+            .cloned()
+            .map(HeaderDto::from)
+            .collect(),
     )
 }
 

@@ -346,11 +346,7 @@ pub fn open_memory() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-pub(crate) fn migrate(
-    conn: &Connection,
-    migrations: &[&str],
-    latest: i64,
-) -> rusqlite::Result<()> {
+pub(crate) fn migrate(conn: &Connection, migrations: &[&str], latest: i64) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
 
     if current > latest {
@@ -404,11 +400,8 @@ mod tests {
         conn.pragma_update(None, "user_version", 1i64).unwrap();
 
         // A v1 flow, written the way the old code did: no port column existed.
-        conn.execute(
-            "INSERT INTO capture_run (id, started_at) VALUES (1, 0)",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO capture_run (id, started_at) VALUES (1, 0)", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO flow (id, run_id, source, started_at, method, uri,
                                http_version, req_headers, host, scheme, path)

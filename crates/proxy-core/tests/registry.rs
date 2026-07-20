@@ -17,19 +17,33 @@ fn creates_and_lists_projects() {
     let root = temp_dir("basic");
     let registry = Registry::open(&root.join("registry.db")).unwrap();
 
-    let a = registry.create("alpha", &root.join("projects/alpha"), 100).unwrap();
-    let b = registry.create("beta", &root.join("projects/beta"), 200).unwrap();
+    let a = registry
+        .create("alpha", &root.join("projects/alpha"), 100)
+        .unwrap();
+    let b = registry
+        .create("beta", &root.join("projects/beta"), 200)
+        .unwrap();
 
     // Creating a project must leave it immediately openable.
     assert!(a.path.join("project.db").exists());
     assert!(a.path.join("blobs").is_dir());
 
     // Ordered by recency of use, falling back to creation.
-    let names: Vec<String> = registry.list().unwrap().into_iter().map(|p| p.name).collect();
+    let names: Vec<String> = registry
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
     assert_eq!(names, vec!["beta", "alpha"]);
 
     registry.touch(a.id, 300).unwrap();
-    let names: Vec<String> = registry.list().unwrap().into_iter().map(|p| p.name).collect();
+    let names: Vec<String> = registry
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
     assert_eq!(names, vec!["alpha", "beta"], "touch should reorder");
 
     assert_eq!(registry.by_path(&b.path).unwrap().unwrap().id, b.id);
@@ -54,7 +68,9 @@ fn re_registering_a_path_renames_rather_than_failing() {
 fn forget_leaves_the_directory_alone() {
     let root = temp_dir("forget");
     let registry = Registry::open(&root.join("registry.db")).unwrap();
-    let project = registry.create("doomed", &root.join("projects/doomed"), 100).unwrap();
+    let project = registry
+        .create("doomed", &root.join("projects/doomed"), 100)
+        .unwrap();
 
     registry.forget(project.id).unwrap();
 

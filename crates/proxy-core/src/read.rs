@@ -436,8 +436,11 @@ pub fn flows(
     binds.push(Box::new(offset));
 
     let mut stmt = conn.prepare(&sql)?;
-    stmt.query_map(params_from_iter(binds.iter().map(|b| b.as_ref())), row_to_flow)?
-        .collect()
+    stmt.query_map(
+        params_from_iter(binds.iter().map(|b| b.as_ref())),
+        row_to_flow,
+    )?
+    .collect()
 }
 
 pub fn flow_detail(conn: &Connection, id: i64) -> rusqlite::Result<Option<FlowDetail>> {
@@ -646,7 +649,11 @@ mod tests {
 
         assert_eq!(decoded.get("content-type").unwrap(), "application/json");
         let cookies: Vec<_> = decoded.get_all("set-cookie").iter().collect();
-        assert_eq!(cookies, vec!["a=1", "b=2"], "order and duplicates preserved");
+        assert_eq!(
+            cookies,
+            vec!["a=1", "b=2"],
+            "order and duplicates preserved"
+        );
     }
 
     #[test]

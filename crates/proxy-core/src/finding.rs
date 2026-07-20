@@ -138,7 +138,10 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Finding>> {
     Ok(finding)
 }
 
-fn evidence_for(conn: &Connection, finding_id: i64) -> rusqlite::Result<Vec<(i64, Option<String>)>> {
+fn evidence_for(
+    conn: &Connection,
+    finding_id: i64,
+) -> rusqlite::Result<Vec<(i64, Option<String>)>> {
     let mut stmt = conn.prepare(
         "SELECT flow_id, label FROM finding_evidence WHERE finding_id = ?1 ORDER BY flow_id",
     )?;
