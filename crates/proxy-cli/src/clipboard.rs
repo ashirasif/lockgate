@@ -44,7 +44,7 @@ impl std::fmt::Display for ClipboardError {
 
 /// Put `text` on the system clipboard.
 pub fn copy(text: &str) -> Result<(), ClipboardError> {
-    let sequence = osc52(text, in_tmux())?;
+    let sequence = osc52(text)?;
     if !io::stdout().is_terminal() {
         return Err(ClipboardError::NotATerminal);
     }
@@ -56,31 +56,31 @@ pub fn copy(text: &str) -> Result<(), ClipboardError> {
         .map_err(|e| ClipboardError::Io(e.to_string()))
 }
 
-fn in_tmux() -> bool {
-    std::env::var_os("TMUX").is_some()
-}
-
 /// Build the escape sequence, without touching the terminal.
 ///
-/// `tmux` wraps it in a passthrough envelope: inside tmux the sequence would
-/// otherwise be swallowed by the multiplexer rather than reaching the terminal
-/// that owns the clipboard. (tmux 3.3+ also needs `allow-passthrough on`.)
-fn osc52(text: &str, tmux: bool) -> Result<String, ClipboardError> {
+/// Sent plain, including under tmux. It is tempting to wrap it in tmux's DCS
+/// passthrough envelope, and a lot of code does — but that is the wrong default
+/// on both counts:
+///
+/// - `set-clipboard` defaults to `external`, meaning tmux *itself* intercepts
+///   OSC 52 and re-emits it to the outer terminal. Plain works.
+/// - `allow-passthrough` defaults to **off**, so a wrapped sequence is silently
+///   discarded by tmux and never reaches anything.
+///
+/// So wrapping breaks the default configuration and plain fixes it. tmux only
+/// forwards when the *outer* terminal's terminfo advertises `Ms`; the inner
+/// `default-terminal` is irrelevant to that decision. If someone has set
+/// `set-clipboard off`, they want tmux out of the way and should turn on
+/// `allow-passthrough` — but that is their choice to make, not ours to force by
+/// emitting a sequence the default config throws away.
+fn osc52(text: &str) -> Result<String, ClipboardError> {
     if text.len() > MAX_BYTES {
         return Err(ClipboardError::TooLarge(text.len()));
     }
     // `c` selects the clipboard proper rather than the X primary selection.
     // BEL terminates rather than ST: both are legal, BEL is accepted by more
     // terminals.
-    let inner = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
-    if !tmux {
-        return Ok(inner);
-    }
-    // tmux passthrough doubles every ESC in the payload it forwards.
-    Ok(format!(
-        "\x1bPtmux;{}\x1b\\",
-        inner.replace('\x1b', "\x1b\x1b")
-    ))
+    Ok(format!("\x1b]52;c;{}\x07", base64(text.as_bytes())))
 }
 
 /// Standard base64 (RFC 4648), padded.
@@ -141,38 +141,38 @@ mod tests {
 
     #[test]
     fn sequence_carries_the_payload() {
-        let seq = osc52("foobar", false).unwrap();
+        let seq = osc52("foobar").unwrap();
         assert_eq!(seq, "\x1b]52;c;Zm9vYmFy\x07");
     }
 
-    /// Inside tmux the sequence needs an envelope, with its ESCs doubled, or
-    /// the multiplexer eats it instead of passing it to the real terminal.
+    /// No tmux passthrough envelope, ever. `allow-passthrough` is off by
+    /// default, so a wrapped sequence would be discarded — whereas tmux's own
+    /// `set-clipboard external` (also the default) forwards the plain one.
     #[test]
-    fn tmux_wraps_and_doubles_escapes() {
-        let seq = osc52("foobar", true).unwrap();
-        assert!(seq.starts_with("\x1bPtmux;"), "missing envelope: {seq:?}");
-        assert!(seq.ends_with("\x1b\\"), "missing terminator: {seq:?}");
+    fn never_wraps_for_tmux() {
+        let seq = osc52("foobar").unwrap();
         assert!(
-            seq.contains("\x1b\x1b]52;c;Zm9vYmFy"),
-            "inner ESC should be doubled: {seq:?}"
+            !seq.contains("\x1bPtmux"),
+            "wrapping breaks the default tmux config: {seq:?}"
         );
+        assert!(seq.starts_with("\x1b]52;"), "{seq:?}");
     }
 
     #[test]
     fn oversized_payloads_are_refused_rather_than_truncated() {
         let big = "x".repeat(MAX_BYTES + 1);
         assert_eq!(
-            osc52(&big, false),
+            osc52(&big),
             Err(ClipboardError::TooLarge(MAX_BYTES + 1)),
             "a silently truncated clipboard is worse than a reported failure"
         );
         // Right at the limit is still fine.
-        assert!(osc52(&"x".repeat(MAX_BYTES), false).is_ok());
+        assert!(osc52(&"x".repeat(MAX_BYTES)).is_ok());
     }
 
     #[test]
     fn empty_text_still_produces_a_valid_sequence() {
-        assert_eq!(osc52("", false).unwrap(), "\x1b]52;c;\x07");
+        assert_eq!(osc52("").unwrap(), "\x1b]52;c;\x07");
     }
 }
 
@@ -188,9 +188,6 @@ mod interop_tests {
         let text = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig";
         let expected = "QXV0aG9yaXphdGlvbjogQmVhcmVyIGV5SmhiR2NpT2lKSVV6STFOaUo5LnBheWxvYWQuc2ln";
         assert_eq!(base64(text.as_bytes()), expected);
-        assert_eq!(
-            osc52(text, false).unwrap(),
-            format!("\x1b]52;c;{expected}\x07")
-        );
+        assert_eq!(osc52(text).unwrap(), format!("\x1b]52;c;{expected}\x07"));
     }
 }
