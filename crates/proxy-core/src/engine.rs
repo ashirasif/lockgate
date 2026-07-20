@@ -261,8 +261,16 @@ impl Engine {
 
     // --- control verbs (called by TUI / MCP) ---
 
+    /// The proxy history: HTTP exchanges only. WebSocket connections have their
+    /// own listing so the two histories stay separate.
     pub fn list_flows(&self) -> Vec<FlowSummary> {
-        self.read(read::list_flows)
+        self.read(|conn| read::list_flows(conn, crate::read::FlowKind::Http))
+    }
+
+    /// The WebSocket history: connections only, each a `101` upgrade whose
+    /// frames hang off it via [`Engine::ws_messages`].
+    pub fn list_ws_flows(&self) -> Vec<FlowSummary> {
+        self.read(|conn| read::list_flows(conn, crate::read::FlowKind::WebSocket))
     }
 
     /// The connection reads go through: the dedicated WAL reader in production,
@@ -468,7 +476,15 @@ impl Engine {
     /// changes.
     pub fn list_flows_in_scope(&self) -> Vec<FlowSummary> {
         let matcher = self.scope_matcher();
-        self.read(|conn| read::list_flows_in_scope(conn, &matcher))
+        self.read(|conn| read::list_flows_in_scope(conn, &matcher, crate::read::FlowKind::Http))
+    }
+
+    /// WebSocket connections, narrowed to the active scope.
+    pub fn list_ws_flows_in_scope(&self) -> Vec<FlowSummary> {
+        let matcher = self.scope_matcher();
+        self.read(|conn| {
+            read::list_flows_in_scope(conn, &matcher, crate::read::FlowKind::WebSocket)
+        })
     }
 
     pub fn get_flow(&self, id: FlowId) -> Option<Flow> {

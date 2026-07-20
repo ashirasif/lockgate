@@ -37,18 +37,43 @@ use crate::scope::{Matcher, Target};
 /// Reverse capture order: the request you just made is the one you want to look
 /// at, and on a busy target it would otherwise be somewhere far below the fold.
 /// Matches the order the MCP's `query_flows` already returns.
-pub fn list_flows(conn: &Connection) -> rusqlite::Result<Vec<FlowSummary>> {
-    conn.prepare("SELECT id, method, uri, status, started_at FROM flow ORDER BY id DESC")?
-        .query_map([], |r| {
-            Ok(summary(
-                r.get(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get(4)?,
-            ))
-        })?
-        .collect()
+/// Which kind of traffic a listing wants.
+///
+/// A WebSocket is exactly a flow whose response is a `101`: the upgrade is
+/// synthesized in the proxy handler, never inferred, so this is a reliable
+/// discriminator rather than a heuristic. HTTP is everything else, including a
+/// flow still pending a response — it is HTTP until proven a socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowKind {
+    Http,
+    WebSocket,
+}
+
+impl FlowKind {
+    fn where_clause(self) -> &'static str {
+        match self {
+            FlowKind::Http => "status IS NULL OR status != 101",
+            FlowKind::WebSocket => "status = 101",
+        }
+    }
+}
+
+pub fn list_flows(conn: &Connection, kind: FlowKind) -> rusqlite::Result<Vec<FlowSummary>> {
+    conn.prepare(&format!(
+        "SELECT id, method, uri, status, started_at FROM flow
+          WHERE {} ORDER BY id DESC",
+        kind.where_clause()
+    ))?
+    .query_map([], |r| {
+        Ok(summary(
+            r.get(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get(4)?,
+        ))
+    })?
+    .collect()
 }
 
 /// The same rows, filtered to the active scope.
@@ -60,14 +85,17 @@ pub fn list_flows(conn: &Connection) -> rusqlite::Result<Vec<FlowSummary>> {
 pub fn list_flows_in_scope(
     conn: &Connection,
     matcher: &Matcher,
+    kind: FlowKind,
 ) -> rusqlite::Result<Vec<FlowSummary>> {
     if matcher.is_unrestricted() {
-        return list_flows(conn);
+        return list_flows(conn, kind);
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT id, method, uri, status, started_at, host, port, path FROM flow ORDER BY id DESC",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, method, uri, status, started_at, host, port, path FROM flow
+          WHERE {} ORDER BY id DESC",
+        kind.where_clause()
+    ))?;
     let rows = stmt.query_map([], |r| {
         Ok((
             summary(

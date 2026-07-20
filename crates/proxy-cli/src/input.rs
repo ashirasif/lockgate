@@ -84,6 +84,9 @@ pub enum Window {
     /// The HTTP history and its request/response detail. The home window.
     #[default]
     Proxy,
+    /// WebSocket connections and their frame transcripts. Kept apart from Proxy
+    /// so the HTTP history stays HTTP.
+    WebSocket,
     /// Replay a single request and read the fresh response.
     Repeater,
     Scope,
@@ -98,8 +101,9 @@ pub enum Window {
 
 impl Window {
     /// Left-to-right tab order, and the set `gt` / `gT` cycle through.
-    pub const ALL: [Window; 7] = [
+    pub const ALL: [Window; 8] = [
         Window::Proxy,
+        Window::WebSocket,
         Window::Intercept,
         Window::Repeater,
         Window::Scope,
@@ -108,10 +112,21 @@ impl Window {
         Window::Automate,
     ];
 
+    /// A shorter label for the tab strip, where eight windows must share one
+    /// 100-column line. Only WebSocket needs it; the rest are already short.
+    pub fn tab_label(self) -> &'static str {
+        match self {
+            Window::WebSocket => "WS",
+            _ => self.label(),
+        }
+    }
+
     /// The name shown in the tab strip.
     pub fn label(self) -> &'static str {
         match self {
             Window::Proxy => "Proxy",
+            Window::WebSocket => "WebSocket",
+
             Window::Intercept => "Intercept",
             Window::Repeater => "Repeater",
             Window::Scope => "Scope",
@@ -128,6 +143,7 @@ impl Window {
     pub fn key(self) -> char {
         match self {
             Window::Proxy => 'P',
+            Window::WebSocket => 'W',
             Window::Intercept => 'I',
             Window::Repeater => 'R',
             Window::Scope => 'C',
@@ -449,6 +465,7 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     // cycles tabs. Lowercase `i` stays vim's insert, which is why Intercept
     // takes `C`.
     ("P", Bind::Window(Window::Proxy)),
+    ("W", Bind::Window(Window::WebSocket)),
     ("I", Bind::Window(Window::Intercept)),
     ("R", Bind::Window(Window::Repeater)),
     // `C` for sCope: `S` is Sitemap and moving it would break muscle memory
@@ -1354,7 +1371,8 @@ mod tests {
 
     #[test]
     fn windows_cycle_and_wrap_in_tab_order() {
-        assert_eq!(Window::Proxy.step(1), Window::Intercept);
+        assert_eq!(Window::Proxy.step(1), Window::WebSocket);
+        assert_eq!(Window::WebSocket.step(1), Window::Intercept);
         assert_eq!(
             Window::Automate.step(1),
             Window::Proxy,

@@ -33,7 +33,7 @@ exists but you will notice what is missing.
 | **Display** | HTTP syntax highlighting, syntect for bodies (JSON, HTML, XML, GraphQL, protobuf, JS-in-`<script>`, …), JSON/HTML pretty-printing, OSC 52 clipboard |
 | **MCP** | 27 tools: recon, intercept, scope, send, format. Resources for full bodies |
 | **Findings** | File a flow as a finding, triage severity and status by keystroke, delete. Also over MCP |
-| **WebSockets** | Frames captured both directions and correlated to the upgrade, shown in the Proxy pane and over MCP. Observed, not intercepted |
+| **WebSockets** | A window of their own (W), separate from the HTTP history, with the handshake and a live frame transcript per connection. Correlated to the upgrade, also over MCP. Observed, not intercepted |
 | **Compressed bodies** | gzip, deflate and brotli decoded for display and over MCP, re-encoded when an intercepted body is edited. Stored bytes are always what arrived |
 
 ### Partial
@@ -116,12 +116,13 @@ run quietly alongside the first.
 ## Keys
 
 `?` is not a help key; `:help` prints the summary and `<C-k>` opens the command
-palette. Windows are `P` proxy, `I` intercept, `R` repeater,
+palette. Windows are `P` proxy, `W` websocket, `I` intercept, `R` repeater,
 `C` scope, `T` findings, `S` sitemap, `A` automate — `gt`/`gT` cycle.
 
 | | |
 |---|---|
 | **Everywhere** | `<Space>r` resend · `<Space>s` send to Repeater · `<Space>i` toggle hold · `<Space>c` bypass scope · `:q` quit |
+| **WebSocket** | `j`/`k` move between connections · the selected one's handshake and frames show below |
 | **Intercept** | `f` forward · `d` drop · `F`/`D` all · `<C-w>` switch pane · `<CR>` open preview |
 | **Repeater** | `n` new tab · `x` close · `gs` / `{count}gs` switch · `[` `]` history · `p` raw/pretty |
 | **Scope** | `n` new · `a` include · `x` exclude · `d` delete · `<CR>` activate or toggle · `<C-w>` switch pane |
@@ -197,7 +198,7 @@ side is not trusted and a few hundred bytes can claim gigabytes.
 ## Development
 
 ```sh
-cargo test --workspace      # 394 tests
+cargo test --workspace      # 398 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```

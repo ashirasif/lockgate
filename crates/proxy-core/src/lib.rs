@@ -25,7 +25,7 @@ pub use finding::{Finding, NewFinding};
 pub use intercept::{Held, Intercept, Pending, TicketId, Verdict};
 pub use model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary};
 pub use proxy::ProxyHandler;
-pub use read::{BodySlice, FlowDetail, FlowQuery, FlowRow, Side, SitemapNode};
+pub use read::{BodySlice, FlowDetail, FlowKind, FlowQuery, FlowRow, Side, SitemapNode};
 pub use registry::{Project, Registry};
 pub use scope::{Action, HostKind, Matcher, RuleSpec, Scope, ScopeRule, Target};
 pub use server::serve;

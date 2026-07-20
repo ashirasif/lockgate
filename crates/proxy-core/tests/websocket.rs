@@ -119,7 +119,7 @@ async fn frames_are_recorded_against_the_flow_that_upgraded() {
     let flow_id = {
         let mut found = None;
         for _ in 0..400 {
-            if let Some(flow) = engine.list_flows().first() {
+            if let Some(flow) = engine.list_ws_flows().first() {
                 found = Some(flow.id);
                 break;
             }

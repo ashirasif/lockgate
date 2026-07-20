@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use hudsucker::hyper::{HeaderMap, StatusCode};
 use proxy_core::{
-    CapturedRequest, Engine, Flow, FlowSummary, Held, Pending, SitemapNode, TicketId,
+    CapturedRequest, Engine, Flow, FlowId, FlowSummary, Held, Pending, SitemapNode, TicketId,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -345,6 +345,11 @@ struct App {
     /// Refreshed from the engine every tick, so proxied traffic shows up live.
     flows: Vec<FlowSummary>,
     table: TableState,
+    /// WebSocket connections, listed in their own window. Parallel to `flows`
+    /// so the two histories never mix.
+    ws_flows: Vec<FlowSummary>,
+    ws_table: TableState,
+    ws_row: usize,
     /// Full flow for the current selection, for the detail pane.
     detail: Option<Flow>,
     /// Shared so a spawned resend task can report back without blocking the UI.
@@ -424,6 +429,9 @@ impl App {
             engine,
             flows: Vec::new(),
             table: TableState::default(),
+            ws_flows: Vec::new(),
+            ws_table: TableState::default(),
+            ws_row: 0,
             detail: None,
             status: Arc::new(Mutex::new(String::new())),
             should_quit: false,
@@ -615,6 +623,13 @@ impl App {
             self.engine.list_flows()
         };
 
+        self.ws_flows = if self.scope_filter {
+            self.engine.list_ws_flows_in_scope()
+        } else {
+            self.engine.list_ws_flows()
+        };
+        self.ws_row = self.ws_row.min(self.ws_flows.len().saturating_sub(1));
+
         self.findings = self.engine.list_findings();
         self.finding_row = self.finding_row.min(self.findings.len().saturating_sub(1));
 
@@ -735,6 +750,10 @@ impl App {
                 }
                 // A different item means a different buffer to look at.
                 self.content_scroll = 0;
+            }
+            Action::Move { motion, count } if self.window == Window::WebSocket => {
+                let last = self.ws_flows.len().saturating_sub(1);
+                self.ws_row = step_row(self.ws_row, last, motion, count);
             }
             Action::Move { motion, count } if self.window == Window::Findings => {
                 let last = self.findings.len().saturating_sub(1);
@@ -2341,6 +2360,7 @@ impl App {
         self.draw_tabs(frame, tabs);
         match self.window {
             Window::Proxy => self.draw_proxy(frame, body),
+            Window::WebSocket => self.draw_websocket(frame, body),
             Window::Intercept => self.draw_intercept(frame, body),
             Window::Repeater => self.draw_repeater(frame, body),
             Window::Sitemap => self.draw_sitemap(frame, body),
@@ -2421,16 +2441,17 @@ impl App {
 
     /// Mason's tool strip: each window a chip, `Name (key)`, active one lit.
     fn draw_tabs(&self, frame: &mut Frame, area: Rect) {
-        let mut spans = vec![Span::raw(" ")];
+        // Compact labels and no separator span: eight windows have to share one
+        // line, and each chip already carries its own padding.
+        let mut spans = Vec::new();
         for window in Window::ALL {
-            let chip = format!(" {} ({}) ", window.label(), window.key());
+            let chip = format!(" {} ({}) ", window.tab_label(), window.key());
             let style = if window == self.window {
                 Style::new().fg(Color::Black).bg(Color::Cyan).bold()
             } else {
                 Style::new().fg(Color::Gray)
             };
             spans.push(Span::styled(chip, style));
-            spans.push(Span::raw(" "));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -3340,54 +3361,122 @@ impl App {
             ),
         };
 
-        // An upgraded flow's interesting part is not its response — that is a
-        // bare 101 — but the conversation that followed it.
-        let (title, lines) = match self.ws_messages() {
-            Some(frames) if !frames.is_empty() => {
-                (format!(" WebSocket ({}) ", frames.len()), frames)
-            }
-            _ => (" Response ".to_string(), lines),
-        };
-        frame.render_widget(pane(lines, title), area);
+        frame.render_widget(pane(lines, " Response "), area);
     }
 
-    /// The frames on the selected flow, rendered oldest first.
+    /// One flow's frames, oldest first, rendered as a transcript.
     ///
-    /// `None` when this flow is not an upgrade, so the caller can fall back to
-    /// showing the response.
-    fn ws_messages(&self) -> Option<Vec<Line<'static>>> {
-        let flow = self.detail.as_ref()?;
-        let is_upgrade = flow
-            .response
-            .as_ref()
-            .is_some_and(|r| r.status == hudsucker::hyper::StatusCode::SWITCHING_PROTOCOLS);
-        if !is_upgrade {
-            return None;
+    /// Shared by the WebSocket window's frame pane. The most recent
+    /// [`WS_FRAME_CAP`] are kept: a chatty socket carries thousands, and reading
+    /// them all every tick would be the one thing that makes this window slow.
+    fn ws_frame_lines(&self, flow_id: FlowId) -> Vec<Line<'static>> {
+        let all = self.engine.ws_messages(flow_id);
+        let total = all.len();
+        let start = total.saturating_sub(WS_FRAME_CAP);
+
+        let mut lines = Vec::new();
+        if start > 0 {
+            lines.push(Line::styled(format!("… {start} earlier frame(s)"), muted()));
+        }
+        lines.extend(all[start..].iter().map(|m| {
+            // Arrows rather than the stored "c2s"/"s2c": direction is the thing
+            // you scan for, and a glyph reads faster.
+            let (arrow, style) = match m.direction.as_str() {
+                "c2s" => ("▶ ", Style::new().fg(Color::Cyan)),
+                _ => ("◀ ", Style::new().fg(Color::Green)),
+            };
+            let text = match m.opcode.as_str() {
+                "text" => String::from_utf8_lossy(&m.payload).to_string(),
+                "close" => "(close)".to_string(),
+                other => format!("({other}, {} bytes)", m.payload.len()),
+            };
+            Line::from(vec![
+                Span::styled(arrow, style),
+                Span::raw(text.replace('\n', " ")),
+            ])
+        }));
+        lines
+    }
+
+    /// The WebSocket window: connections on top, the selected one's handshake
+    /// and frame transcript below. A mirror of Proxy's layout, for the traffic
+    /// Proxy deliberately no longer shows.
+    fn draw_websocket(&mut self, frame: &mut Frame, area: Rect) {
+        let [history, detail] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+        let [handshake, frames] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(detail);
+
+        self.viewport = history.height.saturating_sub(3) as usize;
+
+        if self.ws_flows.is_empty() {
+            frame.render_widget(
+                empty_pane(
+                    " WebSocket ",
+                    "no WebSocket connections yet — they appear here when a page opens one",
+                ),
+                history,
+            );
+            frame.render_widget(empty_pane(" Handshake ", ""), handshake);
+            frame.render_widget(empty_pane(" Frames ", ""), frames);
+            self.content_len = 0;
+            return;
         }
 
-        Some(
-            self.engine
-                .ws_messages(flow.id)
-                .iter()
-                .map(|m| {
-                    // Arrows rather than the stored "c2s"/"s2c": direction is
-                    // the thing you scan for, and a glyph reads faster.
-                    let (arrow, style) = match m.direction.as_str() {
-                        "c2s" => ("▶ ", Style::new().fg(Color::Cyan)),
-                        _ => ("◀ ", Style::new().fg(Color::Green)),
-                    };
-                    let text = match m.opcode.as_str() {
-                        "text" => String::from_utf8_lossy(&m.payload).to_string(),
-                        "close" => "(close)".to_string(),
-                        other => format!("({other}, {} bytes)", m.payload.len()),
-                    };
-                    Line::from(vec![
-                        Span::styled(arrow, style),
-                        Span::raw(text.replace('\n', " ")),
-                    ])
-                })
-                .collect(),
+        let row = self.ws_row.min(self.ws_flows.len() - 1);
+
+        // --- connections ---
+        let rows: Vec<Row> = self
+            .ws_flows
+            .iter()
+            .map(|f| {
+                Row::new(vec![
+                    "⇅".to_string(),
+                    f.id.to_string(),
+                    clock_time(f.started_at),
+                    f.uri.to_string(),
+                ])
+            })
+            .collect();
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(1),
+                Constraint::Length(5),
+                Constraint::Length(8),
+                Constraint::Min(20),
+            ],
         )
+        .header(Row::new(vec![" ", "ID", "TIME", "URL"]).bold())
+        .block(Block::bordered().title(format!(" WebSocket ({}) ", self.ws_flows.len())))
+        .row_highlight_style(Style::new().bg(INACTIVE_BG))
+        .highlight_symbol("▶ ");
+        self.ws_table.select(Some(row));
+        frame.render_stateful_widget(table, history, &mut self.ws_table);
+
+        // --- detail ---
+        let flow_id = self.ws_flows[row].id;
+        let handshake_lines = match self.engine.get_flow(flow_id) {
+            Some(flow) => message_lines(
+                Line::styled(
+                    format!("{} {}", flow.request.method, flow.request.uri),
+                    Style::new().bold().fg(Color::Cyan),
+                ),
+                &flow.request.headers,
+                &flow.request.body,
+            ),
+            None => vec![Line::styled("(gone)", muted())],
+        };
+        frame.render_widget(pane(handshake_lines, " Handshake "), handshake);
+
+        let frame_lines = self.ws_frame_lines(flow_id);
+        let title = format!(" Frames ({}) ", frame_lines.len());
+        self.content_len = frame_lines.len() as u16;
+        frame.render_widget(
+            pane(frame_lines, title).scroll((self.content_scroll, 0)),
+            frames,
+        );
     }
 
     /// Vim's statusline: mode on the left, position and pending keys right.
@@ -3436,7 +3525,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/I/R/C/T/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · Findings (T): s severity, c status, d delete, <Space>f file · :q";
+const HELP: &str = "^k palette · P/W/I/R/C/T/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · Findings (T): s severity, c status, d delete, <Space>f file · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -3708,6 +3797,11 @@ fn muted() -> Style {
 /// different problem from text — they need a real colour to shade a cell — so
 /// they deliberately do not go through [`muted`].
 const INACTIVE_BG: Color = Color::DarkGray;
+
+/// How many of a socket's most recent frames the transcript keeps. A long-lived
+/// connection carries thousands; rendering all of them every tick is the one
+/// thing that would make the WebSocket window slow.
+const WS_FRAME_CAP: usize = 1_000;
 
 /// A bordered, wrapping pane — the shared shell for Request and Response.
 fn pane(lines: Vec<Line<'static>>, title: impl Into<String>) -> Paragraph<'static> {
@@ -4091,6 +4185,30 @@ mod tests {
         );
     }
 
+    /// Record a WebSocket connection the way the proxy handler does: a 101
+    /// upgrade with a couple of frames hanging off it.
+    fn record_ws(engine: &Arc<Engine>, uri: &str) -> u64 {
+        let id = engine.record_request(CapturedRequest {
+            method: Method::GET,
+            uri: uri.parse().unwrap(),
+            version: Version::HTTP_11,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        });
+        engine.record_response(
+            id,
+            CapturedResponse {
+                status: StatusCode::SWITCHING_PROTOCOLS,
+                version: Version::HTTP_11,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+        engine.record_ws_message(id, 0, "c2s", "text", Bytes::from_static(b"hello"));
+        engine.record_ws_message(id, 1, "s2c", "text", Bytes::from_static(b"world"));
+        id
+    }
+
     fn engine_with(count: usize) -> Arc<Engine> {
         let engine = Engine::new();
         for i in 0..count {
@@ -4356,6 +4474,7 @@ mod tests {
         let out = render(&mut app);
         for chip in [
             "Proxy (P)",
+            "WS (W)",
             "Intercept (I)",
             "Repeater (R)",
             "Sitemap (S)",
@@ -4396,7 +4515,7 @@ mod tests {
         let mut app = App::new(engine_with(1));
         app.refresh();
         press(&mut app, "gt");
-        assert_eq!(app.window, Window::Intercept);
+        assert_eq!(app.window, Window::WebSocket);
         press(&mut app, "gT");
         assert_eq!(app.window, Window::Proxy);
     }
@@ -4547,6 +4666,83 @@ mod tests {
         let mut app = App::new(engine);
         app.refresh();
         assert!(render(&mut app).contains("(pending)"));
+    }
+
+    // --- websocket ---
+
+    /// The whole point: WebSocket connections leave the HTTP history and get
+    /// their own.
+    #[test]
+    fn websockets_are_split_out_of_the_proxy_history() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        record_ws(&engine, "https://api.test/socket");
+        let mut app = App::new(engine);
+        app.refresh();
+
+        assert_eq!(app.flows.len(), 1, "Proxy shows only the HTTP flow");
+        assert!(app.flows[0].uri.to_string().contains("/login"));
+
+        assert_eq!(app.ws_flows.len(), 1, "the socket is in the WS window");
+        assert!(app.ws_flows[0].uri.to_string().contains("/socket"));
+    }
+
+    /// A flow still pending a response is HTTP, not a socket — it has no 101
+    /// yet, so it must not vanish from Proxy while it is in flight.
+    #[test]
+    fn a_pending_request_stays_in_the_http_history() {
+        let engine = Engine::new();
+        engine.record_request(CapturedRequest {
+            method: Method::GET,
+            uri: "https://api.test/slow".parse().unwrap(),
+            version: Version::HTTP_11,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        });
+        let mut app = App::new(engine);
+        app.refresh();
+        assert_eq!(app.flows.len(), 1);
+        assert!(app.ws_flows.is_empty());
+    }
+
+    /// The WS window navigates and renders its connection's frames.
+    #[test]
+    fn the_ws_window_shows_frames_for_the_selected_connection() {
+        let engine = Engine::new();
+        record_ws(&engine, "https://api.test/a");
+        record_ws(&engine, "https://api.test/b");
+        let mut app = App::new(engine);
+        app.refresh();
+        app.window = Window::WebSocket;
+
+        let screen = render(&mut app);
+        assert!(screen.contains("WebSocket (2)"), "{screen}");
+        // The newest connection is selected first (id DESC), and its frames show.
+        assert!(
+            screen.contains("hello") || screen.contains("world"),
+            "{screen}"
+        );
+
+        // j moves to the other connection.
+        press(&mut app, "j");
+        assert_eq!(app.ws_row, 1);
+    }
+
+    /// Scope narrows the WS history too, and the bypass widens it back.
+    #[test]
+    fn scope_filters_the_ws_history() {
+        let engine = Engine::new();
+        record_ws(&engine, "https://in.test/socket");
+        record_ws(&engine, "https://out.test/socket");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        assert_eq!(app.ws_flows.len(), 2);
+
+        app.scope_new("s");
+        app.scope_add_rule("in.test", proxy_core::scope::Action::Include);
+        app.refresh();
+        assert_eq!(app.ws_flows.len(), 1, "only the in-scope socket");
+        assert!(app.ws_flows[0].uri.to_string().contains("in.test"));
     }
 
     // --- findings ---
