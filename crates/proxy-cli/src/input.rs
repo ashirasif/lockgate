@@ -250,6 +250,13 @@ pub enum Action {
     /// `<Space>1` / `<Space>2` — choose which legs of an exchange hold.
     ToggleHoldRequests,
     ToggleHoldResponses,
+    NewSession,
+    CloseSession,
+    SelectSession(usize),
+    History {
+        forward: bool,
+    },
+    ToggleView,
 }
 
 /// One entry in the keymap. Kept free of counts and arguments so the table can
@@ -285,6 +292,13 @@ enum Bind {
     Focus(Option<Column>),
     ToggleHoldRequests,
     ToggleHoldResponses,
+    NewSession,
+    CloseSession,
+    SelectSession(usize),
+    History {
+        forward: bool,
+    },
+    ToggleView,
 }
 
 /// Bindings that only apply inside one window, checked before [`NORMAL_MAP`].
@@ -310,6 +324,22 @@ const WINDOW_MAP: &[(Window, &str, Bind)] = &[
     // Step into the preview for the highlighted item.
     (Window::Intercept, "<CR>", Bind::Enter),
     (Window::Repeater, "<CR>", Bind::Enter),
+    // Session tabs. Only reachable with the buffer unfocused, where these keys
+    // are otherwise idle — inside the buffer `n` and `x` are vim's own.
+    (Window::Repeater, "n", Bind::NewSession),
+    (Window::Repeater, "x", Bind::CloseSession),
+    (Window::Repeater, "[", Bind::History { forward: false }),
+    (Window::Repeater, "]", Bind::History { forward: true }),
+    (Window::Repeater, "p", Bind::ToggleView),
+    (Window::Repeater, "1", Bind::SelectSession(1)),
+    (Window::Repeater, "2", Bind::SelectSession(2)),
+    (Window::Repeater, "3", Bind::SelectSession(3)),
+    (Window::Repeater, "4", Bind::SelectSession(4)),
+    (Window::Repeater, "5", Bind::SelectSession(5)),
+    (Window::Repeater, "6", Bind::SelectSession(6)),
+    (Window::Repeater, "7", Bind::SelectSession(7)),
+    (Window::Repeater, "8", Bind::SelectSession(8)),
+    (Window::Repeater, "9", Bind::SelectSession(9)),
     (Window::Sitemap, "<CR>", Bind::Toggle),
 ];
 
@@ -634,6 +664,11 @@ impl Input {
             Bind::DropAll => Action::DropAll,
             Bind::ToggleIntercept => Action::ToggleIntercept,
             Bind::SendToRepeater => Action::SendToRepeater,
+            Bind::NewSession => Action::NewSession,
+            Bind::CloseSession => Action::CloseSession,
+            Bind::SelectSession(n) => Action::SelectSession(n),
+            Bind::History { forward } => Action::History { forward },
+            Bind::ToggleView => Action::ToggleView,
             Bind::Toggle => Action::Toggle,
             Bind::Enter => Action::Enter,
             Bind::ExternalEdit => Action::ExternalEdit,

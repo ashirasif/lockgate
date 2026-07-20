@@ -21,14 +21,15 @@ use crate::input::{Action, Column, Input, InsertKey, Mode, Motion, PaletteKey, S
 use crate::vim;
 use proxy_core::http_text;
 
-/// The Repeater's working copy of a request.
+/// One Repeater session: a request you are iterating on, and everything you
+/// have sent from it.
 ///
 /// Loaded explicitly with `<Space>s` rather than mirrored from the Proxy cursor.
 /// Mirroring is what the Repeater used to do, and it cannot survive editing: the
 /// cursor moves on every tick of new traffic, and an edited buffer that a cursor
 /// move silently replaced would lose work with no way to get it back.
 #[derive(Default)]
-struct Repeater {
+struct Session {
     /// The flow this was loaded from, so replays keep their lineage.
     origin: Option<u64>,
     /// The request as editable wire text.
@@ -36,17 +37,189 @@ struct Repeater {
     /// What the original looked like, to reparse edits against (for the scheme
     /// and authority that origin-form text cannot carry).
     original: Option<CapturedRequest>,
-    /// The last response, rendered. Shared because the send runs on its own task
-    /// so a slow target cannot freeze the UI.
-    response: Arc<Mutex<Option<String>>>,
     /// Why the last send attempt did not leave — a parse error in the buffer.
     error: Option<String>,
+    /// Every send from this session, oldest first.
+    history: Vec<Exchange>,
+    /// Which exchange the response pane is showing. `None` means the newest,
+    /// and *stays* newest as sends land — stepping back pins it so a slow
+    /// response cannot yank the view off what you were reading.
+    viewing: Option<usize>,
+}
+
+/// One send: what went out, and what came back.
+#[derive(Default)]
+struct Exchange {
+    /// The request text as sent, so history shows what was actually on the wire
+    /// rather than whatever the buffer says now.
+    request: String,
+    /// Filled by the send task. Shared rather than channelled because a send
+    /// runs on its own task so a slow target cannot freeze the UI, and the
+    /// draw path only ever reads it.
+    result: Arc<Mutex<Option<SendResult>>>,
+}
+
+/// What came back, with the two numbers worth knowing at a glance.
+struct SendResult {
+    /// The rendered response, or the failure in its place.
+    text: String,
+    /// Body bytes. `None` when the send failed before a response existed.
+    bytes: Option<usize>,
+    /// Wall-clock for the round trip. Measured here rather than in the engine
+    /// because it is a property of this send, not of the flow it recorded.
+    millis: u128,
+    failed: bool,
+}
+
+impl SendResult {
+    /// The two numbers Caido puts in the corner: how much came back, and how
+    /// long it took.
+    fn summary(&self) -> String {
+        match self.bytes {
+            Some(bytes) => format!("{bytes} B · {}ms", self.millis),
+            None => format!("failed · {}ms", self.millis),
+        }
+    }
+}
+
+impl Session {
+    /// The exchange the response pane should show.
+    fn current(&self) -> Option<&Exchange> {
+        match self.viewing {
+            Some(i) => self.history.get(i),
+            None => self.history.last(),
+        }
+    }
+
+    /// Position in history as `(nth, total)`, 1-based for display.
+    fn position(&self) -> Option<(usize, usize)> {
+        let total = self.history.len();
+        if total == 0 {
+            return None;
+        }
+        let index = self.viewing.unwrap_or(total - 1);
+        Some((index + 1, total))
+    }
+
+    /// A short name for the tab: the host being hit, which is the thing that
+    /// tells two sessions apart at a glance.
+    fn label(&self) -> String {
+        self.original
+            .as_ref()
+            .and_then(|r| r.uri.host().map(str::to_string))
+            .unwrap_or_else(|| "empty".to_string())
+    }
+}
+
+/// How the response pane renders what it is showing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// Exactly the bytes that arrived.
+    #[default]
+    Raw,
+    /// Reformatted for reading. Distinct from `gq`, which *edits* a buffer —
+    /// this only changes the view, so a response you are inspecting is never
+    /// misrepresented as something you could have sent.
+    Pretty,
+}
+
+/// The Repeater window: several sessions, one on screen.
+struct Repeater {
+    sessions: Vec<Session>,
+    /// Index into `sessions`. Kept in range by every mutation, so the draw path
+    /// can index without checking.
+    active: usize,
     /// Whether the buffer has the keys.
     ///
     /// The Repeater is almost all buffer, so it is tempting to leave it always
     /// focused — but the buffer keymap claims `I`, `A`, `P` and `gt`, and a
     /// window you cannot leave is a trap. `<CR>` steps in, `<Esc>` steps out.
     focused: bool,
+    view: View,
+}
+
+impl Default for Repeater {
+    fn default() -> Self {
+        // One session always exists, so "the Repeater is empty" is a statement
+        // about a session having no request rather than a separate state the
+        // whole window can be in.
+        Self {
+            sessions: vec![Session::default()],
+            active: 0,
+            focused: false,
+            view: View::default(),
+        }
+    }
+}
+
+impl Repeater {
+    fn session(&self) -> &Session {
+        &self.sessions[self.active]
+    }
+
+    fn session_mut(&mut self) -> &mut Session {
+        &mut self.sessions[self.active]
+    }
+
+    /// Open a new session and switch to it.
+    fn open(&mut self) {
+        self.sessions.push(Session::default());
+        self.active = self.sessions.len() - 1;
+    }
+
+    /// Close the active session. The last one is emptied rather than removed,
+    /// so there is always somewhere to land.
+    fn close(&mut self) {
+        if self.sessions.len() == 1 {
+            self.sessions[0] = Session::default();
+            return;
+        }
+        self.sessions.remove(self.active);
+        self.active = self.active.min(self.sessions.len() - 1);
+    }
+
+    fn select(&mut self, index: usize) -> bool {
+        if index >= self.sessions.len() {
+            return false;
+        }
+        self.active = index;
+        true
+    }
+
+    /// Step through history. Returns false at either end, so the caller can say
+    /// so rather than silently doing nothing.
+    ///
+    /// Landing on the newest exchange means *following* the newest — `viewing`
+    /// goes back to `None` — rather than pinning to its index. The two look
+    /// identical until a send lands, and then only the former shows it.
+    fn step_history(&mut self, forward: bool) -> bool {
+        let total = self.sessions[self.active].history.len();
+        if total == 0 {
+            return false;
+        }
+        let session = &mut self.sessions[self.active];
+        let newest = total - 1;
+        let current = session.viewing.unwrap_or(newest);
+
+        if !forward {
+            if current == 0 {
+                return false;
+            }
+            session.viewing = Some(current - 1);
+            return true;
+        }
+
+        if current + 1 >= newest {
+            // Already following the newest: there is nowhere further forward.
+            if session.viewing.is_none() {
+                return false;
+            }
+            session.viewing = None;
+            return true;
+        }
+        session.viewing = Some(current + 1);
+        true
+    }
 }
 
 /// The Intercept window's view state. The queues themselves live on the engine.
@@ -339,7 +512,7 @@ impl App {
 
         match job.target {
             EditTarget::Repeater => {
-                self.repeater.request = buffer;
+                self.repeater.session_mut().request = buffer;
                 self.note("edit applied — <Space>r to send");
             }
             EditTarget::Held { requests, ticket } => {
@@ -360,9 +533,9 @@ impl App {
     /// Stage the focused buffer for editing. The run loop picks this up.
     fn request_external_edit(&mut self) {
         let job = match self.window {
-            Window::Repeater => self.repeater.original.as_ref().map(|_| EditJob {
+            Window::Repeater => self.repeater.session().original.as_ref().map(|_| EditJob {
                 target: EditTarget::Repeater,
-                before: self.repeater.request.text(),
+                before: self.repeater.session().request.text(),
             }),
             Window::Intercept => {
                 let requests = self.intercept.showing_requests();
@@ -467,7 +640,7 @@ impl App {
     /// drops a request instead of starting a delete.
     fn sync_buffer_focus(&mut self) {
         let editing = match self.window {
-            Window::Repeater => self.repeater.focused && self.repeater.original.is_some(),
+            Window::Repeater => self.repeater.focused && self.repeater.session().original.is_some(),
             Window::Intercept => self.intercept.pane == Pane::Preview,
             _ => false,
         };
@@ -552,6 +725,52 @@ impl App {
             Action::Resend if self.window == Window::Repeater => self.send_repeater(),
             Action::Resend => self.resend_selected(),
             Action::SendToRepeater => self.load_repeater(),
+            Action::NewSession => {
+                self.repeater.open();
+                self.content_scroll = 0;
+                self.note(&format!(
+                    "tab {} — <Space>s to load a flow",
+                    self.repeater.active + 1
+                ));
+            }
+            Action::CloseSession => {
+                let closed = self.repeater.active + 1;
+                self.repeater.close();
+                self.content_scroll = 0;
+                self.note(&format!("closed tab {closed}"));
+            }
+            Action::SelectSession(n) => {
+                // 1-based on screen, so the key you press is the number you see.
+                if self.repeater.select(n.saturating_sub(1)) {
+                    self.content_scroll = 0;
+                } else {
+                    self.note(&format!("no tab {n}"));
+                }
+            }
+            Action::History { forward } => {
+                if self.repeater.step_history(forward) {
+                    self.content_scroll = 0;
+                    if let Some((nth, total)) = self.repeater.session().position() {
+                        self.note(&format!("exchange {nth}/{total}"));
+                    }
+                } else {
+                    self.note(if forward {
+                        "already at the newest send"
+                    } else {
+                        "already at the oldest send"
+                    });
+                }
+            }
+            Action::ToggleView => {
+                self.repeater.view = match self.repeater.view {
+                    View::Raw => View::Pretty,
+                    View::Pretty => View::Raw,
+                };
+                self.note(match self.repeater.view {
+                    View::Pretty => "response: pretty (view only — the bytes are unchanged)",
+                    View::Raw => "response: raw",
+                });
+            }
             Action::Insert(key) => self.edit(key),
             Action::Forward => self.answer_held(true),
             Action::Drop => self.answer_held(false),
@@ -599,9 +818,16 @@ impl App {
     /// Step into the focused buffer, wherever the window keeps one.
     fn enter_preview(&mut self) {
         if self.window == Window::Repeater {
-            if self.repeater.original.is_some() {
+            if self.repeater.session().original.is_some() {
+                // Editing always means editing the live request. Pinned to an
+                // older exchange the pane is showing what was sent, and typing
+                // into that view would put keystrokes somewhere they cannot go.
+                if self.repeater.session_mut().viewing.take().is_some() {
+                    self.note("back to the newest — editing the live request");
+                } else {
+                    self.note("editing — vim keys, <Esc> to leave");
+                }
                 self.repeater.focused = true;
-                self.note("editing — vim keys, <Esc> to leave");
             }
             return;
         }
@@ -941,11 +1167,10 @@ impl App {
     /// the first keystroke is what turns a held item into an edited one.
     fn active_buffer(&mut self) -> Option<&mut TextBuffer> {
         match self.window {
-            Window::Repeater => self
-                .repeater
-                .original
-                .is_some()
-                .then(|| &mut self.repeater.request),
+            Window::Repeater => {
+                let session = self.repeater.session_mut();
+                session.original.is_some().then_some(&mut session.request)
+            }
             Window::Intercept => self.preview_buffer(self.intercept.showing_requests()),
             _ => None,
         }
@@ -1065,60 +1290,98 @@ impl App {
             return;
         };
         let id = flow.id;
-        self.repeater = Repeater {
+        let session = Session {
             origin: Some(id),
             request: TextBuffer::from_text(&http_text::render_request(&flow.request)),
             original: Some(flow.request),
-            response: Arc::new(Mutex::new(None)),
-            error: None,
-            focused: false,
+            ..Session::default()
         };
+        // Land in a fresh tab unless the current one is untouched, so sending a
+        // second flow over cannot discard a request you were editing.
+        if self.repeater.session().original.is_some() {
+            self.repeater.open();
+        }
+        *self.repeater.session_mut() = session;
+        self.repeater.focused = false;
         self.show_window(Window::Repeater);
-        self.note(&format!("#{id} → Repeater"));
+        self.note(&format!(
+            "#{id} → Repeater tab {}",
+            self.repeater.active + 1
+        ));
     }
 
     /// Send what is in the Repeater buffer, edits included.
     fn send_repeater(&mut self) {
-        let Some(original) = self.repeater.original.clone() else {
+        let Some(original) = self.repeater.session().original.clone() else {
             self.note("Repeater is empty — pick a flow in Proxy and press <Space>s");
             return;
         };
-        let request = match http_text::parse_request(&self.repeater.request.text(), &original) {
-            Ok(req) => req,
-            Err(e) => {
-                // Kept on the pane, not just the status line: a parse error is
-                // about the buffer, and belongs next to it.
-                self.repeater.error = Some(e.to_string());
-                self.note(&format!("not sent — {e}"));
-                return;
-            }
-        };
-        self.repeater.error = None;
-        self.repeater.request.clear_dirty();
+        let request =
+            match http_text::parse_request(&self.repeater.session().request.text(), &original) {
+                Ok(req) => req,
+                Err(e) => {
+                    // Kept on the pane, not just the status line: a parse error is
+                    // about the buffer, and belongs next to it.
+                    self.repeater.session_mut().error = Some(e.to_string());
+                    self.note(&format!("not sent — {e}"));
+                    return;
+                }
+            };
+        self.repeater.session_mut().error = None;
+        self.repeater.session_mut().request.clear_dirty();
 
         let engine = self.engine.clone();
         let status = self.status.clone();
-        let slot = self.repeater.response.clone();
-        let origin = self.repeater.origin;
+        let origin = self.repeater.session().origin;
+
+        // The exchange is recorded before the send returns, so history shows an
+        // in-flight request rather than nothing until it lands.
+        let sent_text = self.repeater.session().request.text();
+        let slot = Arc::new(Mutex::new(None));
+        let session = self.repeater.session_mut();
+        session.history.push(Exchange {
+            request: sent_text,
+            result: slot.clone(),
+        });
+        // Any send jumps the view back to the newest, which is the one you just
+        // asked for.
+        session.viewing = None;
 
         self.note("sending…");
         tokio::spawn(async move {
-            let message = match engine.send_request(request, origin).await {
+            // Timed here rather than in the engine: this is a property of this
+            // send, not of the flow it records.
+            let started = std::time::Instant::now();
+            let outcome = engine.send_request(request, origin).await;
+            let millis = started.elapsed().as_millis();
+
+            let (result, message) = match outcome {
                 Ok(sent) => {
-                    let text = http_text::render_response(&sent.response);
-                    *slot.lock().unwrap() = Some(text);
-                    format!(
-                        "sent → {} ({} bytes) as #{}",
-                        sent.response.status,
-                        sent.response.body.len(),
-                        sent.replay_id
+                    let bytes = sent.response.body.len();
+                    (
+                        SendResult {
+                            text: http_text::render_response(&sent.response),
+                            bytes: Some(bytes),
+                            millis,
+                            failed: false,
+                        },
+                        format!(
+                            "sent → {} ({bytes} bytes, {millis}ms) as #{}",
+                            sent.response.status, sent.replay_id
+                        ),
                     )
                 }
-                Err(e) => {
-                    *slot.lock().unwrap() = Some(format!("send failed: {e:?}"));
-                    format!("send failed: {e:?}")
-                }
+                Err(e) => (
+                    SendResult {
+                        text: format!("send failed: {e:?}"),
+                        bytes: None,
+                        millis,
+                        failed: true,
+                    },
+                    format!("send failed: {e:?}"),
+                ),
             };
+            *slot.lock().unwrap() = Some(result);
             *status.lock().unwrap() = message;
         });
     }
@@ -1673,27 +1936,116 @@ impl App {
     /// the right. `i` edits, Escape leaves, `<Space>r` sends what is in the
     /// buffer. Loaded explicitly with `<Space>s` from Proxy.
     fn draw_repeater(&mut self, frame: &mut Frame, area: Rect) {
-        let [banner, panes] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        let [tabs, banner, panes] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(area);
         self.viewport = panes.height.saturating_sub(2) as usize;
 
-        if self.repeater.original.is_none() {
+        self.draw_repeater_tabs(frame, tabs);
+
+        if self.repeater.session().original.is_none() {
             self.content_len = 0;
             frame.render_widget(
                 empty_pane(
                     " Repeater ",
                     "empty — select a flow in Proxy (P) and press <Space>s",
                 ),
-                area,
+                panes,
+            );
+            frame.render_widget(
+                Paragraph::new(Line::styled("  n new tab   x close   1-9 switch", muted())),
+                banner,
             );
             return;
         }
 
         let inserting = self.input.mode() == Mode::Insert;
         let editing = self.repeater.focused;
-        let dirty = self.repeater.request.is_dirty();
+        let dirty = self.repeater.session().request.is_dirty();
+
+        self.draw_repeater_status(frame, banner, editing, dirty);
+
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(panes);
+
+        // Pinned to an older exchange, the request pane shows what was *sent*
+        // then, not what the buffer says now. Showing the live buffer beside an
+        // old response would pair a request with a reply it never produced.
+        let pinned = self
+            .repeater
+            .session()
+            .viewing
+            .and_then(|i| self.repeater.session().history.get(i))
+            .map(|e| e.request.clone());
+
+        // Built only when pinned, so the live path borrows the real buffer
+        // rather than copying it on every frame.
+        let pinned_buffer = pinned.as_deref().map(TextBuffer::from_text);
+        let (title, buffer, focused) = match &pinned_buffer {
+            Some(buffer) => (" Request (sent) ".to_string(), buffer, false),
+            None => (
+                if dirty { " Request* " } else { " Request " }.to_string(),
+                &self.repeater.session().request,
+                editing,
+            ),
+        };
+        let border = if focused {
+            Style::new().fg(Color::Cyan)
+        } else {
+            muted()
+        };
+        BufferView {
+            buffer,
+            cache: Some(&self.syntax_cache),
+            title,
+            focused,
+            inserting,
+            border,
+            scroll: self.content_scroll,
+        }
+        .render(frame, left);
+
+        self.draw_repeater_response(frame, right);
+    }
+
+    /// The tab strip. One entry per session, labelled by the host it targets,
+    /// because that is what tells two sessions apart at a glance.
+    fn draw_repeater_tabs(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = Vec::new();
+        for (i, session) in self.repeater.sessions.iter().enumerate() {
+            let active = i == self.repeater.active;
+            let unsent = session.original.is_some() && session.history.is_empty();
+            let style = if active {
+                Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+            } else {
+                muted()
+            };
+            // The number is the key that selects it, so it is never cosmetic.
+            spans.push(Span::styled(
+                format!(
+                    " {} {}{} ",
+                    i + 1,
+                    session.label(),
+                    if unsent { "*" } else { "" }
+                ),
+                style,
+            ));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("n +", muted()));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Origin, history position, and the two numbers worth knowing about the
+    /// response on screen.
+    fn draw_repeater_status(&self, frame: &mut Frame, area: Rect, editing: bool, dirty: bool) {
+        let session = self.repeater.session();
         let mut chips = vec![Span::styled(
-            match self.repeater.origin {
+            match session.origin {
                 Some(id) => format!(" from #{id} "),
                 None => " new ".to_string(),
             },
@@ -1702,58 +2054,115 @@ impl App {
         if dirty {
             chips.push(Span::styled(" edited ", Style::new().fg(Color::Yellow)));
         }
+
+        if let Some((nth, total)) = session.position() {
+            // Pinned to an older exchange is worth flagging: the response on
+            // screen is then not the one the buffer would produce.
+            let pinned = session.viewing.is_some();
+            chips.push(Span::styled(
+                format!(" {nth}/{total} "),
+                if pinned {
+                    Style::new().fg(Color::Yellow)
+                } else {
+                    muted()
+                },
+            ));
+        }
+
+        // Read under the lock and copy out: `take` would empty the slot and the
+        // response would vanish after one frame.
+        if let Some(result) = session
+            .current()
+            .and_then(|e| e.result.lock().unwrap().as_ref().map(SendResult::summary))
+        {
+            chips.push(Span::styled(format!(" {result} "), muted()));
+        }
+
+        chips.push(Span::styled(
+            match self.repeater.view {
+                View::Pretty => " Pretty ",
+                View::Raw => " Raw ",
+            },
+            Style::new().fg(Color::Cyan),
+        ));
+
         chips.push(Span::styled(
             if editing {
                 "  vim keys   <Esc> leave".to_string()
             } else {
-                "  <CR> edit   ^g $EDITOR   gq format   <Space>r send".to_string()
+                "  <CR> edit  ^g $EDITOR  gq format  p view  [ ] history  <Space>r send".to_string()
             },
             muted(),
         ));
-        frame.render_widget(Paragraph::new(Line::from(chips)), banner);
+        frame.render_widget(Paragraph::new(Line::from(chips)), area);
+    }
 
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(panes);
+    /// The response pane, showing whichever exchange history is pointed at.
+    fn draw_repeater_response(&mut self, frame: &mut Frame, area: Rect) {
+        let session = self.repeater.session();
+        let pretty = self.repeater.view == View::Pretty;
 
-        let title = if dirty { " Request* " } else { " Request " };
-        let border = if editing {
-            Style::new().fg(Color::Cyan)
-        } else {
-            muted()
-        };
-        BufferView {
-            buffer: &self.repeater.request,
-            cache: Some(&self.syntax_cache),
-            title: title.to_string(),
-            focused: editing,
-            inserting,
-            border,
-            scroll: self.content_scroll,
-        }
-        .render(frame, left);
-
-        let response = self.repeater.response.lock().unwrap().clone();
-        let mut lines: Vec<Line> = match &self.repeater.error {
-            Some(e) => vec![Line::styled(
+        // A real response gets the buffer treatment — numbers, syntax, sideways
+        // scroll. A placeholder is one styled line and would look absurd with a
+        // gutter beside it.
+        let body: Result<String, Line<'static>> = match &session.error {
+            Some(e) => Err(Line::styled(
                 format!("cannot send: {e}"),
                 Style::new().fg(Color::Red),
-            )],
-            None => match &response {
-                None => vec![Line::styled("(not sent yet — <Space>r)", muted())],
-                Some(text) => crate::syntax::highlighted_lines(text),
+            )),
+            None => match session.current() {
+                None => Err(Line::styled("(not sent yet — <Space>r)", muted())),
+                Some(exchange) => {
+                    let held = exchange.result.lock().unwrap();
+                    match held.as_ref() {
+                        None => Err(Line::styled("(in flight…)", Style::new().fg(Color::Yellow))),
+                        Some(result) if result.failed => Err(Line::styled(
+                            result.text.clone(),
+                            Style::new().fg(Color::Red),
+                        )),
+                        // Pretty is a *view*: the reformat is rebuilt every
+                        // frame and never touches what was received, so a
+                        // response is never misrepresented as something you
+                        // could have sent. A body that will not reformat shows
+                        // as it arrived rather than as an error.
+                        Some(result) if pretty => {
+                            Ok(proxy_core::pretty::pretty_message(&result.text)
+                                .map(|(text, _)| text)
+                                .unwrap_or_else(|_| result.text.clone()))
+                        }
+                        Some(result) => Ok(result.text.clone()),
+                    }
+                }
             },
         };
-        // The request pane owns the scroll bound; the response follows it, so a
-        // long response still needs the buffer to be at least as tall.
-        self.content_len = self.repeater.request.lines().len().max(lines.len()).max(1) as u16;
-        if lines.is_empty() {
-            lines.push(Line::from(""));
+
+        let request_lines = self.repeater.session().request.lines().len();
+        match body {
+            Err(message) => {
+                self.content_len = request_lines.max(1) as u16;
+                frame.render_widget(
+                    pane(vec![message], " Response ").scroll((self.content_scroll, 0)),
+                    area,
+                );
+            }
+            Ok(text) => {
+                // The request pane owns the scroll bound; the response follows
+                // it, so a long response still needs the buffer to be at least
+                // as tall.
+                let buffer = TextBuffer::from_text(&text);
+                self.content_len = request_lines.max(buffer.lines().len()).max(1) as u16;
+                BufferView {
+                    buffer: &buffer,
+                    cache: Some(&self.syntax_cache),
+                    title: " Response ".to_string(),
+                    focused: false,
+                    inserting: false,
+                    border: muted(),
+                    scroll: self.content_scroll,
+                }
+                .render(frame, area);
+            }
         }
-        frame.render_widget(
-            pane(lines, " Response ").scroll((self.content_scroll, 0)),
-            right,
-        );
     }
 
     /// Intercept: four panes. The two legs of an exchange side by side, each a
@@ -2193,7 +2602,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Intercept: <Space>i hold, ^w pane, f/d answer · :q";
+const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, 1-9 switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -2532,11 +2941,18 @@ impl BufferView<'_> {
     /// Vim's hybrid gutter: distance from the cursor on every line, but the
     /// cursor's own line shows its absolute number — relative numbers are for
     /// counting a jump, and `0` would say nothing.
+    ///
+    /// Without focus there is no cursor and nothing to count *to*, so the
+    /// numbers go absolute. A relative gutter in a pane you cannot move around
+    /// in would be measuring from a cursor the operator cannot see.
     fn gutter(&self, width: u16) -> Vec<Line<'static>> {
         let cursor = self.buffer.cursor().line;
         let width = width.saturating_sub(1) as usize;
         (0..self.buffer.lines().len())
             .map(|line| {
+                if !self.focused {
+                    return Line::styled(format!("{:>width$} ", line + 1), muted());
+                }
                 if line == cursor {
                     Line::styled(
                         format!("{:<width$} ", line + 1),
@@ -3237,12 +3653,16 @@ mod tests {
 
         press(&mut app, " s");
         assert_eq!(app.window, Window::Repeater);
-        let loaded = app.repeater.origin;
+        let loaded = app.repeater.session().origin;
         assert!(loaded.is_some());
 
         // Go back and move the cursor; the Repeater must not follow.
         press(&mut app, "Pj");
-        assert_eq!(app.repeater.origin, loaded, "the buffer should be pinned");
+        assert_eq!(
+            app.repeater.session().origin,
+            loaded,
+            "the buffer should be pinned"
+        );
     }
 
     #[test]
@@ -3268,11 +3688,11 @@ mod tests {
         assert_eq!(app.input.mode(), Mode::Insert);
         press(&mut app, "XY");
         assert!(
-            app.repeater.request.text().starts_with("XY"),
+            app.repeater.session().request.text().starts_with("XY"),
             "typed text should land at the cursor: {:?}",
-            app.repeater.request.text()
+            app.repeater.session().request.text()
         );
-        assert!(app.repeater.request.is_dirty());
+        assert!(app.repeater.session().request.is_dirty());
         // The pane marks itself edited so the operator can see it diverged.
         assert!(render(&mut app).contains("Request*"));
 
@@ -3282,16 +3702,286 @@ mod tests {
 
     /// A buffer that no longer parses must refuse to send and say why, rather
     /// than quietly sending the pre-edit request.
+    /// Tabs are 1-based on screen, so the key you press must be the number you
+    /// see — an off-by-one here would be invisible until it selected the wrong
+    /// request.
+    #[test]
+    fn session_tabs_open_close_and_select() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        assert_eq!(app.repeater.sessions.len(), 1, "one session always exists");
+
+        app.apply(Action::NewSession);
+        app.apply(Action::NewSession);
+        assert_eq!(app.repeater.sessions.len(), 3);
+        assert_eq!(app.repeater.active, 2, "opening switches to the new tab");
+
+        app.apply(Action::SelectSession(1));
+        assert_eq!(app.repeater.active, 0, "1 selects the first tab");
+
+        app.apply(Action::SelectSession(9));
+        assert_eq!(
+            app.repeater.active, 0,
+            "a tab that isn't there changes nothing"
+        );
+
+        app.apply(Action::CloseSession);
+        assert_eq!(app.repeater.sessions.len(), 2);
+    }
+
+    /// There must always be somewhere to land, or the draw path would index an
+    /// empty vector.
+    #[test]
+    fn closing_the_last_tab_empties_it_rather_than_removing_it() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        assert!(app.repeater.session().original.is_some());
+
+        app.apply(Action::CloseSession);
+        assert_eq!(app.repeater.sessions.len(), 1);
+        assert!(
+            app.repeater.session().original.is_none(),
+            "the survivor should be blank"
+        );
+    }
+
+    /// Loading a second flow must not discard a request you were editing.
+    #[test]
+    fn a_second_flow_lands_in_its_own_tab() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        let first = app.repeater.active;
+
+        app.apply(Action::SendToRepeater);
+        assert_ne!(app.repeater.active, first, "should not overwrite the first");
+        assert_eq!(app.repeater.sessions.len(), 2);
+    }
+
+    /// Each send is recorded before it lands, so history shows an in-flight
+    /// request rather than nothing.
+    #[test]
+    fn sending_records_an_exchange_immediately() {
+        // A send spawns onto the runtime; it only has to *start* for the
+        // exchange to be recorded, which is what these assert on.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        assert!(app.repeater.session().history.is_empty());
+
+        app.send_repeater();
+        assert_eq!(app.repeater.session().history.len(), 1);
+        assert_eq!(app.repeater.session().position(), Some((1, 1)));
+        // The request text is snapshotted as sent, not read back off the buffer.
+        assert!(
+            app.repeater.session().history[0]
+                .request
+                .contains("HTTP/1.1")
+        );
+    }
+
+    #[test]
+    fn history_steps_and_stops_at_the_ends() {
+        // A send spawns onto the runtime; it only has to *start* for the
+        // exchange to be recorded, which is what these assert on.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        app.send_repeater();
+        app.send_repeater();
+        app.send_repeater();
+        assert_eq!(app.repeater.session().position(), Some((3, 3)));
+
+        app.apply(Action::History { forward: false });
+        assert_eq!(app.repeater.session().position(), Some((2, 3)));
+        app.apply(Action::History { forward: false });
+        assert_eq!(app.repeater.session().position(), Some((1, 3)));
+
+        // The oldest is the end of the line.
+        app.apply(Action::History { forward: false });
+        assert_eq!(app.repeater.session().position(), Some((1, 3)));
+
+        app.apply(Action::History { forward: true });
+        assert_eq!(app.repeater.session().position(), Some((2, 3)));
+    }
+
+    /// Stepping past the newest goes back to *following* the newest, so a later
+    /// send appears without having to navigate to it.
+    #[test]
+    fn stepping_past_the_newest_resumes_following_it() {
+        // A send spawns onto the runtime; it only has to *start* for the
+        // exchange to be recorded, which is what these assert on.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        app.send_repeater();
+        app.send_repeater();
+
+        app.apply(Action::History { forward: false });
+        assert!(
+            app.repeater.session().viewing.is_some(),
+            "pinned to an older one"
+        );
+
+        app.apply(Action::History { forward: true });
+        assert_eq!(
+            app.repeater.session().viewing,
+            None,
+            "back to following the newest"
+        );
+
+        // And a new send is what you now see.
+        app.send_repeater();
+        assert_eq!(app.repeater.session().position(), Some((3, 3)));
+    }
+
+    /// A send always shows you what you just asked for, even if you were
+    /// reading an older exchange.
+    #[test]
+    fn sending_unpins_the_history_view() {
+        // A send spawns onto the runtime; it only has to *start* for the
+        // exchange to be recorded, which is what these assert on.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        app.send_repeater();
+        app.send_repeater();
+        app.apply(Action::History { forward: false });
+        assert!(app.repeater.session().viewing.is_some());
+
+        app.send_repeater();
+        assert_eq!(app.repeater.session().viewing, None);
+    }
+
+    /// Sessions are independent: history in one must not show up in another.
+    #[test]
+    fn history_is_per_session() {
+        // A send spawns onto the runtime; it only has to *start* for the
+        // exchange to be recorded, which is what these assert on.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        app.send_repeater();
+        assert_eq!(app.repeater.session().history.len(), 1);
+
+        app.apply(Action::NewSession);
+        assert!(
+            app.repeater.session().history.is_empty(),
+            "a fresh tab is empty"
+        );
+
+        app.apply(Action::SelectSession(1));
+        assert_eq!(
+            app.repeater.session().history.len(),
+            1,
+            "the first tab kept its own"
+        );
+    }
+
+    /// Pairing the live buffer with an old response would show a request that
+    /// never produced the reply beside it.
+    #[test]
+    fn pinned_history_shows_the_request_as_it_was_sent() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        app.send_repeater();
+
+        // Change the buffer after sending, so live and historical differ.
+        app.repeater.session_mut().request = TextBuffer::from_text("GET /changed HTTP/1.1\n\n");
+        app.send_repeater();
+
+        app.apply(Action::History { forward: false });
+        let screen = render(&mut app);
+        assert!(
+            screen.contains("Request (sent)"),
+            "should flag the pinned view"
+        );
+        assert!(
+            !screen.contains("/changed"),
+            "the live edit must not appear beside an older response:\n{screen}"
+        );
+    }
+
+    /// Typing into a view of a past request would put keystrokes somewhere they
+    /// cannot go, so editing snaps back to the live one.
+    #[test]
+    fn editing_while_pinned_returns_to_the_newest() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        app.send_repeater();
+        app.send_repeater();
+
+        app.apply(Action::History { forward: false });
+        assert!(app.repeater.session().viewing.is_some());
+
+        app.apply(Action::Enter);
+        assert_eq!(
+            app.repeater.session().viewing,
+            None,
+            "entering the buffer must unpin"
+        );
+        assert!(app.repeater.focused);
+    }
+
+    #[test]
+    fn the_view_toggle_flips_and_says_so() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        assert_eq!(app.repeater.view, View::Raw, "raw is the honest default");
+
+        app.apply(Action::ToggleView);
+        assert_eq!(app.repeater.view, View::Pretty);
+        let status = app.status.lock().unwrap().clone();
+        assert!(status.contains("pretty"), "{status}");
+
+        app.apply(Action::ToggleView);
+        assert_eq!(app.repeater.view, View::Raw);
+    }
+
+    /// The tab label is what tells two sessions apart at a glance.
+    #[test]
+    fn tabs_are_labelled_by_host() {
+        let mut app = App::new(engine_with(3));
+        app.refresh();
+        app.apply(Action::SendToRepeater);
+        let label = app.repeater.session().label();
+        assert_ne!(label, "empty", "a loaded session should name its host");
+
+        app.apply(Action::NewSession);
+        assert_eq!(app.repeater.session().label(), "empty");
+    }
+
     #[test]
     fn repeater_reports_an_unsendable_buffer() {
         let mut app = App::new(engine_with(1));
         app.refresh();
         press(&mut app, " s");
-        app.repeater.request = TextBuffer::from_text("GET /x HTTP/1.1\nbroken-header\n\n");
-        app.repeater.request.insert_char(' ');
+        app.repeater.session_mut().request =
+            TextBuffer::from_text("GET /x HTTP/1.1\nbroken-header\n\n");
+        app.repeater.session_mut().request.insert_char(' ');
 
         app.send_repeater();
-        assert!(app.repeater.error.is_some(), "should refuse to send");
+        assert!(
+            app.repeater.session().error.is_some(),
+            "should refuse to send"
+        );
         assert!(render(&mut app).contains("cannot send"));
     }
 
