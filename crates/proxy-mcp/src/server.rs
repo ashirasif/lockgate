@@ -1,6 +1,6 @@
-//! The MCP server: fifteen tools — recon over captured traffic, plus live
-//! interception — and the `flow://` resources that carry full request/response
-//! bodies on demand.
+//! The MCP server: recon over captured traffic, live interception, scope
+//! management and request sending — plus the `flow://` resources that carry
+//! full request/response bodies on demand.
 //!
 //! Every tool is a thin shell over an `Engine` verb. Reads go straight to the
 //! engine's database-backed queries; the two writes (annotate, create finding)
@@ -11,6 +11,10 @@
 //! item is a live connection parked on a channel, not history. They share the
 //! engine's `Intercept` with the TUI, so an agent and an operator work the same
 //! queue, and share `http_text` so both see byte-identical wire text.
+//!
+//! `send_request` is the Repeater for agents. The TUI's Repeater keeps tabs and
+//! per-session history, which is view state and lives there; what is shared is
+//! the part that matters — take wire text, send it, record a flow.
 
 use std::sync::Arc;
 
@@ -161,6 +165,157 @@ pub struct AnsweredAllResult {
     pub answered: i64,
 }
 
+// --- scope ---
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ScopeDto {
+    pub id: i64,
+    pub name: String,
+    /// Only one scope is active, and it is the active one that narrows
+    /// list_flows when in_scope is set.
+    pub is_active: bool,
+    pub rule_count: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ScopeRuleDto {
+    pub id: i64,
+    /// "include" or "exclude". Excludes always beat includes, so the result
+    /// does not depend on rule order.
+    pub action: String,
+    /// "glob", "regex", "cidr", or "any" when the rule does not constrain host.
+    pub host_kind: String,
+    pub host_pattern: Option<String>,
+    pub port: Option<u16>,
+    pub path_prefix: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListScopesResult {
+    pub scopes: Vec<ScopeDto>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CreateScopeParams {
+    pub name: String,
+    /// Make it the active scope straight away. A scope nobody activated
+    /// narrows nothing.
+    pub activate: Option<bool>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ScopeIdResult {
+    pub id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ScopeIdParams {
+    pub scope_id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ListScopeRulesParams {
+    /// Omit for the active scope.
+    pub scope_id: Option<i64>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListScopeRulesResult {
+    pub scope_id: i64,
+    pub rules: Vec<ScopeRuleDto>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AddScopeRuleParams {
+    /// Omit for the active scope.
+    pub scope_id: Option<i64>,
+    /// "include" (default) or "exclude".
+    pub action: Option<String>,
+    /// Host pattern. Note `*.example.com` does NOT match the apex
+    /// `example.com` — add both if you mean the site and its subdomains.
+    pub host: Option<String>,
+    /// "glob" (default), "regex", or "cidr". Prefer glob: a regex here is
+    /// matched unanchored, so `example\.com` also matches
+    /// `evil-example.com.attacker.net`.
+    pub host_kind: Option<String>,
+    pub port: Option<u16>,
+    /// Matched on path segments, so `/api` covers `/api/v1` but not `/apikeys`.
+    pub path_prefix: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RuleIdParams {
+    pub rule_id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SetRuleEnabledParams {
+    pub rule_id: i64,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct OkResult {
+    pub ok: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CheckScopeParams {
+    /// Absolute URL to test, e.g. "https://api.example.com/v1/users".
+    pub url: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct CheckScopeResult {
+    pub in_scope: bool,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+    /// The scope that decided, or null when none is active (everything is in
+    /// scope).
+    pub scope: Option<String>,
+}
+
+// --- request sending ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SendRequestParams {
+    /// The request as raw wire text: start line, headers, blank line, body —
+    /// the same shape intercept_get returns.
+    pub text: String,
+    /// A flow to resolve scheme and authority against, for when the start line
+    /// carries an origin-form target like `/path`. Omit only if the start line
+    /// has an absolute URL or the text has a Host header.
+    pub base_flow_id: Option<i64>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct SendRequestResult {
+    /// The new flow this send was recorded as.
+    pub flow_id: i64,
+    pub status: u16,
+    /// The response as wire text.
+    pub text: String,
+    pub response_len: i64,
+    pub millis: i64,
+}
+
+// --- formatting ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct FormatMessageParams {
+    /// An HTTP message as wire text.
+    pub text: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct FormatMessageResult {
+    pub text: String,
+    /// "json" or "html" — what the body was read as.
+    pub language: String,
+}
+
 /// The MCP frontend. Holds only an `Engine` handle and its tool table; a fresh
 /// one is built per session by the transport's service factory.
 #[derive(Clone)]
@@ -191,6 +346,9 @@ pub struct ListFlowsParams {
     pub offset: Option<i64>,
     /// Max rows to return. Default 100, capped at 500.
     pub limit: Option<i64>,
+    /// Narrow to the active scope. Off by default, so a survey shows everything
+    /// captured rather than silently hiding traffic.
+    pub in_scope: Option<bool>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -313,7 +471,8 @@ impl ProxyServer {
     #[tool(
         description = "List captured HTTP flows (metadata only, no bodies), newest first. \
                        Filter by host, method, source, URI substring, or status, and page \
-                       with offset/limit. Use get_flow for headers and body previews."
+                       with offset/limit, and narrow to the active scope with in_scope. \
+                       Use get_flow for headers and body previews."
     )]
     async fn list_flows(
         &self,
@@ -329,7 +488,14 @@ impl ProxyServer {
             status: p.status,
             include_automate: p.include_automate.unwrap_or(false),
         };
-        let rows = self.engine.query_flows(&query, offset, limit);
+        // Scope cannot be pushed into SQL — the patterns are globs, regexes and
+        // CIDR blocks — so the scoped path filters in Rust and pages the
+        // results it keeps.
+        let rows = if p.in_scope.unwrap_or(false) {
+            self.engine.query_flows_in_scope(&query, offset, limit)
+        } else {
+            self.engine.query_flows(&query, offset, limit)
+        };
         let flows: Vec<FlowDto> = rows.into_iter().map(FlowDto::from).collect();
         Ok(Json(ListFlowsResult {
             offset,
@@ -418,6 +584,292 @@ impl ProxyServer {
             http_version: format!("{:?}", response.version),
             response_len: response.body.len() as i64,
             mime,
+        }))
+    }
+
+    /// The scope a call means: the one named, else the active one.
+    fn resolve_scope(&self, given: Option<i64>) -> Result<i64, ErrorData> {
+        if let Some(id) = given {
+            return Ok(id);
+        }
+        self.engine.active_scope().map(|s| s.id).ok_or_else(|| {
+            ErrorData::invalid_params(
+                "no active scope — pass scope_id, or create one with create_scope",
+                None,
+            )
+        })
+    }
+
+    // --- scope ---
+    //
+    // Scope is a *view* filter, not a capture filter: nothing is dropped on the
+    // wire, so narrowing it hides rows rather than losing them, and widening it
+    // brings them straight back.
+
+    #[tool(
+        description = "List scopes. Exactly one is active, and it is the active one that \
+                       list_flows narrows to when in_scope is set."
+    )]
+    async fn list_scopes(&self) -> Result<Json<ListScopesResult>, ErrorData> {
+        let scopes = self
+            .engine
+            .scopes()
+            .into_iter()
+            .map(|s| ScopeDto {
+                rule_count: self.engine.scope_rules(s.id).len() as i64,
+                id: s.id,
+                name: s.name,
+                is_active: s.is_active,
+            })
+            .collect();
+        Ok(Json(ListScopesResult { scopes }))
+    }
+
+    #[tool(description = "Create a scope. Pass activate=true to make it the active one.")]
+    async fn create_scope(
+        &self,
+        Parameters(p): Parameters<CreateScopeParams>,
+    ) -> Result<Json<ScopeIdResult>, ErrorData> {
+        let name = p.name.trim();
+        if name.is_empty() {
+            return Err(ErrorData::invalid_params("name must not be empty", None));
+        }
+        let id = self.engine.create_scope(name).map_err(scope_error)?;
+        if p.activate.unwrap_or(false) {
+            self.engine.set_active_scope(id).map_err(scope_error)?;
+        }
+        Ok(Json(ScopeIdResult { id }))
+    }
+
+    #[tool(
+        description = "Delete a scope and its rules. Deleting the active scope leaves none \
+                       active, which means everything is in scope."
+    )]
+    async fn delete_scope(
+        &self,
+        Parameters(p): Parameters<ScopeIdParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        self.engine.delete_scope(p.scope_id).map_err(scope_error)?;
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(description = "Make a scope the active one.")]
+    async fn set_active_scope(
+        &self,
+        Parameters(p): Parameters<ScopeIdParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        self.engine
+            .set_active_scope(p.scope_id)
+            .map_err(scope_error)?;
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(description = "List a scope's rules. Omit scope_id for the active scope.")]
+    async fn list_scope_rules(
+        &self,
+        Parameters(p): Parameters<ListScopeRulesParams>,
+    ) -> Result<Json<ListScopeRulesResult>, ErrorData> {
+        let scope_id = self.resolve_scope(p.scope_id)?;
+        let rules = self
+            .engine
+            .scope_rules(scope_id)
+            .iter()
+            .map(rule_dto)
+            .collect();
+        Ok(Json(ListScopeRulesResult { scope_id, rules }))
+    }
+
+    #[tool(
+        description = "Add a rule to a scope. Defaults to an include with a glob host \
+                       pattern. Excludes always beat includes. The pattern is validated \
+                       here, so a bad regex or CIDR is refused rather than breaking the \
+                       matcher later."
+    )]
+    async fn add_scope_rule(
+        &self,
+        Parameters(p): Parameters<AddScopeRuleParams>,
+    ) -> Result<Json<ScopeIdResult>, ErrorData> {
+        let scope_id = self.resolve_scope(p.scope_id)?;
+        let action = match p.action.as_deref().unwrap_or("include") {
+            "include" => proxy_core::scope::Action::Include,
+            "exclude" => proxy_core::scope::Action::Exclude,
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!("action must be \"include\" or \"exclude\", got {other:?}"),
+                    None,
+                ));
+            }
+        };
+
+        let mut spec = match &p.host {
+            Some(host) => {
+                let kind = match p.host_kind.as_deref().unwrap_or("glob") {
+                    "glob" => proxy_core::scope::HostKind::Glob,
+                    "regex" => proxy_core::scope::HostKind::Regex,
+                    "cidr" => proxy_core::scope::HostKind::Cidr,
+                    other => {
+                        return Err(ErrorData::invalid_params(
+                            format!("host_kind must be glob|regex|cidr, got {other:?}"),
+                            None,
+                        ));
+                    }
+                };
+                proxy_core::scope::RuleSpec::host(kind, host.clone())
+            }
+            None => proxy_core::scope::RuleSpec::default(),
+        };
+        if let Some(port) = p.port {
+            spec = spec.with_port(port);
+        }
+        if let Some(prefix) = &p.path_prefix {
+            spec = spec.with_path_prefix(prefix.clone());
+        }
+
+        let id = self
+            .engine
+            .add_scope_rule(scope_id, action, &spec)
+            .map_err(scope_error)?;
+        Ok(Json(ScopeIdResult { id }))
+    }
+
+    #[tool(description = "Delete one scope rule.")]
+    async fn delete_scope_rule(
+        &self,
+        Parameters(p): Parameters<RuleIdParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        self.engine
+            .delete_scope_rule(p.rule_id)
+            .map_err(scope_error)?;
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(
+        description = "Turn a rule off or on without deleting it — useful for checking \
+                       whether a rule is why something is missing."
+    )]
+    async fn set_scope_rule_enabled(
+        &self,
+        Parameters(p): Parameters<SetRuleEnabledParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        self.engine
+            .set_scope_rule_enabled(p.rule_id, p.enabled)
+            .map_err(scope_error)?;
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(
+        description = "Test whether a URL is in the active scope. Use this before acting on \
+                       a target rather than guessing from the rules."
+    )]
+    async fn check_scope(
+        &self,
+        Parameters(p): Parameters<CheckScopeParams>,
+    ) -> Result<Json<CheckScopeResult>, ErrorData> {
+        let uri: hudsucker::hyper::Uri = p
+            .url
+            .parse()
+            .map_err(|_| ErrorData::invalid_params(format!("not a URL: {:?}", p.url), None))?;
+        let host = uri.host().unwrap_or_default().to_string();
+        // Resolved the same way capture resolves it, so a port rule means the
+        // same thing whether or not the caller wrote the port out.
+        let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+            Some("http") => 80,
+            _ => 443,
+        });
+        let path = uri.path().to_string();
+
+        let in_scope = self
+            .engine
+            .scope_matcher()
+            .matches(&proxy_core::scope::Target {
+                host: &host,
+                port,
+                path: &path,
+            });
+        Ok(Json(CheckScopeResult {
+            in_scope,
+            host,
+            port,
+            path,
+            scope: self.engine.active_scope().map(|s| s.name),
+        }))
+    }
+
+    // --- sending ---
+
+    #[tool(
+        description = "Send an edited request and return the response (the Repeater, for \
+                       agents). Takes raw wire text, so any part of the message can be \
+                       changed. Recorded as a new flow. Use resend_flow instead to replay \
+                       a captured request unchanged."
+    )]
+    async fn send_request(
+        &self,
+        Parameters(p): Parameters<SendRequestParams>,
+    ) -> Result<Json<SendRequestResult>, ErrorData> {
+        // The original supplies what origin-form wire text cannot: scheme and
+        // authority. Without a base flow we synthesize one, which works as long
+        // as the text carries an absolute target or a Host header.
+        let base = match p.base_flow_id {
+            Some(id) => {
+                let flow = self
+                    .engine
+                    .get_flow(id as u64)
+                    .ok_or_else(|| ErrorData::resource_not_found(format!("no flow #{id}"), None))?;
+                flow.request
+            }
+            None => placeholder_request(),
+        };
+
+        let request = http_text::parse_request(&p.text, &base)
+            .map_err(|e| ErrorData::invalid_params(format!("request does not parse: {e}"), None))?;
+
+        // `parse_request` falls back to the original's authority when the text
+        // supplies none — so with no base flow, the placeholder's host is
+        // exactly the signal that the caller gave no host at all. Checking for
+        // `None` would never fire, and the send would go out aimed at the
+        // placeholder.
+        let unnamed = p.base_flow_id.is_none() && request.uri.host() == Some(PLACEHOLDER_HOST);
+        if unnamed || request.uri.host().is_none() {
+            return Err(ErrorData::invalid_params(
+                "no host: give an absolute URL in the start line, a Host header, or a \
+                 base_flow_id to resolve against",
+                None,
+            ));
+        }
+
+        let started = std::time::Instant::now();
+        let sent = self
+            .engine
+            .send_request(request, p.base_flow_id.map(|id| id as u64))
+            .await
+            .map_err(resend_error)?;
+        let millis = started.elapsed().as_millis() as i64;
+
+        Ok(Json(SendRequestResult {
+            flow_id: sent.replay_id as i64,
+            status: sent.response.status.as_u16(),
+            response_len: sent.response.body.len() as i64,
+            text: http_text::render_response(&sent.response),
+            millis,
+        }))
+    }
+
+    #[tool(
+        description = "Pretty-print the body of an HTTP message for reading. JSON and HTML \
+                       only. Key order and number text are preserved exactly, so a \
+                       reformatted request is still the same request; an existing \
+                       Content-Length is corrected to match."
+    )]
+    async fn format_message(
+        &self,
+        Parameters(p): Parameters<FormatMessageParams>,
+    ) -> Result<Json<FormatMessageResult>, ErrorData> {
+        let (text, language) = proxy_core::pretty::pretty_message(&p.text)
+            .map_err(|e| ErrorData::invalid_params(format!("cannot format: {e}"), None))?;
+        Ok(Json(FormatMessageResult {
+            text,
+            language: format!("{language:?}").to_ascii_lowercase(),
         }))
     }
 
@@ -830,6 +1282,59 @@ fn parse_flow_uri(uri: &str) -> Option<(i64, Side)> {
     Some((id, side))
 }
 
+// --- scope helpers ---
+
+fn scope_error(e: proxy_core::scope::ScopeError) -> ErrorData {
+    ErrorData::invalid_params(format!("{e:?}"), None)
+}
+
+fn rule_dto(rule: &proxy_core::scope::ScopeRule) -> ScopeRuleDto {
+    let (host_kind, host_pattern) = match &rule.spec.host {
+        Some((kind, pattern)) => (
+            match kind {
+                proxy_core::scope::HostKind::Glob => "glob",
+                proxy_core::scope::HostKind::Regex => "regex",
+                proxy_core::scope::HostKind::Cidr => "cidr",
+            },
+            Some(pattern.clone()),
+        ),
+        None => ("any", None),
+    };
+    ScopeRuleDto {
+        id: rule.id,
+        action: match rule.action {
+            proxy_core::scope::Action::Include => "include".into(),
+            proxy_core::scope::Action::Exclude => "exclude".into(),
+        },
+        host_kind: host_kind.into(),
+        host_pattern,
+        port: rule.spec.port,
+        path_prefix: rule.spec.path_prefix.clone(),
+        enabled: rule.enabled,
+    }
+}
+
+/// A stand-in request for sends that carry their own absolute target.
+///
+/// `parse_request` needs an original to recover scheme and authority from. When
+/// the caller gave no base flow, this supplies the scheme so a `Host` header is
+/// enough — and if there is no Host either, the send is refused rather than
+/// aimed at this placeholder.
+/// Reserved by RFC 2606 and guaranteed never to resolve, which is what makes it
+/// safe to use as "the caller named no host" — if this ever reached the wire it
+/// could not hit anything real.
+const PLACEHOLDER_HOST: &str = "invalid.invalid";
+
+fn placeholder_request() -> proxy_core::CapturedRequest {
+    proxy_core::CapturedRequest {
+        method: hudsucker::hyper::Method::GET,
+        uri: hudsucker::hyper::Uri::from_static("https://invalid.invalid/"),
+        version: hudsucker::hyper::Version::HTTP_11,
+        headers: hudsucker::hyper::HeaderMap::new(),
+        body: hudsucker::hyper::body::Bytes::new(),
+    }
+}
+
 // --- intercept helpers ---
 
 fn leg_name(pending: &Pending) -> &'static str {
@@ -981,6 +1486,362 @@ mod tests {
             },
         );
         id as i64
+    }
+
+    // --- scope ---
+
+    #[tokio::test]
+    async fn scopes_round_trip_and_only_one_is_active() {
+        let (_engine, server) = setup();
+
+        let a = server
+            .create_scope(Parameters(CreateScopeParams {
+                name: "linear".into(),
+                activate: Some(true),
+            }))
+            .await
+            .unwrap()
+            .0
+            .id;
+        let b = server
+            .create_scope(Parameters(CreateScopeParams {
+                name: "google".into(),
+                activate: Some(true),
+            }))
+            .await
+            .unwrap()
+            .0
+            .id;
+        assert_ne!(a, b);
+
+        let listed = server.list_scopes().await.unwrap().0.scopes;
+        assert_eq!(listed.len(), 2);
+        let active: Vec<&ScopeDto> = listed.iter().filter(|s| s.is_active).collect();
+        assert_eq!(active.len(), 1, "exactly one scope may be active");
+        assert_eq!(active[0].name, "google", "the later activation wins");
+    }
+
+    #[tokio::test]
+    async fn rules_are_added_listed_disabled_and_deleted() {
+        let (_engine, server) = setup();
+        server
+            .create_scope(Parameters(CreateScopeParams {
+                name: "s".into(),
+                activate: Some(true),
+            }))
+            .await
+            .unwrap();
+
+        let rule_id = server
+            .add_scope_rule(Parameters(AddScopeRuleParams {
+                scope_id: None,
+                action: None,
+                host: Some("*.linear.app".into()),
+                host_kind: None,
+                port: None,
+                path_prefix: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .id;
+
+        let listed = server
+            .list_scope_rules(Parameters(ListScopeRulesParams { scope_id: None }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(listed.rules.len(), 1);
+        assert_eq!(listed.rules[0].action, "include", "include is the default");
+        assert_eq!(listed.rules[0].host_kind, "glob", "glob is the default");
+        assert!(listed.rules[0].enabled);
+
+        server
+            .set_scope_rule_enabled(Parameters(SetRuleEnabledParams {
+                rule_id,
+                enabled: false,
+            }))
+            .await
+            .unwrap();
+        let listed = server
+            .list_scope_rules(Parameters(ListScopeRulesParams { scope_id: None }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!listed.rules[0].enabled, "disabled but still present");
+
+        server
+            .delete_scope_rule(Parameters(RuleIdParams { rule_id }))
+            .await
+            .unwrap();
+        let listed = server
+            .list_scope_rules(Parameters(ListScopeRulesParams { scope_id: None }))
+            .await
+            .unwrap()
+            .0;
+        assert!(listed.rules.is_empty());
+    }
+
+    /// A pattern that will not compile must be refused when it is added, not
+    /// silently dropped later — a dropped *exclude* would widen scope.
+    #[tokio::test]
+    async fn a_bad_pattern_is_refused() {
+        let (_engine, server) = setup();
+        server
+            .create_scope(Parameters(CreateScopeParams {
+                name: "s".into(),
+                activate: Some(true),
+            }))
+            .await
+            .unwrap();
+
+        for (host, kind) in [("[unclosed", "regex"), ("not-a-network", "cidr")] {
+            let result = server
+                .add_scope_rule(Parameters(AddScopeRuleParams {
+                    scope_id: None,
+                    action: None,
+                    host: Some(host.into()),
+                    host_kind: Some(kind.into()),
+                    port: None,
+                    path_prefix: None,
+                }))
+                .await;
+            assert!(result.is_err(), "{kind} {host:?} should be refused");
+        }
+
+        let bad_action = server
+            .add_scope_rule(Parameters(AddScopeRuleParams {
+                scope_id: None,
+                action: Some("maybe".into()),
+                host: Some("x.test".into()),
+                host_kind: None,
+                port: None,
+                path_prefix: None,
+            }))
+            .await;
+        assert!(bad_action.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_scope_answers_for_a_url() {
+        let (_engine, server) = setup();
+        server
+            .create_scope(Parameters(CreateScopeParams {
+                name: "s".into(),
+                activate: Some(true),
+            }))
+            .await
+            .unwrap();
+        server
+            .add_scope_rule(Parameters(AddScopeRuleParams {
+                scope_id: None,
+                action: None,
+                host: Some("*.linear.app".into()),
+                host_kind: None,
+                port: None,
+                path_prefix: None,
+            }))
+            .await
+            .unwrap();
+
+        let inside = server
+            .check_scope(Parameters(CheckScopeParams {
+                url: "https://api.linear.app/graphql".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(inside.in_scope);
+        assert_eq!(inside.host, "api.linear.app");
+        assert_eq!(inside.port, 443, "the scheme default is resolved");
+        assert_eq!(inside.scope.as_deref(), Some("s"));
+
+        let outside = server
+            .check_scope(Parameters(CheckScopeParams {
+                url: "http://evil.test/".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!outside.in_scope);
+        assert_eq!(outside.port, 80);
+    }
+
+    /// An unanchored regex is the trap the glob default exists to avoid; the
+    /// tool has to at least report it truthfully.
+    #[tokio::test]
+    async fn a_regex_rule_matches_unanchored() {
+        let (_engine, server) = setup();
+        server
+            .create_scope(Parameters(CreateScopeParams {
+                name: "s".into(),
+                activate: Some(true),
+            }))
+            .await
+            .unwrap();
+        server
+            .add_scope_rule(Parameters(AddScopeRuleParams {
+                scope_id: None,
+                action: None,
+                host: Some(r"linear\.app".into()),
+                host_kind: Some("regex".into()),
+                port: None,
+                path_prefix: None,
+            }))
+            .await
+            .unwrap();
+
+        let sneaky = server
+            .check_scope(Parameters(CheckScopeParams {
+                url: "https://evil-linear.app.attacker.test/".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            sneaky.in_scope,
+            "documents today's behaviour: regex host rules are not anchored"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_can_be_narrowed_to_scope() {
+        let (engine, server) = setup();
+        record(&engine, "https://in.test/a", "x");
+        record(&engine, "https://out.test/b", "y");
+
+        let all = server
+            .list_flows(Parameters(list_params()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(all.returned, 2);
+
+        server
+            .create_scope(Parameters(CreateScopeParams {
+                name: "s".into(),
+                activate: Some(true),
+            }))
+            .await
+            .unwrap();
+        server
+            .add_scope_rule(Parameters(AddScopeRuleParams {
+                scope_id: None,
+                action: None,
+                host: Some("in.test".into()),
+                host_kind: None,
+                port: None,
+                path_prefix: None,
+            }))
+            .await
+            .unwrap();
+
+        // Off by default: a survey must not silently hide traffic.
+        let unfiltered = server
+            .list_flows(Parameters(list_params()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(unfiltered.returned, 2);
+
+        let scoped = server
+            .list_flows(Parameters(ListFlowsParams {
+                in_scope: Some(true),
+                ..list_params()
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(scoped.returned, 1);
+        assert!(scoped.flows[0].uri.contains("in.test"));
+    }
+
+    /// Scope tools with no active scope should say so rather than guessing.
+    #[tokio::test]
+    async fn scope_calls_without_an_active_scope_are_reported() {
+        let (_engine, server) = setup();
+        assert!(
+            server
+                .list_scope_rules(Parameters(ListScopeRulesParams { scope_id: None }))
+                .await
+                .is_err()
+        );
+    }
+
+    // --- sending ---
+
+    #[tokio::test]
+    async fn send_request_refuses_a_message_with_no_host() {
+        let (_engine, server) = setup();
+        let result = server
+            .send_request(Parameters(SendRequestParams {
+                text: "GET /nowhere HTTP/1.1\n\n".into(),
+                base_flow_id: None,
+            }))
+            .await;
+        let message = format!("{:?}", result.err().expect("should refuse"));
+        assert!(message.contains("no host"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_request_refuses_malformed_text() {
+        let (_engine, server) = setup();
+        let result = server
+            .send_request(Parameters(SendRequestParams {
+                text: "GET / HTTP/1.1\nnot-a-header\n\n".into(),
+                base_flow_id: None,
+            }))
+            .await;
+        let message = format!("{:?}", result.err().expect("should refuse"));
+        assert!(message.contains("does not parse"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_request_reports_an_unknown_base_flow() {
+        let (_engine, server) = setup();
+        let result = server
+            .send_request(Parameters(SendRequestParams {
+                text: "GET /a HTTP/1.1\n\n".into(),
+                base_flow_id: Some(999),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    // --- formatting ---
+
+    #[tokio::test]
+    async fn format_message_indents_a_json_body() {
+        let (_engine, server) = setup();
+        let out = server
+            .format_message(Parameters(FormatMessageParams {
+                text: "HTTP/1.1 200 OK\ncontent-type: application/json\n\n{\"b\":1,\"a\":2}".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(out.language, "json");
+        assert!(
+            out.text.ends_with("{\n  \"b\": 1,\n  \"a\": 2\n}"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.starts_with("HTTP/1.1 200 OK\n"),
+            "the head is left alone: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn format_message_reports_what_it_cannot_format() {
+        let (_engine, server) = setup();
+        let result = server
+            .format_message(Parameters(FormatMessageParams {
+                text: "HTTP/1.1 200 OK\n\nplain words".into(),
+            }))
+            .await;
+        assert!(result.is_err());
     }
 
     /// Park a request on the intercept queue the way the proxy handler does,
@@ -1209,6 +2070,7 @@ mod tests {
             include_automate: None,
             offset: None,
             limit: None,
+            in_scope: None,
         }
     }
 

@@ -378,21 +378,27 @@ const FLOW_COLUMNS: &str = "id, method, uri, host, path, status, mime, resp_len,
     source, started_at, ended_at, comment, highlight, error";
 
 fn row_to_flow(r: &rusqlite::Row) -> rusqlite::Result<FlowRow> {
+    row_to_flow_offset(r, 0)
+}
+
+/// The same mapping, starting at an arbitrary column, so a query can select
+/// extra columns ahead of `FLOW_COLUMNS` without duplicating this.
+fn row_to_flow_offset(r: &rusqlite::Row, at: usize) -> rusqlite::Result<FlowRow> {
     Ok(FlowRow {
-        id: r.get(0)?,
-        method: r.get(1)?,
-        uri: r.get(2)?,
-        host: r.get(3)?,
-        path: r.get(4)?,
-        status: r.get::<_, Option<i64>>(5)?.map(|s| s as u16),
-        mime: r.get(6)?,
-        resp_len: r.get(7)?,
-        source: r.get(8)?,
-        started_at: r.get(9)?,
-        ended_at: r.get(10)?,
-        comment: r.get(11)?,
-        highlight: r.get(12)?,
-        error: r.get(13)?,
+        id: r.get(at)?,
+        method: r.get(at + 1)?,
+        uri: r.get(at + 2)?,
+        host: r.get(at + 3)?,
+        path: r.get(at + 4)?,
+        status: r.get::<_, Option<i64>>(at + 5)?.map(|s| s as u16),
+        mime: r.get(at + 6)?,
+        resp_len: r.get(at + 7)?,
+        source: r.get(at + 8)?,
+        started_at: r.get(at + 9)?,
+        ended_at: r.get(at + 10)?,
+        comment: r.get(at + 11)?,
+        highlight: r.get(at + 12)?,
+        error: r.get(at + 13)?,
     })
 }
 
@@ -401,13 +407,10 @@ fn row_to_flow(r: &rusqlite::Row) -> rusqlite::Result<FlowRow> {
 /// Newest-first because "what just happened" is the common recon question, and
 /// offset paging over a descending id is stable as long as new rows only ever
 /// append.
-pub fn flows(
-    conn: &Connection,
-    q: &FlowQuery,
-    offset: i64,
-    limit: i64,
-) -> rusqlite::Result<Vec<FlowRow>> {
-    let mut sql = format!("SELECT {FLOW_COLUMNS} FROM flow");
+/// The WHERE clause and its bindings for a [`FlowQuery`], shared by the plain
+/// and the scope-filtered listings so the two can never drift on what a filter
+/// means.
+fn flow_filters(q: &FlowQuery) -> (Vec<String>, Vec<Box<dyn ToSql>>) {
     let mut where_clauses: Vec<String> = Vec::new();
     let mut binds: Vec<Box<dyn ToSql>> = Vec::new();
 
@@ -437,10 +440,26 @@ pub fn flows(
         where_clauses.push("source != 'automate'".to_string());
     }
 
+    (where_clauses, binds)
+}
+
+fn flow_sql(where_clauses: &[String]) -> String {
+    let mut sql = format!("SELECT {FLOW_COLUMNS} FROM flow");
     if !where_clauses.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&where_clauses.join(" AND "));
     }
+    sql
+}
+
+pub fn flows(
+    conn: &Connection,
+    q: &FlowQuery,
+    offset: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<FlowRow>> {
+    let (where_clauses, mut binds) = flow_filters(q);
+    let mut sql = flow_sql(&where_clauses);
     sql.push_str(&format!(
         " ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
         binds.len() + 1,
@@ -455,6 +474,71 @@ pub fn flows(
         row_to_flow,
     )?
     .collect()
+}
+
+/// How many rows a scope-filtered listing will examine before giving up.
+///
+/// Scope cannot be expressed in SQL — the patterns are globs, regexes and CIDR
+/// blocks — so filtering happens in Rust and `LIMIT` cannot be pushed into the
+/// query. This caps the scan so a narrow scope over a huge project degrades to
+/// "the newest N rows" rather than to a stalled frame.
+const SCOPE_SCAN_LIMIT: usize = 50_000;
+
+/// The same listing, narrowed to what the matcher accepts.
+///
+/// Applied after the SQL filters and before paging, so `offset`/`limit` count
+/// in-scope rows — which is what a caller paging through results expects.
+pub fn flows_in_scope(
+    conn: &Connection,
+    q: &FlowQuery,
+    matcher: &Matcher,
+    offset: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<FlowRow>> {
+    if matcher.is_unrestricted() {
+        return flows(conn, q, offset, limit);
+    }
+
+    let (where_clauses, binds) = flow_filters(q);
+    // `port` is not in `FLOW_COLUMNS`, but scope rules can constrain it, so it
+    // is selected alongside and read out separately. A placeholder would make
+    // every port-constrained rule fail to match — which, for an *include*,
+    // means excluding everything.
+    let sql = format!(
+        "{} ORDER BY id DESC",
+        flow_sql(&where_clauses).replacen("SELECT ", "SELECT port, ", 1)
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds.iter().map(|b| b.as_ref())), |r| {
+        // Column 0 is the port we prepended; the rest is an ordinary flow row.
+        Ok((r.get::<_, i64>(0)?, row_to_flow_offset(r, 1)?))
+    })?;
+
+    let mut out = Vec::new();
+    let mut skipped = 0i64;
+    for (examined, row) in rows.enumerate() {
+        if examined >= SCOPE_SCAN_LIMIT {
+            break;
+        }
+        let (port, row) = row?;
+        if !matcher.matches(&Target {
+            host: &row.host,
+            port: port as u16,
+            path: &row.path,
+        }) {
+            continue;
+        }
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        out.push(row);
+        if out.len() as i64 >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 pub fn flow_detail(conn: &Connection, id: i64) -> rusqlite::Result<Option<FlowDetail>> {

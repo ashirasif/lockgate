@@ -462,6 +462,12 @@ impl Engine {
         self.read(|conn| read::flows(conn, query, offset, limit))
     }
 
+    /// The same listing, narrowed to the active scope.
+    pub fn query_flows_in_scope(&self, query: &FlowQuery, offset: i64, limit: i64) -> Vec<FlowRow> {
+        let matcher = self.scope_matcher();
+        self.read(|conn| read::flows_in_scope(conn, query, &matcher, offset, limit))
+    }
+
     /// Full metadata for one flow (headers, body lengths), or `None` if there is
     /// no such flow. Bodies are fetched separately via [`Engine::body_slice`].
     pub fn flow_detail(&self, id: i64) -> Option<FlowDetail> {

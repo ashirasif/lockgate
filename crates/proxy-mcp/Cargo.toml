@@ -23,8 +23,8 @@ axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-
-[dev-dependencies]
-# Tests build `CapturedRequest`/`CapturedResponse`, whose fields are `http`
-# types re-exported by hudsucker (the same version proxy-core captures with).
+# `CapturedRequest`/`CapturedResponse` have `http` types in their public fields,
+# re-exported by hudsucker. Already in the graph via proxy-core, so this only
+# links what is built anyway — but it has to be a real dependency now that the
+# send and scope tools construct those types rather than only the tests.
 hudsucker = { workspace = true }
