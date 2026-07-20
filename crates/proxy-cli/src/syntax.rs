@@ -16,6 +16,7 @@
 //! that fails to parse must still be readable. Every path degrades to plain
 //! text rather than erroring.
 
+use crate::highlighter::SharedCache;
 use proxy_core::http_text::{Language, detect_body};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -96,6 +97,17 @@ fn status(code: &str) -> Style {
 /// per-cell decoration — a cursor, a visual selection — on top without the
 /// highlighter needing to know those exist.
 pub fn highlight(lines: &[String]) -> Vec<Vec<Style>> {
+    highlight_with(lines, None)
+}
+
+/// As [`highlight`], but allowed to reach for syntect on the body.
+///
+/// The head — start line and headers — is always ours: it is HTTP, not a
+/// language syntect has a definition for, and our scanner is exact about it.
+/// Only the body is delegated, and only when there is a matching syntax and the
+/// body is small enough to be worth a pass. Everything else falls back to the
+/// hand-rolled scanners, which is why those are still here.
+pub fn highlight_with(lines: &[String], cache: Option<&SharedCache>) -> Vec<Vec<Style>> {
     let kind = match lines.first() {
         Some(first) if first.starts_with("HTTP/") => Kind::Response,
         _ => Kind::Request,
@@ -108,12 +120,25 @@ pub fn highlight(lines: &[String]) -> Vec<Vec<Style>> {
         .position(|l| l.trim_end_matches('\r').is_empty());
     let body_start = separator.map(|i| i + 1);
 
+    // `1.min(sep)` because the separator can be line 0 — a buffer whose very
+    // first line is blank has no start line and no headers, and `1..0` would
+    // panic rather than yielding nothing.
+    let headers: &[String] = match separator {
+        Some(sep) => &lines[1.min(sep)..sep],
+        None => &[],
+    };
     let body = match separator {
-        // `1.min(sep)` because the separator can be line 0 — a buffer whose
-        // very first line is blank has no start line and no headers, and
-        // `1..0` would panic rather than yielding nothing.
-        Some(sep) => detect_body(&lines[1.min(sep)..sep], &lines[sep + 1..]),
+        Some(sep) => detect_body(headers, &lines[sep + 1..]),
         None => Language::Plain,
+    };
+
+    // Delegate the body to syntect when we can. Done in one shot up front
+    // because syntect is stateful across lines — it cannot be driven from
+    // inside a per-line map without re-parsing from the top each time.
+    let delegated: Option<Vec<Vec<Style>>> = match (cache, body_start) {
+        (Some(cache), Some(start)) => syntect_name(headers, body)
+            .and_then(|name| cache.borrow_mut().highlight(&lines[start..], name)),
+        _ => None,
     };
 
     // HTML is the one body language that needs state carried between lines: a
@@ -129,17 +154,76 @@ pub fn highlight(lines: &[String]) -> Vec<Vec<Style>> {
             let chars: Vec<char> = line.chars().collect();
             match (i, body_start) {
                 (0, _) => start_line(&chars, kind),
-                (_, Some(start)) if i >= start => match body {
-                    Language::Json => json_line(&chars),
-                    Language::Html => html_line(&chars, &mut html),
-                    Language::Form => form_line(&chars),
-                    Language::Plain => vec![plain(); chars.len()],
+                (_, Some(start)) if i >= start => match &delegated {
+                    Some(styles) => styles
+                        .get(i - start)
+                        .cloned()
+                        .unwrap_or_else(|| vec![plain(); chars.len()]),
+                    None => match body {
+                        Language::Json => json_line(&chars),
+                        Language::Html => html_line(&chars, &mut html),
+                        Language::Form => form_line(&chars),
+                        Language::Plain => vec![plain(); chars.len()],
+                    },
                 },
                 _ if Some(i) == separator => Vec::new(),
                 _ => header_line(&chars),
             }
         })
         .collect()
+}
+
+/// The syntect syntax to read a body as, or `None` to keep it in-house.
+///
+/// Deliberately driven by `Content-Type` rather than by sniffing: past JSON and
+/// HTML — which [`detect_body`] already recognises by shape — there is nothing
+/// reliable to sniff. XML and GraphQL and protobuf-text do not announce
+/// themselves in their first byte, so a guess would be wrong more often than it
+/// was right, and a body highlighted as the wrong language reads worse than one
+/// left plain.
+///
+/// `None` is not a failure: it means the hand-rolled scanners take it, which is
+/// the right answer for form-urlencoded (no syntax definition for it exists
+/// anywhere) and for plain text.
+fn syntect_name(headers: &[String], sniffed: Language) -> Option<&'static str> {
+    let content_type = headers
+        .iter()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+
+    // Ordered most specific first: `application/xhtml+xml` is HTML, and
+    // matching "xml" before "html" would get it wrong.
+    let by_header = [
+        ("graphql", "GraphQL"),
+        ("html", "HTML"),
+        ("json", "JSON"),
+        ("javascript", "JavaScript"),
+        ("ecmascript", "JavaScript"),
+        ("protobuf", "Protocol Buffer"),
+        ("xml", "XML"),
+        ("yaml", "YAML"),
+        ("css", "CSS"),
+        ("sql", "SQL"),
+        ("markdown", "Markdown"),
+        ("toml", "TOML"),
+    ]
+    .into_iter()
+    .find(|(needle, _)| content_type.contains(needle))
+    .map(|(_, syntax)| syntax);
+
+    by_header.or(match sniffed {
+        // No usable header, but the body's own shape gave it away.
+        Language::Json => Some("JSON"),
+        Language::Html => Some("HTML"),
+        // Form data has no syntax definition, and plain text has nothing to
+        // gain from one.
+        Language::Form | Language::Plain => None,
+    })
 }
 
 /// `METHOD target HTTP/1.1` or `HTTP/1.1 200 Reason`.

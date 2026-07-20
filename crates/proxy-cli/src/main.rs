@@ -1,6 +1,7 @@
 mod clipboard;
 mod command;
 mod editor;
+mod highlighter;
 mod input;
 mod syntax;
 mod tui;

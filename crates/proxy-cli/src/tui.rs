@@ -208,6 +208,9 @@ struct App {
     /// preview can be pasted into another — copying a header from a response
     /// into a request is the whole point.
     yank: Yank,
+    /// Memo for syntect-highlighted bodies. `RefCell` because the draw path
+    /// only has `&self`, and highlighting is a cache *write* on a miss.
+    syntax_cache: crate::highlighter::SharedCache,
     /// Set by `e`, consumed by the run loop once it can free the terminal.
     pending_edit: Option<EditJob>,
     /// Makes each scratch file unique within a session.
@@ -242,6 +245,7 @@ impl App {
             held_requests: Vec::new(),
             held_responses: Vec::new(),
             yank: Yank::default(),
+            syntax_cache: crate::highlighter::SharedCache::default(),
             pending_edit: None,
             edit_seq: 0,
         }
@@ -1720,6 +1724,7 @@ impl App {
         };
         BufferView {
             buffer: &self.repeater.request,
+            cache: Some(&self.syntax_cache),
             title: title.to_string(),
             focused: editing,
             inserting,
@@ -1950,6 +1955,7 @@ impl App {
                 }
                 BufferView {
                     buffer,
+                    cache: Some(&self.syntax_cache),
                     title,
                     focused: in_preview,
                     inserting,
@@ -2474,6 +2480,8 @@ fn pane(lines: Vec<Line<'static>>, title: impl Into<String>) -> Paragraph<'stati
 /// single `Paragraph` cannot express.
 struct BufferView<'a> {
     buffer: &'a TextBuffer,
+    /// Shared with the app so a body highlighted this frame is free the next.
+    cache: Option<&'a crate::highlighter::SharedCache>,
     title: String,
     focused: bool,
     inserting: bool,
@@ -2547,7 +2555,7 @@ impl BufferView<'_> {
         // Layering this way keeps the two concerns apart: the highlighter never
         // has to know a cursor exists, and `patch` lets a selection shade the
         // background while leaving the token's own foreground colour intact.
-        let syntax = crate::syntax::highlight(self.buffer.lines());
+        let syntax = crate::syntax::highlight_with(self.buffer.lines(), self.cache);
         // Two cursors, because they mean different things: white where the next
         // key inserts text, cyan where it only moves.
         let cursor_bg = if self.inserting {
@@ -3828,6 +3836,7 @@ mod tests {
     fn view(buffer: &TextBuffer, focused: bool) -> BufferView<'_> {
         BufferView {
             buffer,
+            cache: None,
             title: " Preview ".into(),
             focused,
             inserting: false,
