@@ -5,6 +5,7 @@
 
 pub mod ca;
 pub mod db;
+pub mod encoding;
 pub mod engine;
 pub mod finding;
 pub mod http_text;

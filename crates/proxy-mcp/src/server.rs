@@ -523,8 +523,20 @@ impl ProxyServer {
         let limit = clamp_limit(p.body_limit, DEFAULT_BODY_LIMIT, MAX_BODY_LIMIT);
         let (request_headers, response_headers) = detail_headers(&detail);
 
-        let request_body = self.body_preview(p.id, Side::Request, offset, limit);
-        let response_body = self.body_preview(p.id, Side::Response, offset, limit);
+        let request_body = self.body_preview(
+            p.id,
+            Side::Request,
+            offset,
+            limit,
+            coding_of_pairs(&detail.req_headers),
+        );
+        let response_body = self.body_preview(
+            p.id,
+            Side::Response,
+            offset,
+            limit,
+            coding_of_pairs(&detail.resp_headers),
+        );
 
         Ok(Json(FlowDetailDto {
             flow: FlowDto::from(detail.row),
@@ -850,7 +862,7 @@ impl ProxyServer {
             flow_id: sent.replay_id as i64,
             status: sent.response.status.as_u16(),
             response_len: sent.response.body.len() as i64,
-            text: http_text::render_response(&sent.response),
+            text: http_text::render_response_decoded(&sent.response),
             millis,
         }))
     }
@@ -1140,7 +1152,14 @@ impl ProxyServer {
     }
 
     /// Read a bounded window of one body and shape it for JSON.
-    fn body_preview(&self, id: i64, side: Side, offset: i64, limit: i64) -> BodyPreview {
+    fn body_preview(
+        &self,
+        id: i64,
+        side: Side,
+        offset: i64,
+        limit: i64,
+        coding: Option<proxy_core::encoding::Coding>,
+    ) -> BodyPreview {
         let side_name = match side {
             Side::Request => "request",
             Side::Response => "response",
@@ -1150,14 +1169,29 @@ impl ProxyServer {
         match self.engine.body_slice(id, side, offset, limit) {
             Some(slice) => {
                 let returned = slice.bytes.len() as i64;
-                let (text, base64) = encode_bytes(&slice.bytes);
+                let truncated = offset + returned < slice.total_len;
+
+                // A compressed stream can only be decoded from its start and in
+                // full; decoding a window would produce plausible-looking
+                // garbage, which is worse than handing back the bytes.
+                let whole = offset == 0 && !truncated;
+                let raw = hudsucker::hyper::body::Bytes::copy_from_slice(&slice.bytes);
+                let decoded_bytes = match (whole, coding) {
+                    (true, Some(coding)) => proxy_core::encoding::decode_body(coding, &raw),
+                    _ => raw.clone(),
+                };
+                let decoded = decoded_bytes != raw;
+
+                let (text, base64) = encode_bytes(&decoded_bytes);
                 BodyPreview {
-                    truncated: offset + returned < slice.total_len,
+                    truncated,
                     total_len: slice.total_len,
                     storage: slice.storage,
                     offset,
                     text,
                     base64,
+                    content_encoding: coding.map(|c| c.as_str().to_string()),
+                    decoded,
                     resource_uri,
                 }
             }
@@ -1169,6 +1203,8 @@ impl ProxyServer {
                 truncated: false,
                 text: None,
                 base64: None,
+                content_encoding: None,
+                decoded: false,
                 resource_uri,
             },
         }
@@ -1282,6 +1318,14 @@ fn parse_flow_uri(uri: &str) -> Option<(i64, Side)> {
     Some((id, side))
 }
 
+/// The declared coding, from headers stored as name/value pairs.
+fn coding_of_pairs(headers: &[(String, String)]) -> Option<proxy_core::encoding::Coding> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .and_then(|(_, value)| proxy_core::encoding::Coding::from_header_value(value))
+}
+
 // --- scope helpers ---
 
 fn scope_error(e: proxy_core::scope::ScopeError) -> ErrorData {
@@ -1390,8 +1434,8 @@ fn held_dto(held: &Held) -> HeldDto {
 /// the same codec, so an agent and an operator are looking at the same bytes.
 fn render_pending(pending: &Pending) -> String {
     match pending {
-        Pending::Request(r) => http_text::render_request(r),
-        Pending::Response(r) => http_text::render_response(r),
+        Pending::Request(r) => http_text::render_request_decoded(r),
+        Pending::Response(r) => http_text::render_response_decoded(r),
     }
 }
 

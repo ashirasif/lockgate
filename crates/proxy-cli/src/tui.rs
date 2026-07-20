@@ -1627,7 +1627,7 @@ impl App {
         let id = flow.id;
         let session = Session {
             origin: Some(id),
-            request: TextBuffer::from_text(&http_text::render_request(&flow.request)),
+            request: TextBuffer::from_text(&http_text::render_request_decoded(&flow.request)),
             original: Some(flow.request),
             ..Session::default()
         };
@@ -1695,7 +1695,7 @@ impl App {
                     let bytes = sent.response.body.len();
                     (
                         SendResult {
-                            text: http_text::render_response(&sent.response),
+                            text: http_text::render_response_decoded(&sent.response),
                             bytes: Some(bytes),
                             millis,
                             failed: false,
@@ -3153,8 +3153,8 @@ fn step_row(current: usize, last: usize, motion: Motion, count: Option<usize>) -
 /// Render a held item as wire text, whichever leg it is.
 fn render_pending(pending: &Pending) -> String {
     match pending {
-        Pending::Request(r) => http_text::render_request(r),
-        Pending::Response(r) => http_text::render_response(r),
+        Pending::Request(r) => http_text::render_request_decoded(r),
+        Pending::Response(r) => http_text::render_response_decoded(r),
     }
 }
 
@@ -3623,10 +3623,18 @@ fn message_lines(start: Line<'static>, headers: &HeaderMap, body: &[u8]) -> Vec<
         .iter()
         .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap_or("<binary>")))
         .collect();
-    let body = if body.is_empty() {
+
+    // Decoded for reading. The stored bytes are what arrived — see
+    // `proxy_core::encoding` — but compressed bytes on screen are noise, and
+    // nothing downstream of here can highlight or format them.
+    let raw = hudsucker::hyper::body::Bytes::copy_from_slice(body);
+    let decoded = proxy_core::encoding::decoded(headers, &raw);
+    let was_decoded = decoded != raw;
+
+    let body = if decoded.is_empty() {
         String::new()
     } else {
-        preview(body)
+        preview(&decoded)
     };
 
     let mut lines = vec![start];
@@ -3634,6 +3642,16 @@ fn message_lines(start: Line<'static>, headers: &HeaderMap, body: &[u8]) -> Vec<
         &header_text,
         &body,
     ));
+    if was_decoded {
+        // Said out loud: the body on screen is not byte-for-byte what came off
+        // the wire, and an operator comparing lengths deserves to know why.
+        if let Some(coding) = proxy_core::encoding::coding_of(headers) {
+            lines.push(Line::styled(
+                format!("(decoded {} for display)", coding.as_str()),
+                muted(),
+            ));
+        }
+    }
     lines
 }
 

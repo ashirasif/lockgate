@@ -98,29 +98,65 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Render a request as editable wire text, with the body decoded for reading.
+///
+/// The decoded pair are what a *person* should see: a gzipped body is binary
+/// noise otherwise, and none of the highlighting or formatting can engage on
+/// it. The raw pair stay available for anything that needs the bytes as they
+/// arrived.
+///
+/// `Content-Length` is left describing the encoded body it came with, and is
+/// corrected by [`crate::encoding::encode_for_wire`] on the way back out. It
+/// would be worse to rewrite it here: the number would then match neither what
+/// arrived nor what gets sent.
+pub fn render_request_decoded(req: &CapturedRequest) -> String {
+    let mut out = start_line_of(req);
+    write_headers(&mut out, &req.headers);
+    out.push('\n');
+    out.push_str(&lossy(&crate::encoding::decoded(&req.headers, &req.body)));
+    out
+}
+
+/// Render a response as editable wire text, with the body decoded for reading.
+pub fn render_response_decoded(res: &CapturedResponse) -> String {
+    let mut out = status_line_of(res);
+    write_headers(&mut out, &res.headers);
+    out.push('\n');
+    out.push_str(&lossy(&crate::encoding::decoded(&res.headers, &res.body)));
+    out
+}
+
 /// Render a request as editable wire text.
 pub fn render_request(req: &CapturedRequest) -> String {
-    let target = req
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| req.uri.to_string());
-    let mut out = format!("{} {} {}\n", req.method, target, version_str(req.version));
+    let mut out = start_line_of(req);
     write_headers(&mut out, &req.headers);
     out.push('\n');
     out.push_str(&lossy(&req.body));
     out
 }
 
-/// Render a response as editable wire text.
-pub fn render_response(res: &CapturedResponse) -> String {
+fn start_line_of(req: &CapturedRequest) -> String {
+    let target = req
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri.to_string());
+    format!("{} {} {}\n", req.method, target, version_str(req.version))
+}
+
+fn status_line_of(res: &CapturedResponse) -> String {
     let reason = res.status.canonical_reason().unwrap_or("");
-    let mut out = format!(
+    format!(
         "{} {} {}\n",
         version_str(res.version),
         res.status.as_u16(),
         reason
-    );
+    )
+}
+
+/// Render a response as editable wire text.
+pub fn render_response(res: &CapturedResponse) -> String {
+    let mut out = status_line_of(res);
     write_headers(&mut out, &res.headers);
     out.push('\n');
     out.push_str(&lossy(&res.body));
@@ -181,12 +217,18 @@ pub fn parse_request(
         }
     };
 
+    let mut headers = headers;
+    // The text came from a decoded rendering, so the body here is plaintext. If
+    // the headers still declare a coding it has to go back on, or the far side
+    // will try to decompress plaintext and reject the message.
+    let body = crate::encoding::encode_for_wire(&mut headers, Bytes::from(body.into_bytes()));
+
     Ok(CapturedRequest {
         method,
         uri,
         version,
         headers,
-        body: Bytes::from(body.into_bytes()),
+        body,
     })
 }
 
@@ -208,11 +250,14 @@ pub fn parse_response(
         .and_then(|c| StatusCode::from_u16(c).ok())
         .ok_or_else(|| ParseError::BadStatus(code.into()))?;
 
+    let mut headers = parse_headers(&headers)?;
+    let body = crate::encoding::encode_for_wire(&mut headers, Bytes::from(body.into_bytes()));
+
     Ok(CapturedResponse {
         status,
         version,
-        headers: parse_headers(&headers)?,
-        body: Bytes::from(body.into_bytes()),
+        headers,
+        body,
     })
 }
 
@@ -426,6 +471,83 @@ mod tests {
             parse_request("ONLYONE\n\n", &original),
             Err(ParseError::BadStartLine(_))
         ));
+    }
+
+    /// The pairing that makes interception work on real traffic: what is shown
+    /// is decoded, and what is parsed back goes out re-encoded.
+    #[test]
+    fn a_compressed_body_is_shown_decoded_and_sent_re_encoded() {
+        use std::io::Write;
+
+        let plain = "{\"token\":\"abc\",\"padding\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(plain.as_bytes()).unwrap();
+        let compressed = Bytes::from(e.finish().unwrap());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert(
+            "content-length",
+            compressed.len().to_string().parse().unwrap(),
+        );
+        let original = CapturedResponse {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers,
+            body: compressed.clone(),
+        };
+
+        // Raw rendering shows the bytes that arrived; decoded shows the body.
+        assert!(!render_response(&original).contains("token"));
+        let shown = render_response_decoded(&original);
+        assert!(shown.contains("\"token\": \"abc\"") || shown.contains("\"token\":\"abc\""));
+
+        // Edit it the way an operator would, then parse it back.
+        let edited_text = shown.replace("abc", "xyz");
+        let parsed = parse_response(&edited_text, &original).unwrap();
+
+        assert!(
+            parsed.body.starts_with(&[0x1f, 0x8b]),
+            "the body must go out re-compressed, not as plaintext under a gzip header"
+        );
+        assert_eq!(
+            parsed
+                .headers
+                .get("content-length")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            parsed.body.len().to_string(),
+            "length must describe what is actually sent"
+        );
+
+        // And the far side gets the edit.
+        let received = crate::encoding::decoded(&parsed.headers, &parsed.body);
+        let received = String::from_utf8(received.to_vec()).unwrap();
+        assert!(received.contains("xyz"));
+        assert!(!received.contains("abc"));
+    }
+
+    /// A body that will not decompress must still be editable — it renders as
+    /// the bytes that arrived, and those go back out unchanged in shape.
+    #[test]
+    fn an_undecodable_body_still_round_trips() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        let original = CapturedResponse {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers,
+            body: Bytes::from_static(b"this is not gzip"),
+        };
+
+        let shown = render_response_decoded(&original);
+        assert!(shown.contains("this is not gzip"), "{shown}");
+        // Parsing it back re-applies the declared coding, which is the honest
+        // reading of "the headers say gzip".
+        let parsed = parse_response(&shown, &original).unwrap();
+        assert!(parsed.body.starts_with(&[0x1f, 0x8b]));
     }
 
     #[test]

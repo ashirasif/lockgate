@@ -87,6 +87,13 @@ pub struct BodyPreview {
     pub text: Option<String>,
     /// The window base64-encoded, when it is not valid UTF-8 (binary bodies).
     pub base64: Option<String>,
+    /// The `Content-Encoding` the body arrived with, if any. Present whether or
+    /// not it was decoded, so a base64 blob is never a mystery.
+    pub content_encoding: Option<String>,
+    /// Set when the bytes here were decompressed for you. A compressed body can
+    /// only be decoded whole, so a windowed read of one is returned raw with
+    /// this false — fetch `resource_uri` to get it decoded.
+    pub decoded: bool,
     pub resource_uri: String,
 }
 

@@ -33,6 +33,7 @@ exists but you will notice what is missing.
 | **Display** | HTTP syntax highlighting, syntect for bodies (JSON, HTML, XML, GraphQL, protobuf, JS-in-`<script>`, …), JSON/HTML pretty-printing, OSC 52 clipboard |
 | **MCP** | 26 tools: recon, intercept, scope, send, format. Resources for full bodies |
 | **Findings** | Schema, core API and MCP tools — see gaps for the missing half |
+| **Compressed bodies** | gzip, deflate and brotli decoded for display and over MCP, re-encoded when an intercepted body is edited. Stored bytes are always what arrived |
 
 ### Partial
 
@@ -48,7 +49,7 @@ exists but you will notice what is missing.
 
 | Area | |
 |---|---|
-| **Compressed bodies** | Stored exactly as they arrived, so a `content-encoding: gzip` response renders as binary noise and no highlighting engages. Verified, not assumed — see [Decoding](#decoding-compressed-bodies) |
+| **zstd bodies** | `zstd` is not decoded. Still rare in browser traffic, and the usable crate pulls a C library. Such bodies render as they arrived |
 | **WebSockets** | Frames pass through untouched. The `ws_message` table exists and is never written |
 | **HTTP/2** | Not enabled |
 | **Match & replace** | Absent |
@@ -153,20 +154,29 @@ A few decisions worth knowing before changing things:
 
 ## Decoding compressed bodies
 
-The next thing to build, and the decisions already taken:
+Captured bodies are stored **exactly as they arrived**, compressed and all. A
+proxy that silently rewrites what came off the wire is lying about what
+happened, and it would make the stored `Content-Length` a fiction.
 
-1. **Store the wire bytes unchanged.** A proxy that silently rewrites what
-   arrived is lying about what happened, and it makes `Content-Length` a
-   fiction.
-2. **Decode at the display and MCP boundary only.** `content-encoding` survives
-   capture, so what a body is can always be recovered.
-3. **Re-encode on forward** when an intercepted body was edited. Sending
-   plaintext under a `gzip` header would break the client.
+Decoding happens at the two boundaries where a body is *shown* to someone:
 
-Verified rather than assumed: a 7.7KB JSON response arrives as 561 gzip-framed
-bytes, is stored that way, and is unreadable in the preview.
+- the preview panes and the Proxy detail view, which say `(decoded gzip for
+  display)` so a length mismatch is never a mystery
+- `get_flow` and the `flow://` resources over MCP, which report
+  `content_encoding` and whether the bytes were `decoded`
 
----
+A compressed stream can only be decoded whole, so a *windowed* body read comes
+back raw with `decoded: false` — decoding a window would produce
+plausible-looking garbage. Fetch the resource to get it decoded.
+
+Going the other way, an intercepted body that was edited is **re-encoded on
+forward** and `Content-Length` corrected, because plaintext under a `gzip`
+header is rejected by the client.
+
+Every failure degrades to the original bytes. A truncated, mislabelled or
+oversized body still renders — as noise, but it renders: in a proxy the bytes
+that arrived are the evidence. Decompression is capped at 64MB, since the far
+side is not trusted and a few hundred bytes can claim gigabytes.
 
 ## Known hazards
 
@@ -181,7 +191,7 @@ bytes, is stored that way, and is unreadable in the preview.
 ## Development
 
 ```sh
-cargo test --workspace      # 355 tests
+cargo test --workspace      # 372 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```

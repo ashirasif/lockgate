@@ -13,6 +13,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
 regex = { workspace = true }
 
 # Integration tests read the database back with their own connection.
