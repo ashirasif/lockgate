@@ -6,3 +6,8 @@
 
 # runtime log (TUI redirects tracing here)
 proxy.log
+
+# Claude Code's scratch space, including git worktrees it creates under
+# .claude/worktrees. Those are checkouts of this same repo — committing them
+# would nest the repository inside itself.
+/.claude
