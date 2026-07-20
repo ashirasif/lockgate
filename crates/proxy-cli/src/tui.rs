@@ -16,9 +16,11 @@ use ratatui::{
 };
 
 use crate::command::Command;
-use crate::editor::TextBuffer;
+use crate::editor::{TextBuffer, Yank};
 use crate::http_text;
-use crate::input::{Action, Column, Input, InsertKey, Mode, Motion, PaletteKey, Scroll, Window};
+use crate::input::{
+    Action, BufferCmd, Column, Input, InsertKey, Mode, Motion, PaletteKey, Scroll, Window,
+};
 
 /// The Repeater's working copy of a request.
 ///
@@ -40,6 +42,12 @@ struct Repeater {
     response: Arc<Mutex<Option<String>>>,
     /// Why the last send attempt did not leave — a parse error in the buffer.
     error: Option<String>,
+    /// Whether the buffer has the keys.
+    ///
+    /// The Repeater is almost all buffer, so it is tempting to leave it always
+    /// focused — but the buffer keymap claims `I`, `A`, `P` and `gt`, and a
+    /// window you cannot leave is a trap. `<CR>` steps in, `<Esc>` steps out.
+    focused: bool,
 }
 
 /// The Intercept window's view state. The queues themselves live on the engine.
@@ -197,6 +205,10 @@ struct App {
     held_requests: Vec<Held>,
     held_responses: Vec<Held>,
 
+    /// The unnamed register. On the app rather than the buffer so a yank in one
+    /// preview can be pasted into another — copying a header from a response
+    /// into a request is the whole point.
+    yank: Yank,
     /// Set by `e`, consumed by the run loop once it can free the terminal.
     pending_edit: Option<EditJob>,
     /// Makes each scratch file unique within a session.
@@ -230,6 +242,7 @@ impl App {
             sitemap: SitemapView::default(),
             held_requests: Vec::new(),
             held_responses: Vec::new(),
+            yank: Yank::default(),
             pending_edit: None,
             edit_seq: 0,
         }
@@ -401,6 +414,8 @@ impl App {
 
         self.detail = self.selected_id().and_then(|id| self.engine.get_flow(id));
 
+        self.sync_buffer_focus();
+
         self.held_requests = self.engine.intercept().queue_of(true);
         self.held_responses = self.engine.intercept().queue_of(false);
         self.intercept.request_row = self
@@ -441,8 +456,28 @@ impl App {
         Ok(())
     }
 
+    /// Tell the input layer whether a buffer currently has the keys.
+    ///
+    /// Called after every action as well as on refresh, because focus changes
+    /// mid-action: syncing only on the next tick would leave one keystroke
+    /// resolving against the wrong map, and that keystroke could be a `d` that
+    /// drops a request instead of starting a delete.
+    fn sync_buffer_focus(&mut self) {
+        let editing = match self.window {
+            Window::Repeater => self.repeater.focused && self.repeater.original.is_some(),
+            Window::Intercept => self.intercept.pane == Pane::Preview,
+            _ => false,
+        };
+        self.input.set_buffer_focus(editing);
+    }
+
     /// The single place where an intent becomes a change to the app.
     fn apply(&mut self, action: Action) {
+        self.apply_inner(action);
+        self.sync_buffer_focus();
+    }
+
+    fn apply_inner(&mut self, action: Action) {
         match action {
             // Windows with a row cursor move it; the rest have only scrollable
             // content, so the same motions move the viewport instead.
@@ -547,6 +582,7 @@ impl App {
             Action::Toggle => self.toggle_fold(),
             Action::Enter => self.enter_preview(),
             Action::ExternalEdit => self.request_external_edit(),
+            Action::Buffer { cmd, count } => self.buffer_command(cmd, count),
             Action::Escape => self.leave_preview(),
             Action::Command(line) => self.run_command(&line),
             Action::Window(window) => self.show_window(window),
@@ -557,8 +593,15 @@ impl App {
 
     // --- editing ---
 
-    /// Step from a queue into the preview beneath it.
+    /// Step into the focused buffer, wherever the window keeps one.
     fn enter_preview(&mut self) {
+        if self.window == Window::Repeater {
+            if self.repeater.original.is_some() {
+                self.repeater.focused = true;
+                self.note("editing — vim keys, <Esc> to leave");
+            }
+            return;
+        }
         if self.window != Window::Intercept {
             return;
         }
@@ -573,11 +616,16 @@ impl App {
         self.note("preview — e for $EDITOR, i to insert, <Esc> back");
     }
 
-    /// Step back out of a preview to its queue.
+    /// Step back out of a buffer, which is what makes window keys reachable
+    /// again.
     fn leave_preview(&mut self) {
-        if self.window == Window::Intercept && self.intercept.pane == Pane::Preview {
-            self.intercept.pane = Pane::Table;
-            self.content_scroll = 0;
+        match self.window {
+            Window::Repeater => self.repeater.focused = false,
+            Window::Intercept if self.intercept.pane == Pane::Preview => {
+                self.intercept.pane = Pane::Table;
+                self.content_scroll = 0;
+            }
+            _ => {}
         }
     }
 
@@ -605,6 +653,110 @@ impl App {
         }
     }
 
+    /// Run a vim command against the focused buffer.
+    ///
+    /// Counts repeat the whole command, which is right for motions and for the
+    /// operators we have (`3dd`, `2x`). It is not vim's general rule — vim
+    /// applies the count to the *motion* inside an operator — but with no
+    /// operator-pending state to hang that on, repeating is the reading that
+    /// never does something surprising.
+    fn buffer_command(&mut self, cmd: BufferCmd, count: Option<usize>) {
+        let times = count.unwrap_or(1).min(1000);
+        // Entering insert starts one undo unit for the whole session, so the
+        // checkpoint belongs here rather than on each typed character.
+        if matches!(
+            cmd,
+            BufferCmd::Insert
+                | BufferCmd::InsertLineStart
+                | BufferCmd::Append
+                | BufferCmd::AppendLineEnd
+        ) {
+            if let Some(buffer) = self.active_buffer() {
+                buffer.checkpoint();
+            }
+        }
+
+        let mut yanked = None;
+        // Cloned up front: the register lives on `self`, and pasting needs to
+        // read it while the buffer is mutably borrowed out of the same struct.
+        let register = self.yank.clone();
+        let Some(buffer) = self.active_buffer() else {
+            return;
+        };
+
+        for _ in 0..times {
+            match cmd {
+                // Motions.
+                BufferCmd::Left => buffer.left(),
+                BufferCmd::Right => buffer.right(),
+                BufferCmd::Up => buffer.up(),
+                BufferCmd::Down => buffer.down(),
+                BufferCmd::WordForward => buffer.word_forward(),
+                BufferCmd::WordBackward => buffer.word_backward(),
+                BufferCmd::WordEnd => buffer.word_end(),
+                BufferCmd::LineStart => buffer.line_start(),
+                BufferCmd::FirstNonBlank => buffer.first_non_blank(),
+                BufferCmd::LineEnd => buffer.line_end(),
+                // `5gg` is line 5; bare `gg` is the top.
+                BufferCmd::Top => match count {
+                    Some(n) => buffer.goto_line(n.saturating_sub(1)),
+                    None => buffer.top(),
+                },
+                BufferCmd::Bottom => match count {
+                    Some(n) => buffer.goto_line(n.saturating_sub(1)),
+                    None => buffer.bottom(),
+                },
+
+                // Operators. Each yields the text it removed, which becomes the
+                // register — deleting in vim yanks, which is what makes `dd`
+                // then `p` a move.
+                BufferCmd::DeleteChar => yanked = Some(buffer.delete_char()),
+                BufferCmd::DeleteLine => yanked = Some(buffer.delete_line()),
+                BufferCmd::DeleteToEnd => yanked = Some(buffer.delete_to_end()),
+                BufferCmd::DeleteWord => yanked = Some(buffer.delete_word()),
+                // Change is delete-then-insert; the mode switch already happened
+                // in the input layer.
+                BufferCmd::ChangeLine => {
+                    let taken = buffer.delete_line();
+                    buffer.open_above();
+                    yanked = Some(taken);
+                }
+                BufferCmd::ChangeToEnd => yanked = Some(buffer.delete_to_end()),
+                BufferCmd::ChangeWord => yanked = Some(buffer.delete_word()),
+                BufferCmd::YankLine => yanked = Some(buffer.yank_line()),
+                BufferCmd::YankWord => yanked = Some(buffer.yank_word()),
+                BufferCmd::PasteAfter => buffer.paste(&register, true),
+                BufferCmd::PasteBefore => buffer.paste(&register, false),
+                BufferCmd::Undo => {
+                    if !buffer.undo() {
+                        break;
+                    }
+                }
+                BufferCmd::Redo => {
+                    if !buffer.redo() {
+                        break;
+                    }
+                }
+
+                // Insert entry points. The cursor move is the whole job.
+                BufferCmd::Insert => {}
+                BufferCmd::InsertLineStart => buffer.first_non_blank(),
+                BufferCmd::Append => buffer.append(),
+                BufferCmd::AppendLineEnd => buffer.line_end(),
+                BufferCmd::OpenBelow => buffer.open_below(),
+                BufferCmd::OpenAbove => buffer.open_above(),
+            }
+        }
+
+        // An empty yank means the operator found nothing to take; keeping the
+        // previous register is better than clearing it to nothing.
+        if let Some(yanked) = yanked {
+            if !yanked.text.is_empty() {
+                self.yank = yanked;
+            }
+        }
+    }
+
     /// Route a keystroke to whichever buffer the active window is editing.
     /// Windows with nothing editable swallow it, so `i` there is inert rather
     /// than scribbling into a buffer the operator cannot see.
@@ -612,7 +764,9 @@ impl App {
         // `i` from the queue means "edit this one", so open its preview rather
         // than leaving the operator in INSERT with nothing underneath the
         // cursor. `<CR>` is still the way to open one just to read it.
-        if self.window == Window::Intercept && self.intercept.pane == Pane::Table {
+        if (self.window == Window::Intercept && self.intercept.pane == Pane::Table)
+            || (self.window == Window::Repeater && !self.repeater.focused)
+        {
             self.enter_preview();
         }
         let Some(buffer) = self.active_buffer() else {
@@ -768,6 +922,7 @@ impl App {
             original: Some(flow.request),
             response: Arc::new(Mutex::new(None)),
             error: None,
+            focused: false,
         };
         self.show_window(Window::Repeater);
         self.note(&format!("#{id} → Repeater"));
@@ -1384,7 +1539,8 @@ impl App {
             return;
         }
 
-        let editing = self.input.mode() == Mode::Insert;
+        let inserting = self.input.mode() == Mode::Insert;
+        let editing = self.repeater.focused;
         let dirty = self.repeater.request.is_dirty();
         let mut chips = vec![Span::styled(
             match self.repeater.origin {
@@ -1398,9 +1554,9 @@ impl App {
         }
         chips.push(Span::styled(
             if editing {
-                "  <Esc> stop editing".to_string()
+                "  vim keys   <Esc> leave".to_string()
             } else {
-                "  e $EDITOR   i insert   <Space>r send".to_string()
+                "  <CR> edit   e $EDITOR   <Space>r send".to_string()
             },
             muted(),
         ));
@@ -1412,12 +1568,12 @@ impl App {
 
         let title = if dirty { " Request* " } else { " Request " };
         let border = if editing {
-            Style::new().fg(Color::Red)
+            Style::new().fg(Color::Cyan)
         } else {
-            Style::new()
+            muted()
         };
         frame.render_widget(
-            buffer_pane(&self.repeater.request, title, editing, editing, border)
+            buffer_pane(&self.repeater.request, title, editing, inserting, border)
                 .scroll((self.content_scroll, 0)),
             left,
         );
@@ -1479,7 +1635,7 @@ impl App {
                 ),
                 Span::styled(
                     if self.intercept.pane == Pane::Preview {
-                        "   e $EDITOR  i insert  <Esc> back"
+                        "   vim keys: w b dd cw yy p u   <Esc> back to queue"
                     } else {
                         "   <CR> open  e $EDITOR  f forward  d drop  F/D all  ^w pane  <Space>i hold"
                     },
@@ -1875,7 +2031,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <Space>s→Repeater, i edit, <Space>r send · Intercept: <Space>i hold, <Space>1/2 legs, ^w pane, <CR> open, f/d answer (F/D all) · :q";
+const HELP: &str = "^k palette · P/I/R/S/A windows, gt/gT cycle · <Space>s→Repeater, <CR> edit (vim keys, <Esc> leaves), e $EDITOR, <Space>r send · Intercept: <Space>i hold, <Space>1/2 legs, ^w pane, f/d answer (F/D all) · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -3008,6 +3164,124 @@ mod tests {
         );
         let (_, req) = app.intercept.request_edit.as_ref().unwrap();
         assert!(req.text().starts_with('Z'));
+    }
+
+    /// The preview is a vim buffer: `w` moves by word, `dd` deletes a line,
+    /// `p` puts it back.
+    #[test]
+    fn preview_supports_vim_motions_and_operators() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        // `w` from column 0 of "GET /req-path HTTP/1.1" lands on the slash.
+        press(&mut app, "w");
+        assert_eq!(app.preview_buffer(true).unwrap().cursor().col, 4);
+
+        press(&mut app, "dd");
+        let text = app.preview_buffer(true).unwrap().text();
+        assert!(!text.starts_with("GET"), "the line should be gone: {text}");
+
+        press(&mut app, "p");
+        assert!(
+            app.preview_buffer(true).unwrap().text().contains("GET"),
+            "p should put the deleted line back"
+        );
+    }
+
+    /// `u` undoes, and a whole insert session undoes as one step.
+    #[test]
+    fn preview_undo_covers_a_whole_insert_session() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        let original = app.preview_buffer(true).unwrap().text();
+
+        press(&mut app, "i");
+        assert_eq!(app.input.mode(), Mode::Insert);
+        press(&mut app, "XYZ");
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.preview_buffer(true).unwrap().text().starts_with("XYZ"));
+
+        press(&mut app, "u");
+        assert_eq!(
+            app.preview_buffer(true).unwrap().text(),
+            original,
+            "the whole session should undo at once"
+        );
+    }
+
+    /// The register is on the app, so a yank in one preview pastes into the
+    /// other — copying a header from a response into a request.
+    #[test]
+    fn the_register_is_shared_between_previews() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+
+        // Yank the status line out of the response.
+        app.apply(Action::Focus(Some(Column::Right)));
+        app.apply(Action::Enter);
+        press(&mut app, "yy");
+        assert!(app.yank.text.contains("404"), "yanked: {}", app.yank.text);
+
+        // Put it into the request.
+        app.apply(Action::Focus(Some(Column::Left)));
+        press(&mut app, "p");
+        assert!(
+            app.preview_buffer(true).unwrap().text().contains("404"),
+            "the yank should cross panes"
+        );
+    }
+
+    /// A count repeats the command.
+    #[test]
+    fn counts_repeat_buffer_commands() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        let lines = app.preview_buffer(true).unwrap().lines().len();
+
+        press(&mut app, "2dd");
+        assert_eq!(
+            app.preview_buffer(true).unwrap().lines().len(),
+            lines - 2,
+            "2dd should delete two lines"
+        );
+    }
+
+    /// The buffer keymap claims `I`, `A`, `P` and `gt`, so a window that is
+    /// always focused would be one you cannot leave. Escape has to get out.
+    #[test]
+    fn escape_releases_the_buffer_so_window_keys_work_again() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+
+        // While focused, `P` is a vim put, not a jump to Proxy.
+        press(&mut app, "P");
+        assert_eq!(app.window, Window::Intercept, "P must not switch windows");
+
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        press(&mut app, "P");
+        assert_eq!(app.window, Window::Proxy, "and must switch once released");
+    }
+
+    /// Same trap in the Repeater, which is almost all buffer.
+    #[test]
+    fn the_repeater_buffer_can_be_left() {
+        let mut app = App::new(engine_with(1));
+        app.refresh();
+        press(&mut app, " s");
+        assert!(!app.repeater.focused, "should not start focused");
+
+        // Unfocused, window keys work.
+        press(&mut app, "P");
+        assert_eq!(app.window, Window::Proxy);
+
+        press(&mut app, "R");
+        key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.repeater.focused);
+        press(&mut app, "P");
+        assert_eq!(app.window, Window::Repeater, "focused: P is a put");
+
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        press(&mut app, "P");
+        assert_eq!(app.window, Window::Proxy);
     }
 
     /// `e` stages the focused buffer for the external editor. The handoff
