@@ -1718,13 +1718,15 @@ impl App {
         } else {
             muted()
         };
-        frame.render_widget(
-            buffer_pane(&self.repeater.request, title, editing, inserting, border).scroll((
-                self.content_scroll,
-                horizontal_scroll(&self.repeater.request, left),
-            )),
-            left,
-        );
+        BufferView {
+            buffer: &self.repeater.request,
+            title: title.to_string(),
+            focused: editing,
+            inserting,
+            border,
+            scroll: self.content_scroll,
+        }
+        .render(frame, left);
 
         let response = self.repeater.response.lock().unwrap().clone();
         let mut lines: Vec<Line> = match &self.repeater.error {
@@ -1943,13 +1945,18 @@ impl App {
                 // Show the cursor whenever the preview has the keys, not only
                 // while inserting — that is what makes it navigable rather than
                 // a block of text that happens to scroll.
-                let hscroll = horizontal_scroll(buffer, view_area);
-                let widget = buffer_pane(buffer, title, in_preview, inserting, view_border)
-                    .scroll((view_scroll, hscroll));
                 if focused {
                     self.content_len = buffer.lines().len() as u16;
                 }
-                frame.render_widget(widget, view_area);
+                BufferView {
+                    buffer,
+                    title,
+                    focused: in_preview,
+                    inserting,
+                    border: view_border,
+                    scroll: view_scroll,
+                }
+                .render(frame, view_area);
             }
             _ => {
                 let text = render_pending(&item.pending);
@@ -2458,76 +2465,153 @@ fn pane(lines: Vec<Line<'static>>, title: impl Into<String>) -> Paragraph<'stati
         .wrap(Wrap { trim: false })
 }
 
-/// How far to scroll a buffer pane sideways to keep the cursor on screen.
+/// A pane showing an editable buffer: a line-number gutter, syntax-highlighted
+/// text, and a block cursor when the buffer has focus.
 ///
-/// The companion to [`buffer_pane`]'s refusal to wrap. Without this, a minified
-/// body — a 559-byte HTML response on one line is the normal case, not a corner
-/// one — runs off the right edge with no way to reach the rest of it. Scrolling
-/// only once the cursor would leave the pane keeps short lines pinned at column
-/// zero, so the view stays still until it has a reason to move.
-fn horizontal_scroll(buffer: &TextBuffer, area: Rect) -> u16 {
-    // Borders eat a column on each side, and one more so the cursor is never
-    // drawn flush against the right edge.
-    let visible = area.width.saturating_sub(3) as usize;
-    buffer.cursor().col.saturating_sub(visible) as u16
-}
-
-/// A pane showing an editable buffer, with the cursor drawn as a block when the
-/// buffer has focus.
-///
-/// Deliberately *not* wrapped, unlike [`pane`]. A wrapped line occupies more
-/// than one screen row, which would put the cursor somewhere other than where
-/// the buffer says it is — and a text editor whose cursor lies about its
-/// position is worse than one that scrolls sideways.
-fn buffer_pane(
-    buffer: &TextBuffer,
-    title: impl Into<String>,
+/// Renders itself rather than returning a `Paragraph`, because the gutter and
+/// the text scroll differently — the text moves sideways on a long line while
+/// the numbers must stay put. That needs two widgets in two sub-areas, which a
+/// single `Paragraph` cannot express.
+struct BufferView<'a> {
+    buffer: &'a TextBuffer,
+    title: String,
     focused: bool,
     inserting: bool,
     border: Style,
-) -> Paragraph<'static> {
-    let cursor = buffer.cursor();
-    // Syntax first, then the interactive decoration on top. Layering this way
-    // keeps the two concerns apart: the highlighter never has to know a cursor
-    // exists, and `patch` lets a selection shade the background while leaving
-    // the token's own foreground colour intact.
-    let syntax = crate::syntax::highlight(buffer.lines());
-    // Two cursors, because they mean different things: white where the next key
-    // inserts text, cyan where it only moves.
-    let cursor_bg = if inserting { Color::White } else { Color::Cyan };
-    let cursor_style = Style::new().fg(Color::Black).bg(cursor_bg);
-    let selected = Style::new().bg(Color::Rgb(60, 60, 100));
-    let has_selection = buffer.has_selection();
+    /// Vertical offset to use when the buffer does *not* have focus, where
+    /// scrolling is driven by the window's own `j`/`k` rather than a cursor.
+    scroll: u16,
+}
 
-    let lines: Vec<Line<'static>> = buffer
-        .lines()
-        .iter()
-        .zip(syntax)
-        .enumerate()
-        .map(|(line, (text, mut styles))| {
-            if focused {
-                // Per-cell so the selection and the cursor can overlap: the
-                // cursor sits inside its own selection, and must stay visible
-                // there.
-                for (col, style) in styles.iter_mut().enumerate() {
-                    if line == cursor.line && col == cursor.col {
-                        *style = style.patch(cursor_style);
-                    } else if has_selection && buffer.in_selection(Cursor { line, col }) {
-                        *style = style.patch(selected);
+impl BufferView<'_> {
+    /// Width of the number gutter, including its trailing space.
+    fn gutter_width(&self) -> u16 {
+        let digits = self.buffer.lines().len().to_string().len().max(2);
+        digits as u16 + 2
+    }
+
+    /// How far down to scroll so the cursor stays on screen.
+    ///
+    /// The bug this fixes: `content_scroll` only ever moved on `j`/`k` in a
+    /// window with no focused buffer, so once a buffer had focus — and
+    /// especially after `gq` turned one line into forty — the cursor walked off
+    /// the bottom and the view never followed.
+    ///
+    /// Stateless, and pinned to the last row rather than centred, matching how
+    /// the queue list above it scrolls. Nothing is stored, so the offset cannot
+    /// drift out of agreement with the cursor.
+    fn vertical_scroll(&self, rows: u16) -> u16 {
+        if !self.focused {
+            return self.scroll;
+        }
+        let visible = rows.max(1) as usize;
+        self.buffer.cursor().line.saturating_sub(visible - 1) as u16
+    }
+
+    /// How far sideways, so the far end of a minified body is reachable.
+    ///
+    /// The companion to this pane's refusal to wrap: a wrapped line occupies
+    /// more than one screen row, which would put the cursor somewhere other
+    /// than where the buffer says it is, and a text editor whose cursor lies
+    /// about its position is worse than one that scrolls. Short lines stay
+    /// pinned at column zero so the view holds still until it must move.
+    fn horizontal_scroll(&self, cols: u16) -> u16 {
+        // One column spare, so the cursor is never flush against the edge.
+        let visible = cols.saturating_sub(1) as usize;
+        self.buffer.cursor().col.saturating_sub(visible) as u16
+    }
+
+    /// Vim's hybrid gutter: distance from the cursor on every line, but the
+    /// cursor's own line shows its absolute number — relative numbers are for
+    /// counting a jump, and `0` would say nothing.
+    fn gutter(&self, width: u16) -> Vec<Line<'static>> {
+        let cursor = self.buffer.cursor().line;
+        let width = width.saturating_sub(1) as usize;
+        (0..self.buffer.lines().len())
+            .map(|line| {
+                if line == cursor {
+                    Line::styled(
+                        format!("{:<width$} ", line + 1),
+                        Style::new().fg(Color::Cyan),
+                    )
+                } else {
+                    Line::styled(format!("{:>width$} ", line.abs_diff(cursor)), muted())
+                }
+            })
+            .collect()
+    }
+
+    /// The text itself: syntax underneath, cursor and selection layered on top.
+    fn body(&self) -> Vec<Line<'static>> {
+        let cursor = self.buffer.cursor();
+        // Layering this way keeps the two concerns apart: the highlighter never
+        // has to know a cursor exists, and `patch` lets a selection shade the
+        // background while leaving the token's own foreground colour intact.
+        let syntax = crate::syntax::highlight(self.buffer.lines());
+        // Two cursors, because they mean different things: white where the next
+        // key inserts text, cyan where it only moves.
+        let cursor_bg = if self.inserting {
+            Color::White
+        } else {
+            Color::Cyan
+        };
+        let cursor_style = Style::new().fg(Color::Black).bg(cursor_bg);
+        let selected = Style::new().bg(Color::Rgb(60, 60, 100));
+        let has_selection = self.buffer.has_selection();
+
+        self.buffer
+            .lines()
+            .iter()
+            .zip(syntax)
+            .enumerate()
+            .map(|(line, (text, mut styles))| {
+                if self.focused {
+                    // Per-cell so the selection and the cursor can overlap: the
+                    // cursor sits inside its own selection and must stay visible
+                    // there.
+                    for (col, style) in styles.iter_mut().enumerate() {
+                        if line == cursor.line && col == cursor.col {
+                            *style = style.patch(cursor_style);
+                        } else if has_selection && self.buffer.in_selection(Cursor { line, col }) {
+                            *style = style.patch(selected);
+                        }
                     }
                 }
-            }
-            let mut spans = crate::syntax::coalesce(text, &styles);
-            // Past the last character there is nothing to invert, so a space
-            // stands in for the cell.
-            if focused && line == cursor.line && cursor.col >= text.chars().count() {
-                spans.push(Span::styled(" ", cursor_style));
-            }
-            Line::from(spans)
-        })
-        .collect();
+                let mut spans = crate::syntax::coalesce(text, &styles);
+                // Past the last character there is nothing to invert, so a
+                // space stands in for the cell.
+                if self.focused && line == cursor.line && cursor.col >= text.chars().count() {
+                    spans.push(Span::styled(" ", cursor_style));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    }
 
-    Paragraph::new(lines).block(Block::bordered().title(title.into()).border_style(border))
+    fn render(self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .title(self.title.clone())
+            .border_style(self.border);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let gutter_width = self.gutter_width();
+        let [gutter_area, text_area] =
+            Layout::horizontal([Constraint::Length(gutter_width), Constraint::Min(0)]).areas(inner);
+
+        // One offset for both, or the numbers would slide out of step with the
+        // lines they label.
+        let vertical = self.vertical_scroll(inner.height);
+
+        frame.render_widget(
+            Paragraph::new(self.gutter(gutter_width)).scroll((vertical, 0)),
+            gutter_area,
+        );
+        frame.render_widget(
+            Paragraph::new(self.body()).scroll((vertical, self.horizontal_scroll(text_area.width))),
+            text_area,
+        );
+    }
 }
 
 /// A bordered pane with a single muted message — used when a window has nothing
@@ -3741,27 +3825,35 @@ mod tests {
         assert!(status.contains("cannot format"), "should say why: {status}");
     }
 
+    fn view(buffer: &TextBuffer, focused: bool) -> BufferView<'_> {
+        BufferView {
+            buffer,
+            title: " Preview ".into(),
+            focused,
+            inserting: false,
+            border: Style::new(),
+            scroll: 0,
+        }
+    }
+
     /// A minified body is one very long line; without sideways scrolling the
     /// far end of it is unreachable, which is what made the pane look broken.
     #[test]
     fn the_view_follows_the_cursor_along_a_long_line() {
-        let area = Rect::new(0, 0, 40, 10);
+        const COLS: u16 = 37;
         let mut buffer = TextBuffer::from_text(&"x".repeat(500));
 
         assert_eq!(
-            horizontal_scroll(&buffer, area),
+            view(&buffer, true).horizontal_scroll(COLS),
             0,
             "a cursor already on screen must not shift the view"
         );
 
-        buffer.set_cursor(Cursor { line: 0, col: 36 });
-        assert_eq!(horizontal_scroll(&buffer, area), 0, "still just on screen");
-
         buffer.set_cursor(Cursor { line: 0, col: 200 });
-        let scroll = horizontal_scroll(&buffer, area);
+        let scroll = view(&buffer, true).horizontal_scroll(COLS);
         assert!(scroll > 0, "the view should follow the cursor");
         // The cursor must land inside the visible columns, not past the edge.
-        let visible = area.width as usize - 3;
+        let visible = COLS as usize - 1;
         assert!(
             (200 - scroll as usize) <= visible,
             "cursor at {} of {visible} visible",
@@ -3773,10 +3865,81 @@ mod tests {
     /// drift whenever the cursor sat near the end of one.
     #[test]
     fn short_lines_stay_pinned_at_column_zero() {
-        let area = Rect::new(0, 0, 80, 10);
         let mut buffer = TextBuffer::from_text("GET / HTTP/1.1");
         buffer.set_cursor(Cursor { line: 0, col: 13 });
-        assert_eq!(horizontal_scroll(&buffer, area), 0);
+        assert_eq!(view(&buffer, true).horizontal_scroll(77), 0);
+    }
+
+    /// The reported bug: after `gq` turns one line into many, moving down must
+    /// bring the view with it. Vim motions never touched `content_scroll`, so
+    /// the cursor used to walk off the bottom of the pane.
+    #[test]
+    fn the_view_follows_the_cursor_down_a_long_buffer() {
+        const ROWS: u16 = 10;
+        let mut buffer = TextBuffer::from_text(&"line\n".repeat(100));
+
+        assert_eq!(
+            view(&buffer, true).vertical_scroll(ROWS),
+            0,
+            "a cursor near the top must not scroll the view"
+        );
+
+        buffer.set_cursor(Cursor { line: 9, col: 0 });
+        assert_eq!(
+            view(&buffer, true).vertical_scroll(ROWS),
+            0,
+            "the last visible row is still on screen"
+        );
+
+        buffer.set_cursor(Cursor { line: 50, col: 0 });
+        let scroll = view(&buffer, true).vertical_scroll(ROWS);
+        assert_eq!(scroll, 41, "cursor pinned to the bottom row");
+        assert!(
+            (50 - scroll as usize) < ROWS as usize,
+            "the cursor must be inside the pane"
+        );
+    }
+
+    /// Without focus there is no cursor to follow, so the window's own `j`/`k`
+    /// offset stays in charge — otherwise entering a preview would yank the
+    /// read-only view back to the top.
+    #[test]
+    fn an_unfocused_buffer_keeps_its_manual_scroll() {
+        let mut buffer = TextBuffer::from_text(&"line\n".repeat(100));
+        buffer.set_cursor(Cursor { line: 50, col: 0 });
+
+        let mut unfocused = view(&buffer, false);
+        unfocused.scroll = 7;
+        assert_eq!(unfocused.vertical_scroll(10), 7);
+    }
+
+    /// The gutter must be wide enough for the largest line number, or the
+    /// numbers would truncate on a long body.
+    #[test]
+    fn the_gutter_grows_with_the_line_count() {
+        let short = TextBuffer::from_text("a\nb");
+        let long = TextBuffer::from_text(&"x\n".repeat(1000));
+        assert!(
+            view(&long, true).gutter_width() > view(&short, true).gutter_width(),
+            "a 1000-line body needs more room than a 2-line one"
+        );
+    }
+
+    /// Vim's hybrid: distance from the cursor everywhere, absolute on the
+    /// cursor's own line, where `0` would say nothing useful.
+    #[test]
+    fn the_gutter_is_relative_except_on_the_cursor_line() {
+        let mut buffer = TextBuffer::from_text("a\nb\nc\nd\ne");
+        buffer.set_cursor(Cursor { line: 2, col: 0 });
+
+        let v = view(&buffer, true);
+        let text: Vec<String> = v
+            .gutter(v.gutter_width())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let trimmed: Vec<&str> = text.iter().map(|s| s.trim()).collect();
+        assert_eq!(trimmed, ["2", "1", "3", "1", "2"], "{text:?}");
     }
 
     /// `<C-g>` stages the focused buffer for the external editor. The handoff
