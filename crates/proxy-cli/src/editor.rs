@@ -56,6 +56,12 @@ impl TextBuffer {
         self.dirty = false;
     }
 
+    /// Mark the buffer changed without going through an edit method — for text
+    /// that came back altered from somewhere else, such as an external editor.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     // --- editing ---
 
     pub fn insert_char(&mut self, c: char) {

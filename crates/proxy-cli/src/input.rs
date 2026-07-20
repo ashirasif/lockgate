@@ -239,6 +239,8 @@ pub enum Action {
     Toggle,
     /// `<CR>` on a queue row — step into the preview for that item.
     Enter,
+    /// `e` — open the focused buffer in the operator's own editor.
+    ExternalEdit,
     /// Escape with nothing half-typed: step back out of wherever you are.
     Escape,
     /// `<C-w>h` / `<C-w>l` / `<C-w>w` — move focus between split panes.
@@ -276,6 +278,7 @@ enum Bind {
     SendToRepeater,
     Toggle,
     Enter,
+    ExternalEdit,
     /// `None` cycles to the other pane; `Some(c)` focuses that side.
     Focus(Option<Column>),
     ToggleHoldRequests,
@@ -291,6 +294,11 @@ enum Bind {
 /// two things you do to it are forward and drop. A key that is unambiguous in
 /// one window can be spent there without costing anything anywhere else.
 const WINDOW_MAP: &[(Window, &str, Bind)] = &[
+    // Hand the buffer to the operator's real editor. `e` is end-of-word in vim,
+    // but these windows have no word motions to shadow — and this is the key
+    // that gets you the editor that does.
+    (Window::Intercept, "e", Bind::ExternalEdit),
+    (Window::Repeater, "e", Bind::ExternalEdit),
     (Window::Intercept, "f", Bind::Forward),
     (Window::Intercept, "d", Bind::Drop),
     (Window::Intercept, "F", Bind::ForwardAll),
@@ -564,6 +572,7 @@ impl Input {
             Bind::SendToRepeater => Action::SendToRepeater,
             Bind::Toggle => Action::Toggle,
             Bind::Enter => Action::Enter,
+            Bind::ExternalEdit => Action::ExternalEdit,
             Bind::Focus(column) => Action::Focus(column),
             Bind::ToggleHoldRequests => Action::ToggleHoldRequests,
             Bind::ToggleHoldResponses => Action::ToggleHoldResponses,

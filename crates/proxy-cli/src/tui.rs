@@ -106,6 +106,27 @@ struct SitemapView {
     collapsed: HashSet<String>,
 }
 
+/// A buffer handed out to the operator's own editor, and where to put it back.
+///
+/// The edit is deferred rather than done inline because it needs the terminal:
+/// the TUI has to release the alternate screen before the editor can draw, and
+/// only the run loop owns the terminal handle.
+struct EditJob {
+    target: EditTarget,
+    /// What went out, so an unchanged file can be told from a saved one.
+    before: String,
+}
+
+enum EditTarget {
+    Repeater,
+    /// A held item, identified by ticket so the result cannot land on whatever
+    /// took its place while the editor was open.
+    Held {
+        requests: bool,
+        ticket: TicketId,
+    },
+}
+
 /// One rendered line of the sitemap tree.
 struct SitemapRow {
     depth: usize,
@@ -175,6 +196,11 @@ struct App {
     /// never saw.
     held_requests: Vec<Held>,
     held_responses: Vec<Held>,
+
+    /// Set by `e`, consumed by the run loop once it can free the terminal.
+    pending_edit: Option<EditJob>,
+    /// Makes each scratch file unique within a session.
+    edit_seq: u64,
 }
 
 impl App {
@@ -204,6 +230,8 @@ impl App {
             sitemap: SitemapView::default(),
             held_requests: Vec::new(),
             held_responses: Vec::new(),
+            pending_edit: None,
+            edit_seq: 0,
         }
     }
 
@@ -229,10 +257,124 @@ impl App {
             self.refresh();
             terminal.draw(|frame| self.draw(frame))?;
             self.handle_events()?;
+            // Handing the terminal to an editor has to happen out here, where
+            // the terminal handle lives — and between draws, never during one.
+            if let Some(job) = self.pending_edit.take() {
+                self.run_editor(job, terminal).await;
+            }
             // Yield rather than block: the proxy is running on other tokio tasks.
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Ok(())
+    }
+
+    /// Drop out of the TUI, run the operator's editor over a scratch file, and
+    /// come back.
+    ///
+    /// The proxy keeps running throughout — it lives on other tasks — so traffic
+    /// is still captured and anything held stays held while you edit.
+    ///
+    /// Whether the file changed *is* the save signal: `:wq` writes and the edit
+    /// lands, `:q!` doesn't and it doesn't. That means we never have to ask the
+    /// editor what the user did, which is good, because there is no portable way
+    /// to find out.
+    async fn run_editor(&mut self, job: EditJob, terminal: &mut DefaultTerminal) {
+        self.edit_seq += 1;
+        let path = std::env::temp_dir().join(format!(
+            // `.http` so an editor picks a sensible filetype for syntax.
+            "proxy-edit-{}-{}.http",
+            std::process::id(),
+            self.edit_seq
+        ));
+
+        if let Err(e) = std::fs::write(&path, &job.before) {
+            self.note(&format!("could not write scratch file: {e}"));
+            return;
+        }
+
+        // Give the terminal back before spawning: the editor needs the real
+        // screen, not our alternate one.
+        ratatui::restore();
+        let status = editor_command(&path).status().await;
+        *terminal = ratatui::init();
+        let _ = terminal.clear();
+
+        match status {
+            Ok(status) if status.success() => match std::fs::read_to_string(&path) {
+                Ok(after) if after != job.before => self.apply_edit(job, after),
+                Ok(_) => self.note("no changes"),
+                Err(e) => self.note(&format!("could not read back the edit: {e}")),
+            },
+            // A non-zero exit is how an editor reports it did not finish
+            // cleanly. Taking the file anyway would apply a half-finished edit.
+            Ok(status) => self.note(&format!("editor exited {status}; nothing applied")),
+            Err(e) => self.note(&format!("could not start editor: {e}")),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Put an edited buffer back where it came from.
+    fn apply_edit(&mut self, job: EditJob, text: String) {
+        let mut buffer = TextBuffer::from_text(&text);
+        // It came back changed, so it is dirty by definition — `from_text`
+        // starts clean, and forwarding only reparses a dirty buffer.
+        buffer.mark_dirty();
+
+        match job.target {
+            EditTarget::Repeater => {
+                self.repeater.request = buffer;
+                self.note("edit applied — <Space>r to send");
+            }
+            EditTarget::Held { requests, ticket } => {
+                // The item may have been answered while the editor was open.
+                if !self.held(requests).iter().any(|h| h.ticket == ticket) {
+                    self.note("that item is no longer held; edit discarded");
+                    return;
+                }
+                *self.intercept.edit(requests) = Some((ticket, buffer));
+                // `:wq` means "done with this one" — go back to the queue, which
+                // is where forwarding it happens.
+                self.intercept.pane = Pane::Table;
+                self.note("edit applied — f to forward");
+            }
+        }
+    }
+
+    /// Stage the focused buffer for editing. The run loop picks this up.
+    fn request_external_edit(&mut self) {
+        let job = match self.window {
+            Window::Repeater => self.repeater.original.as_ref().map(|_| EditJob {
+                target: EditTarget::Repeater,
+                before: self.repeater.request.text(),
+            }),
+            Window::Intercept => {
+                let requests = self.intercept.showing_requests();
+                let row = self.intercept.row(requests);
+                let held = self.held(requests).get(row).cloned();
+                held.map(|held| {
+                    // Prefer edits already made in-pane over the original, so
+                    // `i` then `e` does not silently throw the first ones away.
+                    let before = match self.intercept.edit(requests) {
+                        Some((t, b)) if *t == held.ticket => b.text(),
+                        _ => render_pending(&held.pending),
+                    };
+                    EditJob {
+                        target: EditTarget::Held {
+                            requests,
+                            ticket: held.ticket,
+                        },
+                        before,
+                    }
+                })
+            }
+            _ => None,
+        };
+
+        match job {
+            Some(job) => self.pending_edit = Some(job),
+            None => self.note("nothing to edit here"),
+        }
     }
 
     /// Pull the latest history from the engine and keep the selection valid.
@@ -404,6 +546,7 @@ impl App {
             }
             Action::Toggle => self.toggle_fold(),
             Action::Enter => self.enter_preview(),
+            Action::ExternalEdit => self.request_external_edit(),
             Action::Escape => self.leave_preview(),
             Action::Command(line) => self.run_command(&line),
             Action::Window(window) => self.show_window(window),
@@ -427,11 +570,7 @@ impl App {
         self.content_scroll = 0;
         // Materialise the buffer now so the cursor is visible on arrival.
         self.preview_buffer(requests);
-        self.note(if requests {
-            "request preview — i edit, <Esc> back"
-        } else {
-            "response preview — read-only, <Esc> back"
-        });
+        self.note("preview — e for $EDITOR, i to insert, <Esc> back");
     }
 
     /// Step back out of a preview to its queue.
@@ -475,14 +614,6 @@ impl App {
         // cursor. `<CR>` is still the way to open one just to read it.
         if self.window == Window::Intercept && self.intercept.pane == Pane::Table {
             self.enter_preview();
-        }
-        // A held response is shown for reading, not rewriting. Refusing here
-        // rather than hiding the buffer keeps it navigable — you can still put
-        // the cursor anywhere in it — while nothing you type can change what
-        // gets forwarded.
-        if self.window == Window::Intercept && !self.intercept.showing_requests() {
-            self.note("responses are read-only here");
-            return;
         }
         let Some(buffer) = self.active_buffer() else {
             return;
@@ -1269,7 +1400,7 @@ impl App {
             if editing {
                 "  <Esc> stop editing".to_string()
             } else {
-                "  i edit   <Space>r send".to_string()
+                "  e $EDITOR   i insert   <Space>r send".to_string()
             },
             muted(),
         ));
@@ -1317,9 +1448,9 @@ impl App {
     /// Intercept: four panes. The two legs of an exchange side by side, each a
     /// queue above a preview of its highlighted item.
     ///
-    /// Requests sit left and responses right — the order traffic travels. The
-    /// request preview is editable, so what is on screen is exactly what
-    /// forwarding would send; the response preview is for reading.
+    /// Requests sit left and responses right — the order traffic travels. Both
+    /// previews are editable, so what is on screen is exactly what forwarding
+    /// would send.
     fn draw_intercept(&mut self, frame: &mut Frame, area: Rect) {
         let [banner, panes] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
@@ -1348,9 +1479,9 @@ impl App {
                 ),
                 Span::styled(
                     if self.intercept.pane == Pane::Preview {
-                        "   <Esc> back to queue   i edit"
+                        "   e $EDITOR  i insert  <Esc> back"
                     } else {
-                        "   <CR> open  f forward  d drop  F/D all  ^w pane  <Space>i hold  <Space>1/2 legs"
+                        "   <CR> open  e $EDITOR  f forward  d drop  F/D all  ^w pane  <Space>i hold"
                     },
                     muted(),
                 ),
@@ -1503,7 +1634,7 @@ impl App {
                     " {}{}{} ",
                     capitalize(noun),
                     if buffer.is_dirty() { "*" } else { "" },
-                    if requests { "" } else { " (read-only)" }
+                    ""
                 );
                 // Show the cursor whenever the preview has the keys, not only
                 // while inserting — that is what makes it navigable rather than
@@ -1929,6 +2060,51 @@ fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
         width,
         height,
     }
+}
+
+/// The command that opens `path` in the operator's editor.
+///
+/// `$VISUAL` before `$EDITOR` (the former means "full-screen editor", which is
+/// exactly what we are handing the terminal to), then `nvim`, then `vi` — which
+/// POSIX requires to exist.
+///
+/// The variable is split on whitespace so settings like `code -w` or
+/// `nvim --clean` work. That is not a shell parse: an editor path containing
+/// spaces will not resolve. Running it through a shell instead would make the
+/// variable's contents executable code, which is a much worse trade for a
+/// setting this rarely exotic.
+fn editor_command(path: &std::path::Path) -> tokio::process::Command {
+    let configured = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_default();
+    editor_command_from(&configured, path)
+}
+
+/// The half of [`editor_command`] that does not read the environment.
+///
+/// Split out to be testable: mutating `VISUAL`/`EDITOR` to test the real thing
+/// would be process-global, and unsound alongside parallel test threads.
+fn editor_command_from(configured: &str, path: &std::path::Path) -> tokio::process::Command {
+    let mut parts = configured.split_whitespace();
+
+    let program = parts.next().unwrap_or("").to_string();
+    let program = if program.is_empty() {
+        if which("nvim") { "nvim" } else { "vi" }.to_string()
+    } else {
+        program
+    };
+
+    let mut command = tokio::process::Command::new(program);
+    command.args(parts).arg(path);
+    command
+}
+
+/// Whether a program is on `PATH`. Only used to prefer `nvim` over the `vi`
+/// fallback, so a false negative costs nothing worse than a plainer editor.
+fn which(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
 }
 
 /// Capture time as a wall clock, in the operator's own timezone.
@@ -2834,6 +3010,113 @@ mod tests {
         assert!(req.text().starts_with('Z'));
     }
 
+    /// `e` stages the focused buffer for the external editor. The handoff
+    /// itself needs a real terminal, so the test stops at the staging.
+    #[test]
+    fn e_stages_the_held_item_for_the_external_editor() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        press(&mut app, "e");
+
+        let job = app.pending_edit.as_ref().expect("an edit should be staged");
+        assert!(
+            job.before.contains("/req-path"),
+            "should hand over the held request: {}",
+            job.before
+        );
+        match job.target {
+            EditTarget::Held { requests, .. } => assert!(requests, "the focused leg"),
+            _ => panic!("expected a held target"),
+        }
+    }
+
+    /// Edits already made in the pane are what gets handed over, so `i` then
+    /// `e` does not silently discard the first ones.
+    #[test]
+    fn external_edit_carries_in_pane_edits_forward() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Insert(InsertKey::Char('Z')));
+        app.apply(Action::ExternalEdit);
+
+        let job = app.pending_edit.as_ref().unwrap();
+        assert!(job.before.starts_with('Z'), "got: {}", job.before);
+    }
+
+    /// Coming back from the editor marks the buffer dirty — otherwise
+    /// forwarding, which only reparses dirty buffers, would ignore the edit.
+    #[test]
+    fn an_applied_edit_is_marked_dirty_and_returns_to_the_queue() {
+        let (_engine, mut app, _rt) = app_with_both_legs_held();
+        app.apply(Action::Enter);
+        let ticket = app.held_requests[0].ticket;
+
+        app.apply_edit(
+            EditJob {
+                target: EditTarget::Held {
+                    requests: true,
+                    ticket,
+                },
+                before: String::new(),
+            },
+            "GET /from-editor HTTP/1.1\nhost: example.com\n\n".to_string(),
+        );
+
+        let buffer = app.preview_buffer(true).unwrap();
+        assert!(buffer.text().contains("/from-editor"));
+        assert!(buffer.is_dirty(), "must be dirty or forwarding ignores it");
+        assert_eq!(
+            app.intercept.pane,
+            Pane::Table,
+            "saving should return to the queue"
+        );
+    }
+
+    /// An item answered while the editor was open must not have the edit landed
+    /// on whatever took its place.
+    #[test]
+    fn an_edit_for_a_vanished_item_is_discarded() {
+        let (engine, mut app, _rt) = app_with_both_legs_held();
+        let ticket = app.held_requests[0].ticket;
+        engine.intercept().forward(ticket, None);
+        app.refresh();
+
+        app.apply_edit(
+            EditJob {
+                target: EditTarget::Held {
+                    requests: true,
+                    ticket,
+                },
+                before: String::new(),
+            },
+            "GET /too-late HTTP/1.1\n\n".to_string(),
+        );
+        assert!(app.intercept.request_edit.is_none());
+    }
+
+    /// Arguments in `$VISUAL`/`$EDITOR` survive, and the file is always last.
+    #[test]
+    fn editor_command_keeps_configured_arguments() {
+        let path = std::path::Path::new("/tmp/x.http");
+
+        let command = editor_command_from("nvim --clean", path);
+        assert_eq!(command.as_std().get_program(), "nvim");
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args, ["--clean", "/tmp/x.http"]);
+
+        let command = editor_command_from("ed", path);
+        assert_eq!(command.as_std().get_program(), "ed");
+    }
+
+    /// With nothing configured we still have to open *something*.
+    #[test]
+    fn editor_command_falls_back_when_unset() {
+        let command = editor_command_from("", std::path::Path::new("/tmp/x.http"));
+        let program = command.as_std().get_program().to_string_lossy().to_string();
+        assert!(
+            program == "nvim" || program == "vi",
+            "unexpected fallback: {program}"
+        );
+    }
+
     /// `i` straight from the queue opens the preview and edits there, rather
     /// than leaving INSERT mode pointed at nothing.
     #[test]
@@ -2846,27 +3129,18 @@ mod tests {
         assert!(app.preview_buffer(true).unwrap().text().starts_with('Z'));
     }
 
-    /// A held response is shown for reading. Typing into it must not change
-    /// what gets forwarded.
+    /// Responses are editable too — the core forwards an edited response and
+    /// the client receives it.
     #[test]
-    fn the_response_preview_refuses_edits() {
+    fn the_response_preview_accepts_edits() {
         let (_engine, mut app, _rt) = app_with_both_legs_held();
         app.apply(Action::Focus(Some(Column::Right)));
         app.apply(Action::Enter);
 
-        let before = app
-            .preview_buffer(false)
-            .map(|b| b.text())
-            .expect("a response buffer to read");
         app.apply(Action::Insert(InsertKey::Char('Z')));
-
-        let after = app.preview_buffer(false).map(|b| b.text()).unwrap();
-        assert_eq!(after, before, "the buffer must be unchanged");
-        assert!(
-            !app.preview_buffer(false).unwrap().is_dirty(),
-            "and must not be marked edited"
-        );
-        assert!(render(&mut app).contains("read-only"));
+        let buffer = app.preview_buffer(false).unwrap();
+        assert!(buffer.text().starts_with('Z'));
+        assert!(buffer.is_dirty());
     }
 
     /// Enter steps into the preview; Escape steps back out. Movement follows
