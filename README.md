@@ -100,16 +100,39 @@ whoever holds it.
 ### 3. Run
 
 ```sh
-cargo run --release                          # proxy 3000, MCP 3001, project "default"
-cargo run --release -- --project acme -p 8080
+cargo run --release                            # startup picker, then proxy 3000, MCP 3001
+cargo run --release -- --project acme -p 8080  # skip the picker, open "acme" directly
 cargo run --release -- --help
 ```
+
+With no `--project`, a **startup screen** opens first: one search bar that
+fuzzy-finds your projects, shows the top matches, and creates a new one when you
+type a name it does not recognise (`Ctrl-d` forgets the selected project, leaving
+its traffic on disk). `--project <name>` bypasses the picker — the scriptable path,
+and what non-interactive runs want so they land on a known project without a menu
+waiting on input.
 
 Point a browser or `curl -x http://127.0.0.1:3000` at it. Project data lives in
 `~/.proxy`; naming a project both creates and reopens it.
 
 `--mcp-port 0` turns the MCP server off, which is what lets a second instance
 run quietly alongside the first.
+
+### 4. Drive it from an agent
+
+The MCP server is streamable HTTP at **`http://127.0.0.1:3001/mcp`**. Register it
+with an agent — for Claude Code:
+
+```sh
+claude mcp add --transport http proxy http://127.0.0.1:3001/mcp
+```
+
+and the agent gets the same 27 tools: survey flows, read full bodies as `flow://`
+resources, walk the sitemap and WebSocket frames, replay through scope, and file
+findings. A bundled skill at `.claude/skills/proxy-recon` teaches the recon loop
+and the conventions that are judgement rather than mechanics — redact captured
+secrets by default, rate severity against the threat model, set scope before a
+replay.
 
 ---
 
@@ -198,7 +221,7 @@ side is not trusted and a few hundred bytes can claim gigabytes.
 ## Development
 
 ```sh
-cargo test --workspace      # 398 tests
+cargo test --workspace      # 407 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
