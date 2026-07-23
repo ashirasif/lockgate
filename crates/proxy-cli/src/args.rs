@@ -23,7 +23,7 @@ OPTIONS:
     -p, --port <PORT>        Port to proxy on (default 3000)
         --mcp-port <PORT>    Port for the MCP server (default 3001; 0 disables)
         --listen <ADDR>      Address to bind both listeners to (default 127.0.0.1)
-        --project <NAME>     Project to open (default \"default\")
+        --project <NAME>     Open this project directly, skipping the picker
         --data-dir <PATH>    Where projects live (default ~/.proxy)
         --export-ca <PATH>   Write the CA certificate here and exit
     -h, --help               Print this
@@ -40,7 +40,10 @@ pub struct Args {
     /// `0` means "do not start it". Useful when running two instances, where
     /// the second would otherwise fail to bind and log a confusing error.
     pub mcp_port: u16,
-    pub project: String,
+    /// `None` shows the startup picker; `Some(name)` opens that project directly
+    /// and skips it — the scriptable path, and what every non-interactive test
+    /// wants so it lands on a known project without a menu waiting on input.
+    pub project: Option<String>,
     /// `None` means the default location, resolved later — the parser does not
     /// touch the filesystem, which is what makes it testable.
     pub data_dir: Option<PathBuf>,
@@ -53,7 +56,7 @@ impl Default for Args {
             listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 3000,
             mcp_port: 3001,
-            project: "default".to_string(),
+            project: None,
             data_dir: None,
             export_ca: None,
         }
@@ -121,7 +124,7 @@ where
                 Err(e) => return Parsed::Error(e),
             },
             "--project" => match value() {
-                Ok(name) if !name.trim().is_empty() => args.project = name,
+                Ok(name) if !name.trim().is_empty() => args.project = Some(name),
                 Ok(_) => return Parsed::Error("--project needs a name".into()),
                 Err(e) => return Parsed::Error(e),
             },
@@ -173,7 +176,7 @@ mod tests {
         let args = run(&[]);
         assert_eq!(args.proxy_addr().to_string(), "127.0.0.1:3000");
         assert_eq!(args.mcp_addr().to_string(), "127.0.0.1:3001");
-        assert_eq!(args.project, "default");
+        assert_eq!(args.project, None, "no --project means the picker");
         assert_eq!(args.data_dir, None);
     }
 
@@ -182,7 +185,7 @@ mod tests {
         let args = run(&["--port", "8080", "--mcp-port", "8081", "--project", "acme"]);
         assert_eq!(args.port, 8080);
         assert_eq!(args.mcp_port, 8081);
-        assert_eq!(args.project, "acme");
+        assert_eq!(args.project.as_deref(), Some("acme"));
     }
 
     /// People type both forms without thinking about it.

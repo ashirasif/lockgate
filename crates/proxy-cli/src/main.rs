@@ -4,6 +4,7 @@ mod command;
 mod editor;
 mod highlighter;
 mod input;
+mod startup;
 mod syntax;
 mod tui;
 mod vim;
@@ -98,22 +99,30 @@ async fn main() -> std::io::Result<()> {
     let data_dir = args.data_dir.clone().unwrap_or_else(data_dir);
     let registry =
         Registry::open(&data_dir.join("registry.db")).expect("failed to open project registry");
-    // `create` is idempotent on the path, so this both makes a new project and
-    // reopens an existing one — naming a project is how you switch to it.
-    let project = registry
-        .create(
-            &args.project,
-            &data_dir.join("projects").join(&args.project),
-            now_micros(),
-        )
-        .expect("failed to open project");
+    let projects_dir = startup::projects_dir(&data_dir);
+
+    // Which project? `--project` names one directly (the scriptable path);
+    // otherwise the startup picker opens, and a project only exists once the user
+    // has chosen or created one. `create` is idempotent on the path, so naming a
+    // project both makes a new one and reopens an existing one.
+    let project = match &args.project {
+        Some(name) => registry
+            .create(name, &projects_dir.join(name), now_micros())
+            .expect("failed to open project"),
+        None => match startup::pick(&registry, &projects_dir)? {
+            Some(project) => project,
+            // The user left the picker without opening anything. Nothing has
+            // been spawned yet, so this is a clean exit.
+            None => return Ok(()),
+        },
+    };
     registry
         .touch(project.id, now_micros())
         .expect("failed to update project");
 
     let engine = Engine::open_project(&project.path).expect("failed to open project");
     info!(
-        project = %args.project,
+        project = %project.name,
         proxy = %args.proxy_addr(),
         "started"
     );

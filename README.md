@@ -41,7 +41,7 @@ exists but you will notice what is missing.
 | Area | What is missing |
 |---|---|
 | **Findings** | Prose fields (description, repro, impact) are set over MCP only; the TUI files and triages but does not edit them |
-| **Projects** | Selected with `--project`, but only at startup — no switching from inside the TUI |
+| **Projects** | A startup picker opens, creates or forgets projects — one fuzzy search bar, top matches in a dropdown, Enter on a new name creates it, `Ctrl-d` forgets one (keeping its traffic on disk). `--project <name>` still skips straight in. What is missing is switching *inside* a running session: changing project means relaunching |
 | **Notes** | `note` table exists, nothing reads or writes it |
 | **Repeater** | Tabs and history are in memory. Closing the TUI loses them |
 | **Search** | `/` moves the cursor through the flow list. No body search, and no search tool over MCP |
