@@ -136,10 +136,7 @@ impl<'a> Picker<'a> {
             .collect();
 
         // Offer creation unless the query is empty or already names a project.
-        let names_existing = self
-            .all
-            .iter()
-            .any(|p| p.name.eq_ignore_ascii_case(query));
+        let names_existing = self.all.iter().any(|p| p.name.eq_ignore_ascii_case(query));
         if !query.is_empty() && !names_existing {
             self.rows.push(Row::Create(query.to_string()));
         }
@@ -246,9 +243,12 @@ impl<'a> Picker<'a> {
 
         self.draw_logo(frame, logo);
         frame.render_widget(
-            Line::from(format!("an intercepting proxy · v{}", env!("CARGO_PKG_VERSION")))
-                .centered()
-                .fg(Color::DarkGray),
+            Line::from(format!(
+                "an intercepting proxy · v{}",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .centered()
+            .fg(Color::DarkGray),
             tagline,
         );
         self.draw_input(frame, input);
@@ -298,10 +298,7 @@ impl<'a> Picker<'a> {
 
         match row {
             Row::Open(project) => {
-                let deleting = self
-                    .confirm
-                    .as_ref()
-                    .is_some_and(|c| c.id == project.id);
+                let deleting = self.confirm.as_ref().is_some_and(|c| c.id == project.id);
                 let left = format!("{marker}{}", project.name);
                 let right = ago(project.last_opened);
                 let pad = width
@@ -377,7 +374,10 @@ fn fuzzy(query: &str, name: &str) -> Option<i32> {
         score += 1 + run; // reward longer unbroken runs
     }
     // A prefix match (query starts the name) is the strongest signal.
-    if name.to_ascii_lowercase().starts_with(&query.to_ascii_lowercase()) {
+    if name
+        .to_ascii_lowercase()
+        .starts_with(&query.to_ascii_lowercase())
+    {
         score += 5;
     }
     Some(score)
@@ -477,7 +477,10 @@ mod tests {
         let picker = Picker::new(&registry, &dir);
         let screen = render(&picker);
         assert!(screen.contains("██████"), "logo missing");
-        assert!(screen.contains("open or create a project"), "input title missing");
+        assert!(
+            screen.contains("open or create a project"),
+            "input title missing"
+        );
         assert!(screen.contains("acme"), "project missing");
         assert!(screen.contains("opened"), "recency missing");
         assert!(screen.contains("esc quit"), "hint missing");
@@ -492,7 +495,10 @@ mod tests {
         }
         picker.recompute();
         let screen = render(&picker);
-        assert!(screen.contains("create"), "create row missing for a new name");
+        assert!(
+            screen.contains("create"),
+            "create row missing for a new name"
+        );
         assert!(screen.contains("widgets"), "typed name missing");
     }
 
