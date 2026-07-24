@@ -49,7 +49,8 @@ is the whole body — check `truncated`/`total_len` before reasoning about paylo
 - **Intercept** (hold/edit/forward live traffic): `intercept_status`, `intercept_get`,
   `intercept_queue`, `intercept_set`, `intercept_forward`, `intercept_drop`,
   `intercept_answer_all`.
-- **Record**: `create_finding`, `annotate_flow` (comment/highlight a flow).
+- **Record**: `create_finding`, `update_finding` (revise one as you confirm it),
+  `annotate_flow` (comment/highlight a flow).
 - **Format**: `format_message` (pretty/raw a request or response).
 
 ## Rules
@@ -79,6 +80,12 @@ also set: `impact_md`, `repro_md`, `remediation_md`, `cwe`, and `evidence` — a
 of `{ flow_id, label }` pointing at the flows that demonstrate it. `status` defaults
 to `draft`. Write the prose in Markdown; state the mechanism plainly and keep the
 threat model explicit (what the attacker must already have).
+
+A finding is not write-once. `update_finding` revises any of it — file at the
+confidence you actually have, then triage the severity and status up as evidence
+arrives, rather than sitting on a draft until it is perfect. Omitted fields are left
+alone and a given markdown field replaces that whole section, so `get_finding` first
+if you mean to append. Evidence links are fixed at filing.
 
 A good finding reads: what the mechanism is → what an attacker with the stated
 position can do → exact repro steps against a numbered evidence flow → whether it's

@@ -8,9 +8,10 @@ use rusqlite::Connection;
 use hudsucker::hyper::header::HOST;
 
 use crate::db::ProjectPaths;
-use crate::finding::{Finding, NewFinding};
+use crate::finding::{Finding, FindingEdit, NewFinding, WriteUp};
 use crate::intercept::Intercept;
 use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary, now_micros};
+use crate::note::{NewNote, Note};
 use crate::read::{self, BodySlice, FlowDetail, FlowQuery, FlowRow, Side, SitemapNode};
 use crate::scope::{Matcher, Target};
 use crate::writer::{Source, WriteEvent, WriteHandle, write_batch};
@@ -337,8 +338,53 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// Replace a finding's whole write-up — all four prose columns at once,
+    /// since they are edited as one document (see `finding::WriteUp`).
+    ///
+    /// Synchronous like the triage edits: the write-up is saved from a
+    /// keystroke, and the editor pane needs to know it landed before it clears
+    /// its dirty flag.
+    pub fn set_finding_write_up(&self, id: i64, write_up: &WriteUp) -> usize {
+        self.with_db(|conn| crate::finding::set_write_up(conn, id, write_up, now_micros()))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    /// Apply a partial edit to a finding — the MCP's `update_finding`. Returns
+    /// rows changed, so an unknown id is distinguishable from a no-op.
+    pub fn update_finding(&self, id: i64, edit: &FindingEdit) -> usize {
+        self.with_db(|conn| crate::finding::update(conn, id, edit, now_micros()))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    /// Retitle a finding. Returns rows changed.
+    pub fn set_finding_title(&self, id: i64, title: &str) -> usize {
+        self.with_db(|conn| crate::finding::set_title(conn, id, title, now_micros()))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
     pub fn delete_finding(&self, id: i64) -> usize {
         self.with_db(|conn| crate::finding::delete(conn, id))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    /// Edit a note's title and/or body. `None` leaves that field alone. Returns
+    /// rows changed, so an unknown id is distinguishable from a no-op.
+    ///
+    /// Synchronous like the finding edits above: a note is saved from a
+    /// keystroke, and the editor pane needs to know it landed before it clears
+    /// its dirty flag.
+    pub fn update_note(&self, id: i64, title: Option<&str>, body_md: Option<&str>) -> usize {
+        self.with_db(|conn| crate::note::update(conn, id, title, body_md, now_micros()))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    pub fn delete_note(&self, id: i64) -> usize {
+        self.with_db(|conn| crate::note::delete(conn, id))
             .and_then(|r| r.ok())
             .unwrap_or(0)
     }
@@ -604,6 +650,16 @@ impl Engine {
         self.read(|conn| crate::finding::get(conn, id))
     }
 
+    /// Every note in the project, newest first.
+    pub fn list_notes(&self) -> Vec<Note> {
+        self.read(crate::note::list)
+    }
+
+    /// One note by id, or `None` if absent.
+    pub fn get_note(&self, id: i64) -> Option<Note> {
+        self.read(|conn| crate::note::get(conn, id))
+    }
+
     // --- write verbs routed through persistence (used by the MCP) ---
     //
     // Every database write in the process goes through `write`, so these hand the
@@ -633,6 +689,16 @@ impl Engine {
         let (reply, rx) = oneshot::channel();
         self.write(WriteEvent::CreateFinding {
             finding: Box::new(finding),
+            reply,
+        });
+        rx.await.map_err(|_| WriteError::Dropped)
+    }
+
+    /// Start a note, returning its new id once the row is durably committed.
+    pub async fn create_note(&self, note: NewNote) -> Result<i64, WriteError> {
+        let (reply, rx) = oneshot::channel();
+        self.write(WriteEvent::CreateNote {
+            note: Box::new(note),
             reply,
         });
         rx.await.map_err(|_| WriteError::Dropped)

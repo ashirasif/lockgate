@@ -425,3 +425,41 @@ async fn sitemap_builds_a_tree() {
         .unwrap();
     assert_eq!(count, 4, "sitemap should span capture runs");
 }
+
+/// Notes are authored rather than captured, so the interesting property is that
+/// an edit survives the process: write one, close the project, reopen it.
+#[tokio::test]
+async fn notes_survive_a_reopen() {
+    let path = temp_project("notes");
+
+    let id = {
+        let engine = Engine::open_project(&path).unwrap();
+        let id = engine
+            .create_note(proxy_core::NewNote {
+                title: "auth teardown".into(),
+                body_md: "the refresh token is bound to nothing".into(),
+            })
+            .await
+            .unwrap();
+        // An edit through the read connection, the way the TUI saves.
+        assert_eq!(
+            engine.update_note(id, None, Some("bound to nothing, see #412")),
+            1
+        );
+        engine.shutdown().await;
+        id
+    };
+
+    let engine = Engine::open_project(&path).unwrap();
+    let note = engine.get_note(id).expect("the note should still be there");
+    assert_eq!(note.title, "auth teardown", "a body edit is not a retitle");
+    assert_eq!(note.body_md, "bound to nothing, see #412");
+    assert!(note.updated_at >= note.created_at);
+    assert_eq!(engine.list_notes().len(), 1);
+
+    assert_eq!(engine.delete_note(id), 1);
+    assert!(engine.list_notes().is_empty());
+    // A second delete is a no-op, not an error — the id is simply gone.
+    assert_eq!(engine.delete_note(id), 0);
+    engine.shutdown().await;
+}

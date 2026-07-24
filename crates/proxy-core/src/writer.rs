@@ -19,6 +19,7 @@ use tracing::{error, warn};
 use crate::db::{INLINE_BODY_LIMIT, ProjectPaths};
 use crate::finding::NewFinding;
 use crate::model::{CapturedRequest, CapturedResponse, FlowId, now_micros};
+use crate::note::NewNote;
 
 /// How many events to fold into a single transaction. Purely a bound on how
 /// much work one failed batch can lose.
@@ -126,6 +127,12 @@ pub enum WriteEvent {
         finding: Box<NewFinding>,
         reply: oneshot::Sender<i64>,
     },
+    /// Start a note. Like `CreateFinding`, the reply carries the new id and is
+    /// released only once the row is durably committed.
+    CreateNote {
+        note: Box<NewNote>,
+        reply: oneshot::Sender<i64>,
+    },
     /// Commit whatever is already queued, then stop. Sent by `shutdown`.
     Stop,
 }
@@ -136,6 +143,7 @@ pub enum WriteEvent {
 enum Pending {
     Annotate(oneshot::Sender<u64>, u64),
     Finding(oneshot::Sender<i64>, i64),
+    Note(oneshot::Sender<i64>, i64),
 }
 
 impl Pending {
@@ -146,6 +154,9 @@ impl Pending {
                 let _ = tx.send(rows);
             }
             Pending::Finding(tx, id) => {
+                let _ = tx.send(id);
+            }
+            Pending::Note(tx, id) => {
                 let _ = tx.send(id);
             }
         }
@@ -365,6 +376,11 @@ pub(crate) fn write_batch(
             WriteEvent::CreateFinding { finding, reply } => {
                 let finding_id = crate::finding::insert(&tx, &finding, now_micros())?;
                 pending.push(Pending::Finding(reply, finding_id));
+            }
+
+            WriteEvent::CreateNote { note, reply } => {
+                let note_id = crate::note::insert(&tx, &note, now_micros())?;
+                pending.push(Pending::Note(reply, note_id));
             }
 
             // Nothing to write; it only exists to break the drain loop.

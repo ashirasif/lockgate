@@ -298,6 +298,37 @@ struct ScopeView {
     rule_row: usize,
 }
 
+/// The Findings window's view state.
+///
+/// Same shape as `NotesView`, because a finding's write-up is edited the same
+/// way a note is: one buffer, focused with `<CR>`, saved on the way out. What
+/// differs is what the buffer *is* — four prose columns rendered as one
+/// markdown document (`proxy_core::WriteUp`) and split apart again on save.
+#[derive(Default)]
+struct FindingsView {
+    row: usize,
+    /// Whether the write-up pane has the keys.
+    focused: bool,
+    /// The finding being edited, by id, and its buffer. Keyed by id rather than
+    /// by row so a refresh that reorders the list cannot land your typing in a
+    /// different finding.
+    edit: Option<(i64, TextBuffer)>,
+}
+
+/// The Notes window's view state. The notes themselves are read fresh each
+/// refresh; this is the cursor and the one buffer being typed into.
+#[derive(Default)]
+struct NotesView {
+    row: usize,
+    /// Whether the body pane has the keys. Same shape as the Repeater's
+    /// `focused`: with it set the vim grammar takes every keystroke.
+    focused: bool,
+    /// The note being edited, by id, and its buffer. Keyed by id rather than by
+    /// row so a refresh that reorders the list cannot land your typing in a
+    /// different note.
+    edit: Option<(i64, TextBuffer)>,
+}
+
 /// A buffer handed out to the operator's own editor, and where to put it back.
 ///
 /// The edit is deferred rather than done inline because it needs the terminal:
@@ -311,12 +342,29 @@ struct EditJob {
 
 enum EditTarget {
     Repeater,
+    /// A note, identified by id so the text cannot land on whatever the cursor
+    /// moved to while the editor was open.
+    Note(i64),
+    /// A finding's write-up, by id, for the same reason.
+    Finding(i64),
     /// A held item, identified by ticket so the result cannot land on whatever
     /// took its place while the editor was open.
     Held {
         requests: bool,
         ticket: TicketId,
     },
+}
+
+impl EditTarget {
+    /// The scratch file's extension, so the editor picks a sensible filetype:
+    /// wire text is not markdown and highlighting it as such is worse than
+    /// nothing.
+    fn extension(&self) -> &'static str {
+        match self {
+            EditTarget::Note(_) | EditTarget::Finding(_) => "md",
+            EditTarget::Repeater | EditTarget::Held { .. } => "http",
+        }
+    }
 }
 
 /// One rendered line of the sitemap tree.
@@ -391,9 +439,20 @@ struct App {
     intercept: InterceptView,
     sitemap: SitemapView,
     scope: ScopeView,
-    /// Findings as of the last refresh, and which row is selected.
+    /// Findings as of the last refresh, and the Findings window's view state.
     findings: Vec<proxy_core::Finding>,
-    finding_row: usize,
+    findings_view: FindingsView,
+    /// The id of a finding just filed, posted by the writer task and consumed by
+    /// the next `refresh` — the same hand-off `created_note` makes, and for the
+    /// same reason: the create is spawned, so it cannot touch the app directly.
+    created_finding: Arc<Mutex<Option<i64>>>,
+    /// Notes as of the last refresh, and the Notes window's view state.
+    notes: Vec<proxy_core::Note>,
+    notes_view: NotesView,
+    /// The id of a note just created, posted by the writer task and consumed by
+    /// the next `refresh`. Shared the way `status` is, and for the same reason:
+    /// the create is spawned, so it cannot touch the app directly.
+    created_note: Arc<Mutex<Option<i64>>>,
     /// Scopes as of the last refresh, and the highlighted one's rules.
     scopes: Vec<proxy_core::scope::Scope>,
     scope_rules: Vec<proxy_core::scope::ScopeRule>,
@@ -453,7 +512,11 @@ impl App {
             sitemap: SitemapView::default(),
             scope: ScopeView::default(),
             findings: Vec::new(),
-            finding_row: 0,
+            findings_view: FindingsView::default(),
+            created_finding: Arc::new(Mutex::new(None)),
+            notes: Vec::new(),
+            notes_view: NotesView::default(),
+            created_note: Arc::new(Mutex::new(None)),
             scopes: Vec::new(),
             scope_rules: Vec::new(),
             scope_filter: true,
@@ -512,10 +575,12 @@ impl App {
     async fn run_editor(&mut self, job: EditJob, terminal: &mut DefaultTerminal) {
         self.edit_seq += 1;
         let path = std::env::temp_dir().join(format!(
-            // `.http` so an editor picks a sensible filetype for syntax.
-            "proxy-edit-{}-{}.http",
+            // Extension carried from the target so an editor picks a sensible
+            // filetype for syntax.
+            "proxy-edit-{}-{}.{}",
             std::process::id(),
-            self.edit_seq
+            self.edit_seq,
+            job.target.extension()
         ));
 
         if let Err(e) = std::fs::write(&path, &job.before) {
@@ -557,6 +622,29 @@ impl App {
                 self.repeater.session_mut().request = buffer;
                 self.note("edit applied — <Space>r to send");
             }
+            EditTarget::Note(id) => {
+                // The note may have been deleted — from the MCP, say — while
+                // the editor was open.
+                if !self.notes.iter().any(|n| n.id == id) {
+                    self.note("that note is gone; edit discarded");
+                    return;
+                }
+                self.notes_view.edit = Some((id, buffer));
+                // `:wq` in $EDITOR means saved, so make it so rather than
+                // leaving it dirty for an <Esc> the operator has no reason to
+                // expect is still owed.
+                self.save_note();
+            }
+            EditTarget::Finding(id) => {
+                // The finding may have been deleted — from the MCP, say —
+                // while the editor was open.
+                if !self.findings.iter().any(|f| f.id == id) {
+                    self.note("that finding is gone; edit discarded");
+                    return;
+                }
+                self.findings_view.edit = Some((id, buffer));
+                self.save_write_up();
+            }
             EditTarget::Held { requests, ticket } => {
                 // The item may have been answered while the editor was open.
                 if !self.held(requests).iter().any(|h| h.ticket == ticket) {
@@ -579,6 +667,32 @@ impl App {
                 target: EditTarget::Repeater,
                 before: self.repeater.session().request.text(),
             }),
+            Window::Notes => {
+                let note = self.notes.get(self.notes_view.row);
+                note.map(|note| EditJob {
+                    target: EditTarget::Note(note.id),
+                    // Prefer what is in the buffer over the stored body, so
+                    // typing a line and then reaching for `e` does not throw
+                    // that line away.
+                    before: match &self.notes_view.edit {
+                        Some((id, buffer)) if *id == note.id => buffer.text(),
+                        _ => note.body_md.clone(),
+                    },
+                })
+            }
+            Window::Findings => {
+                let finding = self.findings.get(self.findings_view.row);
+                finding.map(|finding| EditJob {
+                    target: EditTarget::Finding(finding.id),
+                    // Prefer the buffer over the stored columns, for the same
+                    // reason Notes does: a line typed here and then handed to
+                    // $EDITOR should still be there when it opens.
+                    before: match &self.findings_view.edit {
+                        Some((id, buffer)) if *id == finding.id => buffer.text(),
+                        _ => finding.write_up(),
+                    },
+                })
+            }
             Window::Intercept => {
                 let requests = self.intercept.showing_requests();
                 let row = self.intercept.row(requests);
@@ -631,7 +745,46 @@ impl App {
         self.ws_row = self.ws_row.min(self.ws_flows.len().saturating_sub(1));
 
         self.findings = self.engine.list_findings();
-        self.finding_row = self.finding_row.min(self.findings.len().saturating_sub(1));
+        self.findings_view.row = self
+            .findings_view
+            .row
+            .min(self.findings.len().saturating_sub(1));
+        // A finding filed since the last tick: land the cursor on it, now that
+        // it is actually in the list. Filing one is usually the prelude to
+        // writing it up, so this is where the write-up starts.
+        if let Some(id) = self.created_finding.lock().unwrap().take()
+            && let Some(row) = self.findings.iter().position(|f| f.id == id)
+        {
+            self.findings_view.row = row;
+            self.findings_view.edit = None;
+        }
+        // An edit buffer for a finding that is gone — deleted here or from the
+        // MCP — has nowhere to save back to, so it goes with it.
+        if let Some((id, _)) = &self.findings_view.edit
+            && !self.findings.iter().any(|f| f.id == *id)
+        {
+            self.findings_view.edit = None;
+            self.findings_view.focused = false;
+        }
+
+        self.notes = self.engine.list_notes();
+        self.notes_view.row = self.notes_view.row.min(self.notes.len().saturating_sub(1));
+        // A note created since the last tick: land the cursor on it, now that
+        // it is actually in the list.
+        if let Some(id) = self.created_note.lock().unwrap().take()
+            && let Some(row) = self.notes.iter().position(|n| n.id == id)
+        {
+            self.notes_view.row = row;
+            self.notes_view.edit = None;
+        }
+        // An edit buffer for a note that is gone — deleted here or from the MCP
+        // — has nowhere to save back to, so it goes with it.
+        if let Some((id, _)) = &self.notes_view.edit
+            && !self.notes.iter().any(|n| n.id == *id)
+        {
+            self.notes_view.edit = None;
+            self.notes_view.focused = false;
+        }
 
         self.scopes = self.engine.scopes();
         self.scope.scope_row = self
@@ -714,6 +867,8 @@ impl App {
         let editing = match self.window {
             Window::Repeater => self.repeater.focused && self.repeater.session().original.is_some(),
             Window::Intercept => self.intercept.pane == Pane::Preview,
+            Window::Notes => self.notes_view.focused && !self.notes.is_empty(),
+            Window::Findings => self.findings_view.focused && !self.findings.is_empty(),
             _ => false,
         };
         self.input.set_buffer_focus(editing);
@@ -756,8 +911,22 @@ impl App {
                 self.ws_row = step_row(self.ws_row, last, motion, count);
             }
             Action::Move { motion, count } if self.window == Window::Findings => {
+                // Only reached with the write-up unfocused — with focus the keys
+                // go to the vim grammar instead. Moving off a finding is a way
+                // out of its buffer, so it saves like any other.
+                self.save_write_up();
                 let last = self.findings.len().saturating_sub(1);
-                self.finding_row = step_row(self.finding_row, last, motion, count);
+                self.findings_view.row = step_row(self.findings_view.row, last, motion, count);
+                self.content_scroll = 0;
+            }
+            Action::Move { motion, count } if self.window == Window::Notes => {
+                // Only reached with the body unfocused — with focus the keys go
+                // to the vim grammar instead. Moving off a note is a way out of
+                // its buffer, so it saves like any other.
+                self.save_note();
+                let last = self.notes.len().saturating_sub(1);
+                self.notes_view.row = step_row(self.notes_view.row, last, motion, count);
+                self.content_scroll = 0;
             }
             Action::Move { motion, count } if self.window == Window::Scope => {
                 // Each pane keeps its own cursor, so switching panes does not
@@ -887,6 +1056,7 @@ impl App {
             Action::Insert(key) => self.edit(key),
             Action::Forward => self.answer_held(true),
             Action::Drop if self.window == Window::Findings => self.delete_finding(),
+            Action::Drop if self.window == Window::Notes => self.delete_note(),
             Action::Drop if self.window == Window::Scope => self.scope_delete(),
             Action::Drop => self.answer_held(false),
             Action::ForwardAll => {
@@ -951,6 +1121,28 @@ impl App {
             }
             return;
         }
+        if self.window == Window::Notes {
+            if self.notes.is_empty() {
+                self.note("no notes yet — :note <title> starts one");
+                return;
+            }
+            self.notes_view.focused = true;
+            // Materialise now so the cursor is visible on arrival.
+            self.note_buffer();
+            self.note("editing — vim keys, ^g for $EDITOR, <Esc> saves and leaves");
+            return;
+        }
+        if self.window == Window::Findings {
+            if self.findings.is_empty() {
+                self.note("nothing filed yet — <Space>f files the selected flow");
+                return;
+            }
+            self.findings_view.focused = true;
+            // Materialise now so the cursor is visible on arrival.
+            self.write_up_buffer();
+            self.note("editing the write-up — ## Reproduction / ## Impact / ## Remediation are sections, ^g for $EDITOR, <Esc> saves");
+            return;
+        }
         if self.window != Window::Intercept {
             return;
         }
@@ -972,6 +1164,18 @@ impl App {
             Window::Repeater => self.repeater.focused = false,
             Window::Intercept if self.intercept.pane == Pane::Preview => {
                 self.intercept.pane = Pane::Table;
+                self.content_scroll = 0;
+            }
+            // Stepping out of a note is the save point: there is no `:w`, so
+            // the way out has to be the way it lands.
+            Window::Notes if self.notes_view.focused => {
+                self.save_note();
+                self.notes_view.focused = false;
+                self.content_scroll = 0;
+            }
+            Window::Findings if self.findings_view.focused => {
+                self.save_write_up();
+                self.findings_view.focused = false;
                 self.content_scroll = 0;
             }
             _ => {}
@@ -1292,8 +1496,94 @@ impl App {
                 session.original.is_some().then_some(&mut session.request)
             }
             Window::Intercept => self.preview_buffer(self.intercept.showing_requests()),
+            Window::Notes => self.note_buffer(),
+            Window::Findings => self.write_up_buffer(),
             _ => None,
         }
+    }
+
+    /// The buffer for the highlighted finding's write-up, created on first use.
+    ///
+    /// Forked from the rendered document rather than re-rendered every frame:
+    /// once typing starts the buffer *is* the write-up, and re-rendering it from
+    /// the columns under the cursor would throw away unsaved lines.
+    fn write_up_buffer(&mut self) -> Option<&mut TextBuffer> {
+        let finding = self.findings.get(self.findings_view.row)?;
+        let (id, text) = (finding.id, finding.write_up());
+        if self.findings_view.edit.as_ref().map(|(i, _)| *i) != Some(id) {
+            self.findings_view.edit = Some((id, TextBuffer::from_text(&text)));
+        }
+        self.findings_view.edit.as_mut().map(|(_, b)| b)
+    }
+
+    /// Split the open write-up back into the four prose columns, if it has been
+    /// touched.
+    ///
+    /// Called on every way out of the buffer for the same reason `save_note` is:
+    /// a write-up you have to remember to save is a write-up you lose.
+    fn save_write_up(&mut self) {
+        let Some((id, buffer)) = &self.findings_view.edit else {
+            return;
+        };
+        if !buffer.is_dirty() {
+            return;
+        }
+        let (id, write_up) = (*id, proxy_core::WriteUp::parse(&buffer.text()));
+        if self.engine.set_finding_write_up(id, &write_up) == 0 {
+            self.note(&format!("finding #{id} is gone; edit not saved"));
+            return;
+        }
+        // Clean again, so leaving twice does not write twice. The buffer is left
+        // as it is rather than re-rendered from the saved columns — normalising
+        // the document under the cursor mid-edit would move text the operator is
+        // still looking at.
+        if let Some((_, buffer)) = &mut self.findings_view.edit {
+            buffer.clear_dirty();
+        }
+        self.refresh();
+        self.note(&format!("saved finding #{id}"));
+    }
+
+    /// The buffer for the highlighted note, created on first use.
+    ///
+    /// Forked from the stored body rather than re-read every frame: the buffer
+    /// is the live document once typing starts, and reloading it from SQLite
+    /// under the cursor would throw away unsaved lines.
+    fn note_buffer(&mut self) -> Option<&mut TextBuffer> {
+        let note = self.notes.get(self.notes_view.row)?;
+        let (id, body) = (note.id, note.body_md.clone());
+        if self.notes_view.edit.as_ref().map(|(i, _)| *i) != Some(id) {
+            self.notes_view.edit = Some((id, TextBuffer::from_text(&body)));
+        }
+        self.notes_view.edit.as_mut().map(|(_, b)| b)
+    }
+
+    /// Write the open note back if it has been touched.
+    ///
+    /// Called on every way out of the buffer — leaving it, moving to another
+    /// note, changing window, quitting — because a note has no explicit save
+    /// key. `:w` would be the vim answer, but a document you have to remember
+    /// to save is a document you lose.
+    fn save_note(&mut self) {
+        let Some((id, buffer)) = &self.notes_view.edit else {
+            return;
+        };
+        if !buffer.is_dirty() {
+            return;
+        }
+        let (id, body) = (*id, buffer.text());
+        if self.engine.update_note(id, None, Some(&body)) == 0 {
+            self.note(&format!("note #{id} is gone; edit not saved"));
+            return;
+        }
+        // Clean again, so leaving twice does not write twice. The buffer itself
+        // is kept as it is — rebuilding it from the saved text would send the
+        // cursor back to the top of a note you are still in the middle of.
+        if let Some((_, buffer)) = &mut self.notes_view.edit {
+            buffer.clear_dirty();
+        }
+        self.refresh();
+        self.note(&format!("saved note #{id}"));
     }
 
     /// The buffer backing one column's preview, created on first use.
@@ -1427,7 +1717,7 @@ impl App {
     /// Cycling rather than prompting: triage is a repeated motion over many
     /// findings, and a menu per change would make it a chore.
     fn cycle_finding(&mut self, severity: bool) {
-        let Some(finding) = self.findings.get(self.finding_row) else {
+        let Some(finding) = self.findings.get(self.findings_view.row) else {
             self.note("no finding selected");
             return;
         };
@@ -1465,13 +1755,19 @@ impl App {
     }
 
     fn delete_finding(&mut self) {
-        let Some(finding) = self.findings.get(self.finding_row) else {
+        let Some(finding) = self.findings.get(self.findings_view.row) else {
             return;
         };
         let (id, title) = (finding.id, finding.title.clone());
         if self.engine.delete_finding(id) == 0 {
             self.note("could not delete the finding");
             return;
+        }
+        // Drop the buffer first: saving it afterwards would write the write-up
+        // of a finding that no longer exists.
+        if self.findings_view.edit.as_ref().map(|(i, _)| *i) == Some(id) {
+            self.findings_view.edit = None;
+            self.findings_view.focused = false;
         }
         self.refresh();
         self.note(&format!("deleted {title:?}"));
@@ -1514,16 +1810,125 @@ impl App {
 
         let engine = self.engine.clone();
         let status = self.status.clone();
+        let created = self.created_finding.clone();
         let flow_id = flow.id;
         // Findings go through the writer task, so this cannot be awaited here
-        // without blocking the draw loop.
+        // without blocking the draw loop. The id comes back through
+        // `created_finding`, which `refresh` picks up — that is what puts the
+        // cursor on the new finding rather than on whatever row 0 held before
+        // the write landed.
         tokio::spawn(async move {
             let message = match engine.create_finding(new).await {
-                Ok(id) => format!("filed finding #{id} from flow #{flow_id}"),
+                Ok(id) => {
+                    *created.lock().unwrap() = Some(id);
+                    format!("filed finding #{id} from flow #{flow_id} — T then <CR> to write it up")
+                }
                 Err(e) => format!("could not file: {e:?}"),
             };
             *status.lock().unwrap() = message;
         });
+    }
+
+    /// Retitle the highlighted finding. `:finding! <title>`.
+    ///
+    /// The bang is vim's "and mean it", exactly as in `:note!`: `:finding` with
+    /// no bang always files a new one, so the destructive reading of a bare
+    /// title is never the accidental one.
+    fn rename_finding(&mut self, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            self.note("usage: :finding! <title>   (retitles the highlighted finding)");
+            return;
+        }
+        let Some(finding) = self.findings.get(self.findings_view.row) else {
+            self.note("no finding selected");
+            return;
+        };
+        let id = finding.id;
+        if self.engine.set_finding_title(id, title) == 0 {
+            self.note("could not retitle the finding");
+            return;
+        }
+        self.refresh();
+        self.note(&format!("#{id} → {title:?}"));
+    }
+
+    // --- notes ---
+
+    /// Start a note. `:note <title>`, or `<Space>n` from anywhere.
+    ///
+    /// One field, like `:finding`. A note is a document you write *into*, so
+    /// the title is only what gets you a page to write on; the body arrives by
+    /// typing, not by filling in a prompt.
+    fn create_note(&mut self, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            self.note("usage: :note <title>   (starts a project note)");
+            return;
+        }
+
+        let new = proxy_core::NewNote {
+            title: title.to_string(),
+            body_md: String::new(),
+        };
+
+        let engine = self.engine.clone();
+        let status = self.status.clone();
+        let created = self.created_note.clone();
+        // Notes go through the writer task like findings, so this cannot be
+        // awaited here without blocking the draw loop. The id comes back
+        // through `created_note`, which `refresh` picks up — that is what puts
+        // the cursor on the new note rather than on whatever row 0 held before
+        // the write landed.
+        tokio::spawn(async move {
+            let message = match engine.create_note(new).await {
+                Ok(id) => {
+                    *created.lock().unwrap() = Some(id);
+                    format!("started note #{id} — <CR> to write it")
+                }
+                Err(e) => format!("could not start the note: {e:?}"),
+            };
+            *status.lock().unwrap() = message;
+        });
+    }
+
+    /// Retitle the highlighted note. `:note! <title>`.
+    fn rename_note(&mut self, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            self.note("usage: :note! <title>   (retitles the highlighted note)");
+            return;
+        }
+        let Some(note) = self.notes.get(self.notes_view.row) else {
+            self.note("no note selected");
+            return;
+        };
+        let id = note.id;
+        if self.engine.update_note(id, Some(title), None) == 0 {
+            self.note("could not retitle the note");
+            return;
+        }
+        self.refresh();
+        self.note(&format!("#{id} → {title:?}"));
+    }
+
+    fn delete_note(&mut self) {
+        let Some(note) = self.notes.get(self.notes_view.row) else {
+            return;
+        };
+        let (id, title) = (note.id, note.title.clone());
+        if self.engine.delete_note(id) == 0 {
+            self.note("could not delete the note");
+            return;
+        }
+        // Drop the buffer first: saving it afterwards would write the body of a
+        // note that no longer exists.
+        if self.notes_view.edit.as_ref().map(|(i, _)| *i) == Some(id) {
+            self.notes_view.edit = None;
+            self.notes_view.focused = false;
+        }
+        self.refresh();
+        self.note(&format!("deleted {title:?}"));
     }
 
     // --- scope ---
@@ -2005,6 +2410,16 @@ impl App {
     /// offset — you always arrive at the top of the window you asked for.
     fn show_window(&mut self, window: Window) {
         if window != self.window {
+            // Leaving Notes is a way out of an open note, so it saves. Same for
+            // an open write-up in Findings.
+            if self.window == Window::Notes {
+                self.save_note();
+                self.notes_view.focused = false;
+            }
+            if self.window == Window::Findings {
+                self.save_write_up();
+                self.findings_view.focused = false;
+            }
             self.window = window;
             self.content_scroll = 0;
             // Window-scoped bindings resolve against this, so it has to move
@@ -2043,7 +2458,14 @@ impl App {
             return;
         };
         match command {
-            Command::Quit => self.should_quit = true,
+            Command::Quit => {
+                // Last chance for an open note or write-up: quitting is a way
+                // out of the buffer like any other, and the only one with no
+                // next tick.
+                self.save_note();
+                self.save_write_up();
+                self.should_quit = true;
+            }
             Command::Resend => self.resend_selected(),
             // `:42` addresses flow #42 — the number the gutter shows — not the
             // 42nd row. With history newest-first the two no longer coincide,
@@ -2058,6 +2480,9 @@ impl App {
             }
             Command::Pretty => self.format_buffer(),
             Command::Finding(title) => self.file_finding(&title),
+            Command::RenameFinding(title) => self.rename_finding(&title),
+            Command::Note(title) => self.create_note(&title),
+            Command::RenameNote(title) => self.rename_note(&title),
             Command::Scope { verb, argument } => self.run_scope_command(&verb, &argument),
             Command::Help => self.note(HELP),
             Command::Unknown(name) => self.note(&format!("E492: not an editor command: {name}")),
@@ -2366,6 +2791,7 @@ impl App {
             Window::Sitemap => self.draw_sitemap(frame, body),
             Window::Scope => self.draw_scope(frame, body),
             Window::Findings => self.draw_findings(frame, body),
+            Window::Notes => self.draw_notes(frame, body),
             Window::Automate => self.draw_automate(frame, body),
         }
         self.draw_status(frame, status_bar);
@@ -2441,11 +2867,18 @@ impl App {
 
     /// Mason's tool strip: each window a chip, `Name (key)`, active one lit.
     fn draw_tabs(&self, frame: &mut Frame, area: Rect) {
-        // Compact labels and no separator span: eight windows have to share one
-        // line, and each chip already carries its own padding.
+        // No separator span: nine windows have to share one line, and each chip
+        // already carries its own padding. Full names when they fit, abbreviated
+        // when they do not — a narrow terminal loses letters, never chips.
+        let compact = Window::strip_width(false) > area.width;
         let mut spans = Vec::new();
         for window in Window::ALL {
-            let chip = format!(" {} ({}) ", window.tab_label(), window.key());
+            let label = if compact {
+                window.tab_label()
+            } else {
+                window.label()
+            };
+            let chip = format!(" {} ({}) ", label, window.key());
             let style = if window == self.window {
                 Style::new().fg(Color::Black).bg(Color::Cyan).bold()
             } else {
@@ -3078,18 +3511,130 @@ impl App {
         self.content_len = self.scopes.len().max(self.scope_rules.len()) as u16;
     }
 
+    /// Notes: the titles on the left, the highlighted note's body on the right,
+    /// editable in place.
+    ///
+    /// The body is a real buffer rather than rendered text, because a note is
+    /// something you write, not something you read back — Findings can afford a
+    /// read-only detail pane, this cannot.
+    fn draw_notes(&mut self, frame: &mut Frame, area: Rect) {
+        let [banner, panes] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        self.viewport = panes.height.saturating_sub(2) as usize;
+
+        let focused = self.notes_view.focused && !self.notes.is_empty();
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                if focused {
+                    "  vim keys   ^g $EDITOR   gq format   <Esc> save and leave"
+                } else {
+                    "  <CR> edit   n new   r retitle   d delete"
+                },
+                muted(),
+            )),
+            banner,
+        );
+
+        if self.notes.is_empty() {
+            frame.render_widget(
+                empty_pane(" Notes ", "nothing written yet — :note <title> starts one"),
+                panes,
+            );
+            self.content_len = 0;
+            return;
+        }
+
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .areas(panes);
+
+        let selected = self.notes_view.row;
+        let rows: Vec<Line> = self
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| {
+                let line = Line::from(vec![
+                    Span::styled(format!(" {:>4} ", format!("#{}", note.id)), muted()),
+                    Span::raw(note.title.clone()),
+                ]);
+                if i == selected {
+                    line.style(Style::new().bg(INACTIVE_BG))
+                } else {
+                    line
+                }
+            })
+            .collect();
+
+        frame.render_widget(
+            Paragraph::new(rows).block(
+                Block::bordered()
+                    .title(format!(" Notes ({}) ", self.notes.len()))
+                    // The lit border follows the keys, so it is on the list
+                    // exactly while the list is what the keys move.
+                    .border_style(if focused {
+                        Style::new().fg(Color::DarkGray)
+                    } else {
+                        Style::new().fg(Color::Cyan)
+                    }),
+            ),
+            left,
+        );
+
+        let inserting = self.input.mode() == Mode::Insert;
+        let scroll = self.content_scroll;
+        let title = self
+            .notes
+            .get(selected)
+            .map(|n| n.title.clone())
+            .unwrap_or_default();
+        // Borrowed after everything that needs `&self` above, since the buffer
+        // comes out of the same struct mutably.
+        let Some(buffer) = self.note_buffer() else {
+            return;
+        };
+        let dirty = buffer.is_dirty();
+        let lines = buffer.lines().len() as u16;
+
+        BufferView {
+            buffer,
+            // Markdown, not an HTTP message: the HTTP highlighter would light
+            // up prose as though it were headers.
+            cache: None,
+            title: format!(" {}{} ", title, if dirty { " *" } else { "" }),
+            focused,
+            inserting,
+            border: if focused {
+                Style::new().fg(Color::Cyan)
+            } else {
+                Style::new().fg(Color::DarkGray)
+            },
+            scroll,
+        }
+        .render(frame, right);
+        self.content_len = lines;
+    }
+
     /// Findings: the list on the left, the highlighted one in full on the right.
     ///
     /// Severity and status are the two things that move during triage, so they
-    /// are the two things a single key changes.
+    /// are the two things a single key changes. The write-up is the part you
+    /// sit and type, so it is a real buffer rather than rendered text.
     fn draw_findings(&mut self, frame: &mut Frame, area: Rect) {
         let [banner, panes] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
         self.viewport = panes.height.saturating_sub(2) as usize;
 
+        let focused = self.findings_view.focused && !self.findings.is_empty();
         frame.render_widget(
             Paragraph::new(Line::styled(
-                "  s severity   c status   d delete   <Space>f file the selected flow",
+                if focused {
+                    // No `gq` here: the buffer is prose, and the formatter
+                    // knows how to pretty-print an HTTP message, not markdown.
+                    "  vim keys   ^g $EDITOR   ## Reproduction / Impact / Remediation   <Esc> save and leave"
+                } else {
+                    "  <CR> write up   s severity   c status   r retitle   d delete"
+                },
                 muted(),
             )),
             banner,
@@ -3129,7 +3674,7 @@ impl App {
                     spans.push(Span::styled(format!("  [{}]", finding.status), muted()));
                 }
                 let line = Line::from(spans);
-                if i == self.finding_row {
+                if i == self.findings_view.row {
                     line.style(Style::new().bg(INACTIVE_BG))
                 } else {
                     line
@@ -3141,64 +3686,95 @@ impl App {
             Paragraph::new(rows).block(
                 Block::bordered()
                     .title(format!(" Findings ({}) ", self.findings.len()))
-                    .border_style(Style::new().fg(Color::Cyan)),
+                    // The lit border follows the keys, so it is on the list
+                    // exactly while the list is what the keys move.
+                    .border_style(if focused {
+                        Style::new().fg(Color::DarkGray)
+                    } else {
+                        Style::new().fg(Color::Cyan)
+                    }),
             ),
             left,
         );
 
-        let detail = match self.findings.get(self.finding_row) {
-            None => vec![Line::styled("no finding selected", muted())],
-            Some(finding) => {
-                let mut lines = vec![
-                    Line::styled(finding.title.clone(), Style::new().bold().fg(Color::Cyan)),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{} ", finding.severity),
-                            Style::new().fg(severity_color(&finding.severity)).bold(),
-                        ),
-                        Span::styled(format!("· {} ", finding.status), muted()),
-                        Span::styled(format!("· {}", finding.origin), muted()),
-                    ]),
-                    Line::from(""),
-                ];
-                if let Some(host) = &finding.host {
-                    let path = finding.path.clone().unwrap_or_default();
-                    lines.push(Line::from(format!("{host}{path}")));
-                }
-                if let Some(cwe) = &finding.cwe {
-                    lines.push(Line::styled(cwe.clone(), muted()));
-                }
-                if !finding.description_md.is_empty() {
-                    lines.push(Line::from(""));
-                    lines.extend(
-                        finding
-                            .description_md
-                            .lines()
-                            .map(|l| Line::from(l.to_string())),
-                    );
-                }
-                // Evidence is what makes a finding reproducible, so it is shown
-                // even when everything else is empty.
-                lines.push(Line::from(""));
-                lines.push(Line::styled("EVIDENCE", muted()));
-                if finding.evidence.is_empty() {
-                    lines.push(Line::styled("  (none)", muted()));
-                } else {
-                    for (flow_id, label) in &finding.evidence {
-                        lines.push(Line::from(format!(
-                            "  #{flow_id}{}",
-                            label.as_ref().map(|l| format!("  {l}")).unwrap_or_default()
-                        )));
-                    }
-                }
-                lines
-            }
+        // The right column is the facts on top and the write-up underneath.
+        // They are split because only one of them is editable: severity, status,
+        // host and evidence are set by keys and by what you filed it from, and
+        // putting them in the buffer would invite typing over them.
+        let Some(finding) = self.findings.get(self.findings_view.row) else {
+            frame.render_widget(empty_pane(" Detail ", "no finding selected"), right);
+            self.content_len = self.findings.len() as u16;
+            return;
         };
-        self.content_len = detail.len().max(self.findings.len()) as u16;
-        frame.render_widget(
-            pane(detail, " Detail ").scroll((self.content_scroll, 0)),
-            right,
-        );
+
+        let mut facts = vec![Line::from(vec![
+            Span::styled(
+                format!(" {} ", finding.severity),
+                Style::new().fg(severity_color(&finding.severity)).bold(),
+            ),
+            Span::styled(format!("· {} ", finding.status), muted()),
+            Span::styled(format!("· {}", finding.origin), muted()),
+        ])];
+        if let Some(host) = &finding.host {
+            let path = finding.path.clone().unwrap_or_default();
+            facts.push(Line::from(format!(" {host}{path}")));
+        }
+        if let Some(cwe) = &finding.cwe {
+            facts.push(Line::styled(format!(" {cwe}"), muted()));
+        }
+        // Evidence is what makes a finding reproducible, so it is shown even
+        // when everything else is empty.
+        let evidence = if finding.evidence.is_empty() {
+            " evidence: (none)".to_string()
+        } else {
+            let flows = finding
+                .evidence
+                .iter()
+                .map(|(flow_id, label)| match label {
+                    Some(label) => format!("#{flow_id} {label}"),
+                    None => format!("#{flow_id}"),
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            format!(" evidence: {flows}")
+        };
+        facts.push(Line::styled(evidence, muted()));
+
+        // The facts block takes the height it needs; the write-up gets the
+        // rest, since that is the part being worked on.
+        let [meta, body] =
+            Layout::vertical([Constraint::Length(facts.len() as u16), Constraint::Min(0)])
+                .areas(right);
+        frame.render_widget(Paragraph::new(facts), meta);
+
+        let inserting = self.input.mode() == Mode::Insert;
+        let scroll = self.content_scroll;
+        let title = finding.title.clone();
+        // Borrowed after everything that needs `&self` above, since the buffer
+        // comes out of the same struct mutably.
+        let Some(buffer) = self.write_up_buffer() else {
+            return;
+        };
+        let dirty = buffer.is_dirty();
+        let lines = buffer.lines().len() as u16;
+
+        BufferView {
+            buffer,
+            // Markdown, not an HTTP message: the HTTP highlighter would light up
+            // prose as though it were headers.
+            cache: None,
+            title: format!(" {}{} ", title, if dirty { " *" } else { "" }),
+            focused,
+            inserting,
+            border: if focused {
+                Style::new().fg(Color::Cyan)
+            } else {
+                Style::new().fg(Color::DarkGray)
+            },
+            scroll,
+        }
+        .render(frame, body);
+        self.content_len = lines.max(self.findings.len() as u16);
     }
 
     /// Sitemap: the tree of what has been seen, host then path. `<CR>` folds.
@@ -3525,7 +4101,7 @@ impl App {
 }
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-const HELP: &str = "^k palette · P/W/I/R/C/T/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · Findings (T): s severity, c status, d delete, <Space>f file · :q";
+const HELP: &str = "^k palette · P/W/I/R/C/T/N/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · Findings (T): <CR> write up (## Reproduction/Impact/Remediation are sections), s severity, c status, r retitle, d delete, <Space>f file · Notes (N): n new, <CR> edit, r retitle, d delete, <Space>n new from anywhere · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of
@@ -4471,17 +5047,40 @@ mod tests {
     fn tab_strip_lists_every_window() {
         let mut app = App::new(engine_with(1));
         app.refresh();
+        // 100 columns cannot hold nine full names, so the strip goes compact —
+        // but every window still has a chip, and every chip still has its key.
         let out = render(&mut app);
         for chip in [
             "Proxy (P)",
             "WS (W)",
-            "Intercept (I)",
-            "Repeater (R)",
-            "Sitemap (S)",
-            "Automate (A)",
+            "Int (I)",
+            "Rep (R)",
+            "Scope (C)",
+            "Find (T)",
+            "Notes (N)",
+            "Site (S)",
+            "Auto (A)",
         ] {
             assert!(out.contains(chip), "missing tab {chip}:\n{out}");
         }
+    }
+
+    /// Given the room, the strip spells the names out.
+    #[test]
+    fn a_wide_terminal_gets_the_full_tab_names() {
+        let mut app = App::new(engine_with(1));
+        app.refresh();
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(out.contains("Intercept (I)"), "{out}");
+        assert!(out.contains("Automate (A)"), "{out}");
     }
 
     /// A single uppercase key switches windows, and the body follows.
@@ -4779,6 +5378,391 @@ mod tests {
             1,
             "the flow you were looking at is the evidence"
         );
+    }
+
+    /// Wait for a filed finding to reach the database, since `file_finding`
+    /// spawns its write rather than awaiting it.
+    async fn settle_findings(engine: &Arc<Engine>, expected: usize) {
+        for _ in 0..200 {
+            if engine.list_findings().len() == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("finding never landed");
+    }
+
+    /// The point of the editor: type a write-up and have it still be there
+    /// afterwards, split into the columns a report is generated from. Saving is
+    /// on the way *out*, so this walks the path a user does.
+    #[tokio::test]
+    async fn a_write_up_is_typed_in_and_saved_on_the_way_out() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("token in the URL");
+        settle_findings(&engine, 1).await;
+        app.refresh();
+
+        app.show_window(Window::Findings);
+        key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.findings_view.focused, "<CR> steps into the write-up");
+
+        key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        press(&mut app, "leaks via Referer");
+        key(&mut app, KeyEvent::from(KeyCode::Enter));
+        press(&mut app, "## Impact");
+        key(&mut app, KeyEvent::from(KeyCode::Enter));
+        press(&mut app, "account takeover");
+        // First <Esc> leaves INSERT; the second leaves the buffer, which is what
+        // saves.
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert!(!app.findings_view.focused);
+        let finding = &engine.list_findings()[0];
+        assert_eq!(finding.description_md, "leaks via Referer");
+        assert_eq!(
+            finding.impact_md.as_deref(),
+            Some("account takeover"),
+            "a `## Impact` section lands in its own column"
+        );
+    }
+
+    /// A section deleted from the document has to be deleted from the row too,
+    /// or the report keeps printing prose the operator removed.
+    #[tokio::test]
+    async fn clearing_a_section_clears_its_column() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("token in the URL");
+        settle_findings(&engine, 1).await;
+        app.refresh();
+
+        let id = app.findings[0].id;
+        engine.set_finding_write_up(
+            id,
+            &proxy_core::WriteUp {
+                description_md: "desc".into(),
+                impact_md: Some("bad".into()),
+                ..Default::default()
+            },
+        );
+        app.refresh();
+
+        app.show_window(Window::Findings);
+        app.apply(Action::Enter);
+        // The buffer opens as the rendered document; replace it with one that
+        // has no impact section at all.
+        let buffer = app.write_up_buffer().unwrap();
+        buffer.set_text("desc only");
+        buffer.mark_dirty();
+        app.save_write_up();
+
+        let finding = engine.get_finding(id).unwrap();
+        assert_eq!(finding.description_md, "desc only");
+        assert_eq!(finding.impact_md, None, "the deleted section is gone");
+    }
+
+    /// Notes and findings each keep an open buffer, and switching windows is
+    /// what saves them. The two must not reach into each other: leaving one
+    /// window has to commit that window's document and leave the other's alone.
+    #[tokio::test]
+    async fn a_note_and_a_write_up_can_be_open_at_once() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("token in the URL");
+        settle_findings(&engine, 1).await;
+        app.create_note("auth teardown");
+        settle_notes(&engine, 1).await;
+        app.refresh();
+        let (finding_id, note_id) = (app.findings[0].id, app.notes[0].id);
+
+        // Type into the note, then leave for Findings without an explicit save.
+        app.show_window(Window::Notes);
+        app.apply(Action::Enter);
+        app.apply(Action::Insert(InsertKey::Char('N')));
+        app.show_window(Window::Findings);
+
+        // Type into the write-up, then leave for Proxy.
+        app.apply(Action::Enter);
+        app.apply(Action::Insert(InsertKey::Char('F')));
+        app.show_window(Window::Proxy);
+
+        assert_eq!(engine.get_note(note_id).unwrap().body_md, "N");
+        assert_eq!(
+            engine.get_finding(finding_id).unwrap().description_md,
+            "F",
+            "the write-up took the write-up's keystroke, not the note's"
+        );
+        // Neither window is left holding the keys after the other was visited.
+        assert!(!app.notes_view.focused);
+        assert!(!app.findings_view.focused);
+    }
+
+    /// Deleting the open finding must not leave a buffer that saves its
+    /// write-up back into a row that no longer exists.
+    #[tokio::test]
+    async fn deleting_the_open_finding_drops_its_buffer() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("scratch");
+        settle_findings(&engine, 1).await;
+        app.refresh();
+
+        app.show_window(Window::Findings);
+        app.apply(Action::Enter);
+        app.apply(Action::Insert(InsertKey::Char('x')));
+        app.delete_finding();
+
+        assert!(app.findings_view.edit.is_none());
+        assert!(!app.findings_view.focused);
+        assert!(engine.list_findings().is_empty());
+        // And leaving now has nothing to write back.
+        app.save_write_up();
+        assert!(engine.list_findings().is_empty());
+    }
+
+    /// Retitling is not rewriting: `:finding!` must leave the write-up alone.
+    #[tokio::test]
+    async fn a_finding_is_retitled_without_losing_its_write_up() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("draft");
+        settle_findings(&engine, 1).await;
+        app.refresh();
+
+        let id = app.findings[0].id;
+        engine.set_finding_write_up(
+            id,
+            &proxy_core::WriteUp {
+                description_md: "the write-up".into(),
+                ..Default::default()
+            },
+        );
+        app.refresh();
+
+        app.rename_finding("session token in the URL");
+
+        let finding = engine.get_finding(id).unwrap();
+        assert_eq!(finding.title, "session token in the URL");
+        assert_eq!(finding.description_md, "the write-up");
+        assert_eq!(finding.severity, "info", "a retitle is not a triage");
+    }
+
+    /// The write-up handed to $EDITOR is the whole document, and what comes back
+    /// is split into columns — the same contract as editing in place.
+    #[tokio::test]
+    async fn the_editor_handoff_carries_the_whole_write_up() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("t");
+        settle_findings(&engine, 1).await;
+        app.refresh();
+
+        let id = app.findings[0].id;
+        engine.set_finding_write_up(
+            id,
+            &proxy_core::WriteUp {
+                description_md: "desc".into(),
+                repro_md: Some("steps".into()),
+                ..Default::default()
+            },
+        );
+        app.refresh();
+        app.show_window(Window::Findings);
+
+        app.request_external_edit();
+        let job = app.pending_edit.take().expect("a job to hand to $EDITOR");
+        assert_eq!(
+            job.before, "desc\n\n## Reproduction\nsteps",
+            "the editor gets the sections, not just the description"
+        );
+        assert_eq!(job.target.extension(), "md");
+
+        app.apply_edit(job, "desc\n\n## Remediation\npatch it".to_string());
+
+        let finding = engine.get_finding(id).unwrap();
+        assert_eq!(finding.remediation_md.as_deref(), Some("patch it"));
+        assert_eq!(
+            finding.repro_md, None,
+            "a section dropped in $EDITOR is dropped in the row"
+        );
+    }
+
+    /// The detail column carries two things that must not crowd each other out:
+    /// the facts a key changes, and the write-up you type.
+    #[tokio::test]
+    async fn the_detail_column_shows_the_facts_and_the_write_up() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("token in the URL");
+        settle_findings(&engine, 1).await;
+        app.refresh();
+        let id = app.findings[0].id;
+        engine.set_finding_write_up(
+            id,
+            &proxy_core::WriteUp {
+                description_md: "leaks via Referer".into(),
+                impact_md: Some("account takeover".into()),
+                ..Default::default()
+            },
+        );
+        app.refresh();
+        app.show_window(Window::Findings);
+
+        let screen = render(&mut app);
+        assert!(screen.contains("Findings (1)"), "{screen}");
+        assert!(screen.contains("api.test/login"), "the facts: {screen}");
+        assert!(screen.contains("evidence:"), "the facts: {screen}");
+        assert!(screen.contains("leaks via Referer"), "{screen}");
+        assert!(
+            screen.contains("## Impact"),
+            "sections show as the document they are: {screen}"
+        );
+        // The write-up pane is titled by the finding, the way an open file is.
+        assert!(screen.contains("token in the URL"), "{screen}");
+
+        app.apply(Action::Enter);
+        let focused = render(&mut app);
+        assert!(focused.contains("$EDITOR"), "the banner follows the keys");
+    }
+
+    /// A finding filed from Proxy should be the one under the cursor when you
+    /// reach Findings — filing is usually the prelude to writing it up.
+    #[tokio::test]
+    async fn a_new_finding_takes_the_cursor() {
+        let engine = Engine::new();
+        record_flow(&engine, "https://api.test/login");
+        let mut app = App::new(engine.clone());
+        app.refresh();
+        app.file_finding("first");
+        settle_findings(&engine, 1).await;
+        app.refresh();
+        app.file_finding("second");
+        settle_findings(&engine, 2).await;
+        app.refresh();
+
+        assert_eq!(app.findings[app.findings_view.row].title, "second");
+    }
+
+    /// Wait for a spawned writer round-trip to land, the way the finding tests
+    /// do — `create_note` cannot be awaited from the draw loop.
+    async fn settle_notes(engine: &Arc<Engine>, expected: usize) {
+        for _ in 0..200 {
+            if engine.list_notes().len() == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("note never landed");
+    }
+
+    /// The whole point of the window: type into a note and have it still be
+    /// there afterwards. Saving is on the way *out* of the buffer, so this
+    /// walks the same path a user does — `<CR>`, type, `<Esc>`.
+    #[tokio::test]
+    async fn typing_into_a_note_saves_on_the_way_out() {
+        let engine = Engine::new();
+        let mut app = App::new(engine.clone());
+        app.create_note("auth teardown");
+        settle_notes(&engine, 1).await;
+        app.refresh();
+
+        app.show_window(Window::Notes);
+        key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.notes_view.focused, "<CR> steps into the body");
+
+        key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        press(&mut app, "hi");
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        // First <Esc> leaves INSERT; the second leaves the buffer, which is
+        // what saves.
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert!(!app.notes_view.focused);
+        assert_eq!(engine.list_notes()[0].body_md, "hi");
+    }
+
+    /// The cursor has to land on the note that was just created, not on
+    /// whatever was at the top before the write committed.
+    #[tokio::test]
+    async fn a_new_note_takes_the_cursor() {
+        let engine = Engine::new();
+        let mut app = App::new(engine.clone());
+        app.create_note("first");
+        settle_notes(&engine, 1).await;
+        app.refresh();
+        app.create_note("second");
+        settle_notes(&engine, 2).await;
+        app.refresh();
+
+        let selected = &app.notes[app.notes_view.row];
+        assert_eq!(selected.title, "second");
+    }
+
+    /// Deleting the open note must not leave a buffer that saves its body back
+    /// into a row that no longer exists.
+    #[tokio::test]
+    async fn deleting_the_open_note_drops_its_buffer() {
+        let engine = Engine::new();
+        let mut app = App::new(engine.clone());
+        app.create_note("scratch");
+        settle_notes(&engine, 1).await;
+        app.refresh();
+
+        app.show_window(Window::Notes);
+        app.apply(Action::Enter);
+        app.apply(Action::Insert(InsertKey::Char('x')));
+        app.delete_note();
+
+        assert!(app.notes_view.edit.is_none());
+        assert!(!app.notes_view.focused);
+        assert!(engine.list_notes().is_empty());
+        // And leaving now has nothing to write back.
+        app.save_note();
+        assert!(engine.list_notes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_note_is_retitled_without_losing_its_body() {
+        let engine = Engine::new();
+        let mut app = App::new(engine.clone());
+        app.create_note("draft");
+        settle_notes(&engine, 1).await;
+        app.refresh();
+        let id = app.notes[0].id;
+        engine.update_note(id, None, Some("body text"));
+        app.refresh();
+
+        app.rename_note("auth teardown");
+
+        let note = engine.get_note(id).unwrap();
+        assert_eq!(note.title, "auth teardown");
+        assert_eq!(note.body_md, "body text", "a retitle is not a rewrite");
+    }
+
+    #[test]
+    fn an_empty_note_title_is_refused() {
+        let engine = Engine::new();
+        let mut app = App::new(engine.clone());
+        app.create_note("   ");
+        assert!(engine.list_notes().is_empty());
+        let status = app.status.lock().unwrap().clone();
+        assert!(status.contains("usage: :note"), "{status}");
     }
 
     #[test]

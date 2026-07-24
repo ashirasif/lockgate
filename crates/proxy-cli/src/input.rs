@@ -91,6 +91,8 @@ pub enum Window {
     Repeater,
     Scope,
     Findings,
+    /// Project notes: markdown documents kept beside the capture.
+    Notes,
     /// Traffic held in flight, awaiting forward or drop.
     Intercept,
     /// The tree of what has been seen: host, then path.
@@ -101,24 +103,49 @@ pub enum Window {
 
 impl Window {
     /// Left-to-right tab order, and the set `gt` / `gT` cycle through.
-    pub const ALL: [Window; 8] = [
+    pub const ALL: [Window; 9] = [
         Window::Proxy,
         Window::WebSocket,
         Window::Intercept,
         Window::Repeater,
         Window::Scope,
         Window::Findings,
+        Window::Notes,
         Window::Sitemap,
         Window::Automate,
     ];
 
-    /// A shorter label for the tab strip, where eight windows must share one
-    /// 100-column line. Only WebSocket needs it; the rest are already short.
+    /// A shorter label for the tab strip, used when nine chips will not fit on
+    /// one line at the terminal's width.
+    ///
+    /// Truncation is the alternative, and a strip that cuts "Automate (A)" in
+    /// half is worse than one that says "Auto (A)": the key is the part you
+    /// actually need, and it is the part truncation eats first.
     pub fn tab_label(self) -> &'static str {
         match self {
+            Window::Proxy => "Proxy",
             Window::WebSocket => "WS",
-            _ => self.label(),
+            Window::Intercept => "Int",
+            Window::Repeater => "Rep",
+            Window::Scope => "Scope",
+            Window::Findings => "Find",
+            Window::Notes => "Notes",
+            Window::Sitemap => "Site",
+            Window::Automate => "Auto",
         }
+    }
+
+    /// How wide the whole strip is with these labels, chip padding included.
+    /// Lets the caller pick full or compact before it draws anything.
+    pub fn strip_width(compact: bool) -> u16 {
+        Self::ALL
+            .iter()
+            .map(|w| {
+                let label = if compact { w.tab_label() } else { w.label() };
+                // " {label} ({key}) "
+                label.chars().count() as u16 + 6
+            })
+            .sum()
     }
 
     /// The name shown in the tab strip.
@@ -131,6 +158,7 @@ impl Window {
             Window::Repeater => "Repeater",
             Window::Scope => "Scope",
             Window::Findings => "Findings",
+            Window::Notes => "Notes",
             Window::Sitemap => "Sitemap",
             Window::Automate => "Automate",
         }
@@ -148,6 +176,7 @@ impl Window {
             Window::Repeater => 'R',
             Window::Scope => 'C',
             Window::Findings => 'T',
+            Window::Notes => 'N',
             Window::Sitemap => 'S',
             Window::Automate => 'A',
         }
@@ -358,6 +387,11 @@ const WINDOW_MAP: &[(Window, &str, Bind)] = &[
     // motion can claim — and the same chord now works in both places.
     (Window::Intercept, "<C-g>", Bind::ExternalEdit),
     (Window::Repeater, "<C-g>", Bind::ExternalEdit),
+    // The document windows reach `$EDITOR` the same way. With the buffer
+    // focused `feed_vim` catches `<C-g>` before the grammar sees it; these two
+    // are for the list, where nothing has claimed the chord either.
+    (Window::Notes, "<C-g>", Bind::ExternalEdit),
+    (Window::Findings, "<C-g>", Bind::ExternalEdit),
     (Window::Intercept, "f", Bind::Forward),
     (Window::Intercept, "d", Bind::Drop),
     (Window::Intercept, "F", Bind::ForwardAll),
@@ -397,6 +431,17 @@ const WINDOW_MAP: &[(Window, &str, Bind)] = &[
     (Window::Findings, "d", Bind::Drop),
     (Window::Findings, "s", Bind::CycleSeverity),
     (Window::Findings, "c", Bind::CycleStatus),
+    // `<CR>` steps into the write-up, which is where the vim keys take over and
+    // these window bindings stop resolving at all — the same arrangement Notes
+    // has, because it is the same kind of pane.
+    (Window::Findings, "<CR>", Bind::Enter),
+    (Window::Findings, "r", Bind::PromptSeeded(":finding! ")),
+    // Notes: `<CR>` steps into the body, which is where the vim keys take over
+    // and these window bindings stop resolving at all.
+    (Window::Notes, "<CR>", Bind::Enter),
+    (Window::Notes, "n", Bind::PromptSeeded(":note ")),
+    (Window::Notes, "r", Bind::PromptSeeded(":note! ")),
+    (Window::Notes, "d", Bind::Drop),
 ];
 
 /// The keymap is data, not control flow, so that `:map` can later rewrite it
@@ -446,6 +491,8 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     ("<Space>c", Bind::ToggleScopeFilter),
     // File the selected flow as a finding, from wherever you noticed it.
     ("<Space>f", Bind::PromptSeeded(":finding ")),
+    // Start a note from wherever the thought arrived, same as filing a finding.
+    ("<Space>n", Bind::PromptSeeded(":note ")),
     // Intercept verdicts live in `WINDOW_MAP` as bare `f`/`d`, since that is
     // where they are unambiguous. Toggling *whether* we hold is global, though:
     // you reach for it from wherever you noticed traffic was stalling.
@@ -475,6 +522,7 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     // forward-all, and a window key you cannot press from every window is worse
     // than one with a duller mnemonic.
     ("T", Bind::Window(Window::Findings)),
+    ("N", Bind::Window(Window::Notes)),
     ("S", Bind::Window(Window::Sitemap)),
     ("A", Bind::Window(Window::Automate)),
     ("gt", Bind::WindowStep(1)),

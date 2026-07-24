@@ -7,7 +7,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use proxy_core::{Finding, FlowDetail, FlowRow, SitemapNode};
+use proxy_core::{Finding, FlowDetail, FlowRow, Note, SitemapNode};
 use rmcp::schemars;
 use serde::Serialize;
 
@@ -216,6 +216,29 @@ impl From<Finding> for FindingDto {
                 .into_iter()
                 .map(|(flow_id, label)| EvidenceDto { flow_id, label })
                 .collect(),
+        }
+    }
+}
+
+/// A project note: free markdown, no schema beyond a title. Distinct from a
+/// flow's `comment`, which annotates one row.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct NoteDto {
+    pub id: i64,
+    pub title: String,
+    pub body_md: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<Note> for NoteDto {
+    fn from(n: Note) -> Self {
+        Self {
+            id: n.id,
+            title: n.title,
+            body_md: n.body_md,
+            created_at: n.created_at,
+            updated_at: n.updated_at,
         }
     }
 }

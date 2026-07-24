@@ -23,6 +23,15 @@ pub enum Command {
     Pretty,
     /// `:finding <title>` — file the selected flow as a draft finding.
     Finding(String),
+    /// `:finding! <title>` — retitle the highlighted finding. Same bang rule as
+    /// `:note!`: without it you always get a new one.
+    RenameFinding(String),
+    /// `:note <title>` — start a project note and open it for editing.
+    Note(String),
+    /// `:note! <title>` — retitle the highlighted note. The `!` is vim's own
+    /// "and mean it" suffix: `:note` with no bang always makes a new one, so
+    /// the destructive reading of a bare title is never the accidental one.
+    RenameNote(String),
     /// `:scope <verb> [argument]` — scope management. Patterns are free text,
     /// so they arrive as a command rather than as forty keybindings.
     Scope {
@@ -53,6 +62,9 @@ impl Command {
             "h" | "help" => Command::Help,
             "pretty" | "pp" | "format" => Command::Pretty,
             "finding" | "fi" => Command::Finding(rest.to_string()),
+            "finding!" | "fi!" => Command::RenameFinding(rest.to_string()),
+            "note" | "nt" => Command::Note(rest.to_string()),
+            "note!" | "nt!" => Command::RenameNote(rest.to_string()),
             "scope" | "sc" => {
                 let (verb, argument) = match rest.split_once(char::is_whitespace) {
                     Some((verb, argument)) => (verb.to_string(), argument.trim().to_string()),
@@ -124,6 +136,32 @@ mod tests {
                 option: "rnu".into(),
                 value: false
             })
+        );
+    }
+
+    /// The bang is what separates "new note" from "rename this one", so the two
+    /// must not collapse into each other. `:finding` reads the same way.
+    #[test]
+    fn the_bang_distinguishes_a_new_note_from_a_rename() {
+        assert_eq!(
+            Command::parse("note auth teardown"),
+            Some(Command::Note("auth teardown".into()))
+        );
+        assert_eq!(
+            Command::parse("note! auth teardown"),
+            Some(Command::RenameNote("auth teardown".into()))
+        );
+        assert_eq!(
+            Command::parse("finding auth bypass"),
+            Some(Command::Finding("auth bypass".into()))
+        );
+        assert_eq!(
+            Command::parse("finding! auth bypass"),
+            Some(Command::RenameFinding("auth bypass".into()))
+        );
+        assert_eq!(
+            Command::parse("fi! auth bypass"),
+            Some(Command::RenameFinding("auth bypass".into()))
         );
     }
 

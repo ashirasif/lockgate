@@ -7,7 +7,7 @@ work the same capture, queue and scope you are looking at.
 Two frontends over one engine:
 
 - a **ratatui TUI** with vim editing, for the human
-- an **MCP server** with 27 tools, for an agent
+- an **MCP server** with 33 tools, for an agent
 
 Both hold the same `Arc<Engine>` in one process, so there is one SQLite writer
 and neither can see stale state.
@@ -31,8 +31,9 @@ exists but you will notice what is missing.
 | **Scope** | Named scopes, include/exclude rules where excludes always win, glob/regex/CIDR host matching, filtering across Proxy and Sitemap, bypass toggle |
 | **Editing** | A real vim grammar — counts, operators, text objects, visual mode, undo/redo, registers — plus `$EDITOR` handoff for anything it does not cover |
 | **Display** | HTTP syntax highlighting, syntect for bodies (JSON, HTML, XML, GraphQL, protobuf, JS-in-`<script>`, …), JSON/HTML pretty-printing, OSC 52 clipboard |
-| **MCP** | 27 tools: recon, intercept, scope, send, format. Resources for full bodies |
-| **Findings** | File a flow as a finding, triage severity and status by keystroke, delete. Also over MCP |
+| **MCP** | 33 tools: recon, intercept, scope, send, format, findings, notes. Resources for full bodies |
+| **Findings** | File a flow as a finding, triage severity and status by keystroke, retitle, delete. The write-up is edited in place with the same vim buffer the Repeater uses, `^g` to hand it to `$EDITOR` — one markdown document whose `## Reproduction` / `## Impact` / `## Remediation` sections are the prose columns a report is generated from. Saved on the way out. Also over MCP |
+| **Notes** | Project markdown documents in a window of their own (N), edited in place with the same vim buffer the Repeater uses, `^g` to hand one to `$EDITOR`. Saved on the way out — there is no `:w`. Full CRUD over MCP, so an agent's working notes and yours are the same list |
 | **WebSockets** | A window of their own (W), separate from the HTTP history, with the handshake and a live frame transcript per connection. Correlated to the upgrade, also over MCP. Observed, not intercepted |
 | **Compressed bodies** | gzip, deflate and brotli decoded for display and over MCP, re-encoded when an intercepted body is edited. Stored bytes are always what arrived |
 
@@ -40,9 +41,8 @@ exists but you will notice what is missing.
 
 | Area | What is missing |
 |---|---|
-| **Findings** | Prose fields (description, repro, impact) are set over MCP only; the TUI files and triages but does not edit them |
+| **Findings** | CVSS and CWE are set over MCP only — the TUI shows a CWE but has no key to change one. Evidence links are fixed at filing on both sides |
 | **Projects** | A startup picker opens, creates or forgets projects — one fuzzy search bar, top matches in a dropdown, Enter on a new name creates it, `Ctrl-d` forgets one (keeping its traffic on disk). `--project <name>` still skips straight in. What is missing is switching *inside* a running session: changing project means relaunching |
-| **Notes** | `note` table exists, nothing reads or writes it |
 | **Repeater** | Tabs and history are in memory. Closing the TUI loses them |
 | **Search** | `/` moves the cursor through the flow list. No body search, and no search tool over MCP |
 
@@ -127,10 +127,10 @@ with an agent — for Claude Code:
 claude mcp add --transport http proxy http://127.0.0.1:3001/mcp
 ```
 
-and the agent gets the same 27 tools: survey flows, read full bodies as `flow://`
-resources, walk the sitemap and WebSocket frames, replay through scope, and file
-findings. A bundled skill at `.claude/skills/proxy-recon` teaches the recon loop
-and the conventions that are judgement rather than mechanics — redact captured
+and the agent gets the same 33 tools: survey flows, read full bodies as `flow://`
+resources, walk the sitemap and WebSocket frames, replay through scope, file
+findings, and keep notes alongside yours. A bundled skill at
+`.claude/skills/proxy-recon` teaches the recon loop and the conventions that are judgement rather than mechanics — redact captured
 secrets by default, rate severity against the threat model, set scope before a
 replay.
 
@@ -140,17 +140,18 @@ replay.
 
 `?` is not a help key; `:help` prints the summary and `<C-k>` opens the command
 palette. Windows are `P` proxy, `W` websocket, `I` intercept, `R` repeater,
-`C` scope, `T` findings, `S` sitemap, `A` automate — `gt`/`gT` cycle.
+`C` scope, `T` findings, `N` notes, `S` sitemap, `A` automate — `gt`/`gT` cycle.
 
 | | |
 |---|---|
-| **Everywhere** | `<Space>r` resend · `<Space>s` send to Repeater · `<Space>i` toggle hold · `<Space>c` bypass scope · `:q` quit |
+| **Everywhere** | `<Space>r` resend · `<Space>s` send to Repeater · `<Space>i` toggle hold · `<Space>c` bypass scope · `<Space>f` file a finding · `<Space>n` start a note · `:q` quit |
 | **WebSocket** | `j`/`k` move between connections · the selected one's handshake and frames show below |
 | **Intercept** | `f` forward · `d` drop · `F`/`D` all · `<C-w>` switch pane · `<CR>` open preview |
 | **Repeater** | `n` new tab · `x` close · `gs` / `{count}gs` switch · `[` `]` history · `p` raw/pretty |
 | **Scope** | `n` new · `a` include · `x` exclude · `d` delete · `<CR>` activate or toggle · `<C-w>` switch pane |
 | **Sitemap** | `<CR>` fold · `a` scope host · `d` unscope host |
-| **Findings** | `s` severity · `c` status · `d` delete · `<Space>f` file the selected flow |
+| **Findings** | `<CR>` edit the write-up · `s` severity · `c` status · `r` retitle · `d` delete · `<Space>f` file the selected flow |
+| **Notes** | `<CR>` edit the body · `n` new · `r` retitle · `d` delete · `<Space>n` start one from anywhere |
 | **In a buffer** | vim motions and operators · `gq` format body · `<C-g>` hand to `$EDITOR` · `<Esc>` leave |
 
 Digits are vim counts, never window bindings — which is why tab selection is
@@ -221,7 +222,7 @@ side is not trusted and a few hundred bytes can claim gigabytes.
 ## Development
 
 ```sh
-cargo test --workspace      # 407 tests
+cargo test --workspace      # 435 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```

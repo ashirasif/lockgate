@@ -31,7 +31,8 @@ use rmcp::{RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router}
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{
-    BodyPreview, FindingDto, FlowDetailDto, FlowDto, SitemapNodeDto, detail_headers, encode_bytes,
+    BodyPreview, FindingDto, FlowDetailDto, FlowDto, NoteDto, SitemapNodeDto, detail_headers,
+    encode_bytes,
 };
 
 /// Default and ceiling on how many rows a listing returns. A ceiling matters
@@ -486,6 +487,78 @@ pub struct ListFindingsResult {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct GetFindingParams {
     pub id: i64,
+}
+
+/// A revision to an existing finding. Every field is optional; omitting one
+/// leaves that column exactly as it is.
+///
+/// Clearing is by empty string rather than by `null`, deliberately: a client
+/// that serialises absent fields as `null` — plenty do — would otherwise wipe
+/// every column it did not mention. `""` can only be sent on purpose.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct UpdateFindingParams {
+    pub id: i64,
+    /// Omit to leave the title alone. Must not be empty.
+    pub title: Option<String>,
+    /// info | low | medium | high | critical.
+    pub severity: Option<String>,
+    /// draft | confirmed | false_positive | reported | fixed | wont_fix.
+    pub status: Option<String>,
+    /// Replaces the whole description when given — get_finding first if you
+    /// mean to append.
+    pub description_md: Option<String>,
+    /// Empty string clears the section.
+    pub repro_md: Option<String>,
+    /// Empty string clears the section.
+    pub impact_md: Option<String>,
+    /// Empty string clears the section.
+    pub remediation_md: Option<String>,
+    /// Empty string clears the CVSS vector *and* its score and version — a
+    /// score without the vector it was computed from is not a rating anyone can
+    /// check.
+    pub cvss_vector: Option<String>,
+    pub cvss_score: Option<f64>,
+    pub cvss_version: Option<String>,
+    /// Empty string clears it.
+    pub cwe: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CreateNoteParams {
+    pub title: String,
+    /// Markdown. May be empty — a note often starts as a title and grows.
+    pub body_md: Option<String>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct CreateNoteResult {
+    pub id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListNotesResult {
+    pub notes: Vec<NoteDto>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct NoteIdParams {
+    pub id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct UpdateNoteParams {
+    pub id: i64,
+    /// Omit to leave the title as it is.
+    pub title: Option<String>,
+    /// Omit to leave the body as it is. Replaces the whole body when given —
+    /// read the note first if you mean to append.
+    pub body_md: Option<String>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct RowsChangedResult {
+    /// 0 means nothing with that id.
+    pub rows_changed: u64,
 }
 
 #[tool_router]
@@ -1213,6 +1286,158 @@ impl ProxyServer {
             .ok_or_else(|| ErrorData::resource_not_found(format!("no finding #{}", p.id), None))
     }
 
+    #[tool(
+        description = "Revise a finding: triage it, or rewrite any part of the write-up as you \
+                       learn more. Omitted fields are left alone; a given markdown field replaces \
+                       that whole section, so get_finding first if you mean to append. Pass an \
+                       empty string to clear an optional field. Evidence flows cannot be changed \
+                       here — file the finding with the evidence it needs."
+    )]
+    async fn update_finding(
+        &self,
+        Parameters(p): Parameters<UpdateFindingParams>,
+    ) -> Result<Json<RowsChangedResult>, ErrorData> {
+        // Same vocabularies as create_finding, and validated for the same
+        // reason: the columns are free text with no DB CHECK, so a typo'd
+        // severity persists silently and skews every later filter.
+        let severity = p
+            .severity
+            .as_deref()
+            .map(|s| validate_one("severity", s, SEVERITIES))
+            .transpose()?;
+        let status = p
+            .status
+            .as_deref()
+            .map(|s| validate_one("status", s, STATUSES))
+            .transpose()?;
+        if p.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(ErrorData::invalid_params("title must not be empty", None));
+        }
+
+        // Empty means clear; anything else is the new value.
+        let clearable = |field: Option<String>| field.map(|v| (!v.is_empty()).then_some(v));
+
+        // The score and version describe the vector, so clearing it clears
+        // them. Without this a finding could keep a 9.8 whose vector is gone.
+        let cleared_cvss = p.cvss_vector.as_deref() == Some("");
+        let cvss_score = match (cleared_cvss, p.cvss_score) {
+            (true, _) => Some(None),
+            (false, score) => score.map(Some),
+        };
+        let cvss_version = if cleared_cvss {
+            Some(None)
+        } else {
+            clearable(p.cvss_version)
+        };
+
+        let edit = proxy_core::FindingEdit {
+            title: p.title,
+            severity,
+            status,
+            description_md: p.description_md,
+            repro_md: clearable(p.repro_md),
+            impact_md: clearable(p.impact_md),
+            remediation_md: clearable(p.remediation_md),
+            cvss_vector: clearable(p.cvss_vector),
+            cvss_score,
+            cvss_version,
+            cwe: clearable(p.cwe),
+        };
+        if edit.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "give at least one field to change",
+                None,
+            ));
+        }
+
+        let rows = self.engine.update_finding(p.id, &edit);
+        Ok(Json(RowsChangedResult {
+            rows_changed: rows as u64,
+        }))
+    }
+
+    #[tool(
+        description = "Start a project note: a free markdown document (how the auth flow works, \
+                       what to try next). For a scribble on one flow use annotate_flow instead. \
+                       Returns the new note id."
+    )]
+    async fn create_note(
+        &self,
+        Parameters(p): Parameters<CreateNoteParams>,
+    ) -> Result<Json<CreateNoteResult>, ErrorData> {
+        let title = p.title.trim();
+        if title.is_empty() {
+            return Err(ErrorData::invalid_params("title must not be empty", None));
+        }
+        let id = self
+            .engine
+            .create_note(proxy_core::NewNote {
+                title: title.to_string(),
+                body_md: p.body_md.unwrap_or_default(),
+            })
+            .await
+            .map_err(write_error)?;
+        Ok(Json(CreateNoteResult { id }))
+    }
+
+    #[tool(description = "List every note in this project, newest first, with full bodies.")]
+    async fn list_notes(&self) -> Result<Json<ListNotesResult>, ErrorData> {
+        let notes = self
+            .engine
+            .list_notes()
+            .into_iter()
+            .map(NoteDto::from)
+            .collect();
+        Ok(Json(ListNotesResult { notes }))
+    }
+
+    #[tool(description = "Get one note by id.")]
+    async fn get_note(
+        &self,
+        Parameters(p): Parameters<NoteIdParams>,
+    ) -> Result<Json<NoteDto>, ErrorData> {
+        self.engine
+            .get_note(p.id)
+            .map(|n| Json(NoteDto::from(n)))
+            .ok_or_else(|| ErrorData::resource_not_found(format!("no note #{}", p.id), None))
+    }
+
+    #[tool(
+        description = "Edit a note. Omitted fields are left alone; a given body_md replaces the \
+                       whole body, so read the note first if you mean to append."
+    )]
+    async fn update_note(
+        &self,
+        Parameters(p): Parameters<UpdateNoteParams>,
+    ) -> Result<Json<RowsChangedResult>, ErrorData> {
+        if p.title.is_none() && p.body_md.is_none() {
+            return Err(ErrorData::invalid_params(
+                "give at least one of title or body_md",
+                None,
+            ));
+        }
+        if p.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(ErrorData::invalid_params("title must not be empty", None));
+        }
+        let rows = self
+            .engine
+            .update_note(p.id, p.title.as_deref(), p.body_md.as_deref());
+        Ok(Json(RowsChangedResult {
+            rows_changed: rows as u64,
+        }))
+    }
+
+    #[tool(description = "Delete a note by id.")]
+    async fn delete_note(
+        &self,
+        Parameters(p): Parameters<NoteIdParams>,
+    ) -> Result<Json<RowsChangedResult>, ErrorData> {
+        let rows = self.engine.delete_note(p.id);
+        Ok(Json(RowsChangedResult {
+            rows_changed: rows as u64,
+        }))
+    }
+
     /// Read a bounded window of one body and shape it for JSON.
     fn body_preview(
         &self,
@@ -1331,7 +1556,10 @@ impl ServerHandler for ProxyServer {
             "Start with list_flows to survey traffic and get_flow for detail. Full request and \
              response bodies are resources at flow://{id}/request and flow://{id}/response. \
              resend_flow replays a request (scope-gated). Record what you find with \
-             create_finding; list_findings shows them all."
+             create_finding; list_findings shows them all, and update_finding revises one as you \
+             confirm it — file it early at low confidence and triage it up rather than sitting on \
+             it. Working notes that are not yet a finding belong in create_note / update_note, \
+             which the operator reads in the TUI."
                 .to_string(),
         );
         info
@@ -2311,6 +2539,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notes_round_trip_and_edit_one_field_at_a_time() {
+        let (_engine, server) = setup();
+
+        let id = server
+            .create_note(Parameters(CreateNoteParams {
+                title: "auth teardown".into(),
+                body_md: Some("refresh token is bound to nothing".into()),
+            }))
+            .await
+            .unwrap()
+            .0
+            .id;
+
+        // A body edit must not disturb the title, which is what makes
+        // update_note safe to call from an agent that only has new prose.
+        let res = server
+            .update_note(Parameters(UpdateNoteParams {
+                id,
+                title: None,
+                body_md: Some("bound to nothing, see flow #412".into()),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res.rows_changed, 1);
+
+        let note = server
+            .get_note(Parameters(NoteIdParams { id }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(note.title, "auth teardown");
+        assert_eq!(note.body_md, "bound to nothing, see flow #412");
+        assert_eq!(server.list_notes().await.unwrap().0.notes.len(), 1);
+
+        // An empty edit is a caller error, not a silent no-op.
+        let err = server
+            .update_note(Parameters(UpdateNoteParams {
+                id,
+                title: None,
+                body_md: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("title or body_md"), "{}", err.message);
+
+        assert_eq!(
+            server
+                .delete_note(Parameters(NoteIdParams { id }))
+                .await
+                .unwrap()
+                .0
+                .rows_changed,
+            1
+        );
+        assert!(server.list_notes().await.unwrap().0.notes.is_empty());
+        // A gone note reads as not-found rather than as an empty one.
+        let err = server
+            .get_note(Parameters(NoteIdParams { id }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.message.contains(&format!("no note #{id}")),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn annotate_round_trips_and_rejects_empty() {
         let (engine, server) = setup();
         let id = record(&engine, "http://example.com/a", "A");
@@ -2374,6 +2673,151 @@ mod tests {
         assert_eq!(g.evidence[0].flow_id, id);
 
         assert_eq!(server.list_findings().await.unwrap().0.findings.len(), 1);
+    }
+
+    fn update_params(id: i64) -> UpdateFindingParams {
+        UpdateFindingParams {
+            id,
+            title: None,
+            severity: None,
+            status: None,
+            description_md: None,
+            repro_md: None,
+            impact_md: None,
+            remediation_md: None,
+            cvss_vector: None,
+            cvss_score: None,
+            cvss_version: None,
+            cwe: None,
+        }
+    }
+
+    /// The point of the tool: an agent files early and revises as it confirms.
+    /// What it does not mention has to survive untouched.
+    #[tokio::test]
+    async fn update_finding_revises_only_what_it_is_given() {
+        let (engine, server) = setup();
+        let flow = record(&engine, "http://example.com/vuln", "boom");
+
+        let mut p = finding_params();
+        p.description_md = "maybe reflected".into();
+        p.evidence = Some(vec![EvidenceInput {
+            flow_id: flow,
+            label: Some("poc".into()),
+        }]);
+        let id = server.create_finding(Parameters(p)).await.unwrap().0.id;
+
+        let mut u = update_params(id);
+        u.severity = Some("high".into());
+        u.status = Some("confirmed".into());
+        u.impact_md = Some("session theft".into());
+        let rows = server.update_finding(Parameters(u)).await.unwrap().0;
+        assert_eq!(rows.rows_changed, 1);
+
+        let g = server
+            .get_finding(Parameters(GetFindingParams { id }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(g.severity, "high");
+        assert_eq!(g.status, "confirmed");
+        assert_eq!(g.impact_md.as_deref(), Some("session theft"));
+        assert_eq!(
+            g.description_md, "maybe reflected",
+            "an untouched field is untouched"
+        );
+        assert_eq!(g.title, "t");
+        assert_eq!(
+            g.evidence.len(),
+            1,
+            "an edit must not drop the evidence it was filed with"
+        );
+    }
+
+    /// Clearing has to be possible, and has to be deliberate: `""` clears, and
+    /// dropping the CVSS vector takes its score and version with it.
+    #[tokio::test]
+    async fn update_finding_clears_on_an_empty_string() {
+        let (engine, server) = setup();
+        record(&engine, "http://example.com/a", "A");
+
+        let mut p = finding_params();
+        p.impact_md = Some("guessed".into());
+        p.cvss_vector = Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".into());
+        p.cvss_score = Some(9.8);
+        p.cvss_version = Some("3.1".into());
+        let id = server.create_finding(Parameters(p)).await.unwrap().0.id;
+
+        let mut u = update_params(id);
+        u.impact_md = Some(String::new());
+        u.cvss_vector = Some(String::new());
+        server.update_finding(Parameters(u)).await.unwrap();
+
+        let g = server
+            .get_finding(Parameters(GetFindingParams { id }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(g.impact_md, None);
+        assert_eq!(g.cvss_vector, None);
+        assert_eq!(
+            g.cvss_score, None,
+            "a score without its vector is not a rating"
+        );
+        assert_eq!(g.cvss_version, None);
+    }
+
+    #[tokio::test]
+    async fn update_finding_validates_inputs() {
+        let (engine, server) = setup();
+        record(&engine, "http://example.com/a", "A");
+        let id = server
+            .create_finding(Parameters(finding_params()))
+            .await
+            .unwrap()
+            .0
+            .id;
+
+        let mut bad_sev = update_params(id);
+        bad_sev.severity = Some("catastrophic".into());
+        assert!(
+            server
+                .update_finding(Parameters(bad_sev))
+                .await
+                .is_err_and(|e| e.message.contains("severity"))
+        );
+
+        let mut blank = update_params(id);
+        blank.title = Some("   ".into());
+        assert!(server.update_finding(Parameters(blank)).await.is_err());
+
+        // An edit that says nothing is a mistake, not a no-op to swallow.
+        assert!(
+            server
+                .update_finding(Parameters(update_params(id)))
+                .await
+                .is_err_and(|e| e.message.contains("at least one"))
+        );
+
+        // Nothing above should have landed.
+        let g = server
+            .get_finding(Parameters(GetFindingParams { id }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(g.severity, "low");
+        assert_eq!(g.title, "t");
+
+        // An unknown id is 0 rows, not an error — same as update_note.
+        let rows = server
+            .update_finding(Parameters(UpdateFindingParams {
+                title: Some("ghost".into()),
+                ..update_params(9999)
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(rows.rows_changed, 0);
     }
 
     #[tokio::test]
