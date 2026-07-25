@@ -42,6 +42,16 @@ pub struct Engine {
     sockets: Mutex<HashMap<SocketKey, OpenSocket>>,
 }
 
+/// Everything observable about engine state, collapsed to a value that can be
+/// compared against a previous one. Opaque by design: only equality means
+/// anything, and an unequal pair says only "something changed", never what.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Revision {
+    data_version: i64,
+    total_changes: u64,
+    intercept: crate::intercept::InterceptRevision,
+}
+
 /// What a WebSocket frame can identify itself by: nothing more than where it
 /// came from and where it is going.
 type SocketKey = (std::net::SocketAddr, String);
@@ -291,6 +301,32 @@ impl Engine {
 
     /// Run a read against the database, logging and returning the default on
     /// error — a failed history query must not take a frontend down.
+    /// A cheap token that changes whenever anything a frontend displays has
+    /// changed — captured traffic, findings, notes, scopes, or the intercept
+    /// queue. Costs a mutex, a pragma read and two atomic loads, with no I/O and
+    /// no table access, so a UI can poll it far more often than it could afford
+    /// to reload.
+    ///
+    /// Both database halves are needed because writes arrive on two different
+    /// connections. `data_version` is SQLite's own cache-invalidation counter:
+    /// it moves when *another* connection commits, which covers everything the
+    /// background writer records (flows, WebSocket frames, findings and notes
+    /// created through it) but deliberately ignores this connection's own
+    /// writes. `total_changes` covers exactly that remainder — the scope and
+    /// triage edits that `with_db` / `with_scope` apply directly to the read
+    /// connection. Neither is something a future write path has to remember to
+    /// update, which is the point: a missed bump here would show a stale UI.
+    pub fn revision(&self) -> Revision {
+        let conn = self.read_conn().lock().unwrap();
+        Revision {
+            data_version: conn
+                .pragma_query_value(None, "data_version", |r| r.get(0))
+                .unwrap_or(0),
+            total_changes: conn.total_changes(),
+            intercept: self.intercept.revision(),
+        }
+    }
+
     fn read<T: Default>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> T {
         let conn = self.read_conn().lock().unwrap();
         f(&conn).unwrap_or_else(|e| {

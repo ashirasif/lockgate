@@ -21,7 +21,7 @@ pub mod server;
 pub mod writer;
 
 pub use db::ProjectPaths;
-pub use engine::{Engine, ResendError, Resent};
+pub use engine::{Engine, ResendError, Resent, Revision};
 pub use finding::{Finding, FindingEdit, NewFinding, WriteUp};
 pub use intercept::{Held, Intercept, Pending, TicketId, Verdict};
 pub use model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary};

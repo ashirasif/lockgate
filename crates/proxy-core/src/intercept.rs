@@ -82,6 +82,15 @@ pub struct Intercept {
     queue: Mutex<BTreeMap<TicketId, Entry>>,
 }
 
+/// The queue's observable state, compared to decide whether a frontend needs to
+/// reload. Opaque by design: only equality is meaningful.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct InterceptRevision {
+    tickets: u64,
+    queued: usize,
+    flags: u8,
+}
+
 impl Default for Intercept {
     fn default() -> Self {
         Self {
@@ -98,6 +107,24 @@ impl Default for Intercept {
 }
 
 impl Intercept {
+    /// A cheap token that changes whenever anything a frontend displays about
+    /// the queue changes, so a UI can skip reloading when it hasn't.
+    ///
+    /// Derived rather than maintained: there is no `revision` field for a new
+    /// mutator to forget to bump. `next_ticket` only ever grows, so pairing it
+    /// with the current length distinguishes every case a length alone would
+    /// miss — holding one item and answering another in the same interval
+    /// leaves the length untouched but always advances the ticket.
+    pub fn revision(&self) -> InterceptRevision {
+        InterceptRevision {
+            tickets: self.next_ticket.load(Ordering::Relaxed),
+            queued: self.queue.lock().unwrap().len(),
+            flags: (self.enabled.load(Ordering::Relaxed) as u8)
+                | ((self.hold_requests.load(Ordering::Relaxed) as u8) << 1)
+                | ((self.hold_responses.load(Ordering::Relaxed) as u8) << 2),
+        }
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }

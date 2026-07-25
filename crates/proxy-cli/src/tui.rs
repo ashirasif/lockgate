@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use hudsucker::hyper::{HeaderMap, StatusCode};
 use proxy_core::{
-    CapturedRequest, Engine, Flow, FlowId, FlowSummary, Held, Pending, SitemapNode, TicketId,
+    CapturedRequest, Engine, Flow, FlowId, FlowSummary, Held, Pending, Revision, SitemapNode,
+    TicketId,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -547,14 +548,37 @@ impl App {
     }
 
     async fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+        // The revision the loaded data belongs to. `None` forces the first pass
+        // to load, and is how the editor asks for a reload on the way back.
+        let mut loaded: Option<Revision> = None;
+        // Set by the previous iteration's input: a keystroke is a reload reason
+        // in its own right, since it can move the cursor onto a different flow.
+        let mut acted = false;
         while !self.should_quit {
-            self.refresh();
+            // Read before the reload, not after: a write landing in between then
+            // makes the next tick reload again, which is the harmless direction
+            // to be wrong in. Reading after could bind fresh data to a revision
+            // that already describes newer data, and that staleness would last
+            // until something else happened to change.
+            let revision = self.engine.revision();
+            if acted || loaded != Some(revision) {
+                self.refresh();
+                loaded = Some(revision);
+            }
+            // Drawn unconditionally, and deliberately: the status line and the
+            // Repeater's result are filled in by spawned tasks and read straight
+            // out of their mutexes here, so they are not covered by the engine
+            // revision. Skipping frames would leave "sending…" on screen until
+            // something unrelated moved. A frame nothing has changed costs a
+            // diff against the last one, which is far below the reload it
+            // replaces.
             terminal.draw(|frame| self.draw(frame))?;
-            self.handle_events()?;
+            acted = self.handle_events()?;
             // Handing the terminal to an editor has to happen out here, where
             // the terminal handle lives — and between draws, never during one.
             if let Some(job) = self.pending_edit.take() {
                 self.run_editor(job, terminal).await;
+                loaded = None;
             }
             // Yield rather than block: the proxy is running on other tokio tasks.
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -842,8 +866,12 @@ impl App {
 
     // --- input ---
 
-    fn handle_events(&mut self) -> std::io::Result<()> {
+    /// Returns whether anything was acted on, which the run loop takes as a
+    /// reason to reload: a keystroke can move the cursor, and the detail pane is
+    /// read from the database per selected row.
+    fn handle_events(&mut self) -> std::io::Result<bool> {
         // Drain everything queued; poll with a zero timeout so we never block.
+        let mut acted = false;
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
@@ -851,10 +879,11 @@ impl App {
                 }
                 if let Some(action) = self.input.feed(key) {
                     self.apply(action);
+                    acted = true;
                 }
             }
         }
-        Ok(())
+        Ok(acted)
     }
 
     /// Tell the input layer whether a buffer currently has the keys.
