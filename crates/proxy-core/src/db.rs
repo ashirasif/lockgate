@@ -31,7 +31,7 @@ use rusqlite::Connection;
 pub const INLINE_BODY_LIMIT: usize = 5 * 1024 * 1024;
 
 /// Bumped whenever `MIGRATIONS` grows. Persisted in SQLite's `user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Applied in order, starting from whatever `user_version` the file is at.
 /// Append only — never edit a statement that has already shipped.
@@ -269,6 +269,31 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE flow ADD COLUMN port INTEGER;
     UPDATE flow SET port = CASE scheme WHEN 'https' THEN 443 ELSE 80 END;
     "#,
+    // v3
+    //
+    // Covering indexes for the history lists, which the TUI re-runs on every
+    // 50ms tick. Without them both queries fall back to a table scan, and `flow`
+    // stores `req_headers` / `resp_headers` as inline BLOBs — so listing 19k
+    // flows dragged a 255MB table through the page cache 20 times a second, for
+    // five small columns. The cost grew with the capture until it dominated a
+    // whole core.
+    //
+    // Both indexes carry exactly the `list_flows` projection and lead with
+    // `id DESC`, so each query is answered by an ordered scan of the index alone
+    // — no table rows, and no sort for the ORDER BY.
+    r#"
+    -- Carries the scope columns as well, so the scope-filtered variant of the
+    -- list (which additionally selects host/port/path) is covered by the same
+    -- index rather than dropping back to a table scan.
+    CREATE INDEX flow_list ON flow(id DESC, status, method, uri, started_at, host, port, path);
+
+    -- WebSockets are a fraction of a percent of traffic, so the partial index
+    -- is tiny and the `status = 101` list becomes near-free. The HTTP side
+    -- can't have the mirror of this: `status IS NULL OR status != 101` is a
+    -- negation SQLite won't turn into a seek, which is why `flow_list` above
+    -- is built to be scanned rather than searched.
+    CREATE INDEX flow_ws ON flow(id DESC, method, uri, started_at) WHERE status = 101;
+    "#,
 ];
 
 /// Where a project's files live.
@@ -398,7 +423,7 @@ mod tests {
     /// Projects created before the conjunction rewrite must upgrade in place,
     /// not just work when created fresh. Applies v1 alone, then migrates.
     #[test]
-    fn upgrades_a_v1_project_to_v2() {
+    fn upgrades_a_v1_project_to_latest() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(MIGRATIONS[0]).unwrap();
         conn.pragma_update(None, "user_version", 1i64).unwrap();
@@ -422,7 +447,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
 
         // Existing rows keep their data and get a port backfilled from scheme.
         let ports: Vec<i64> = conn

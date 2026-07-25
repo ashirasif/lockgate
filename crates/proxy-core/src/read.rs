@@ -59,7 +59,10 @@ impl FlowKind {
 }
 
 pub fn list_flows(conn: &Connection, kind: FlowKind) -> rusqlite::Result<Vec<FlowSummary>> {
-    conn.prepare(&format!(
+    // Cached: the TUI runs this on every tick, and re-parsing and re-planning
+    // the same two statements 40 times a second is pure overhead. There are
+    // only ever two texts here, so the cache stays at two entries.
+    conn.prepare_cached(&format!(
         "SELECT id, method, uri, status, started_at FROM flow
           WHERE {} ORDER BY id DESC",
         kind.where_clause()
@@ -91,7 +94,7 @@ pub fn list_flows_in_scope(
         return list_flows(conn, kind);
     }
 
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT id, method, uri, status, started_at, host, port, path FROM flow
           WHERE {} ORDER BY id DESC",
         kind.where_clause()
