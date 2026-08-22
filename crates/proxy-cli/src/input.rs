@@ -176,7 +176,7 @@ impl Window {
             Window::Repeater => 'R',
             Window::Scope => 'C',
             Window::Findings => 'T',
-            Window::Notes => 'N',
+            Window::Notes => 'K',
             Window::Sitemap => 'S',
             Window::Automate => 'A',
         }
@@ -522,7 +522,7 @@ const NORMAL_MAP: &[(&str, Bind)] = &[
     // forward-all, and a window key you cannot press from every window is worse
     // than one with a duller mnemonic.
     ("T", Bind::Window(Window::Findings)),
-    ("N", Bind::Window(Window::Notes)),
+    ("K", Bind::Window(Window::Notes)),
     ("S", Bind::Window(Window::Sitemap)),
     ("A", Bind::Window(Window::Automate)),
     ("gt", Bind::WindowStep(1)),
