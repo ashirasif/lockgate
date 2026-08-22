@@ -12,6 +12,8 @@ proxy-core = { workspace = true }
 proxy-mcp = { path = "../proxy-mcp" }
 hudsucker = { workspace = true }
 ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures-util = { workspace = true }
 syntect = { workspace = true }
 two-face = { workspace = true }
 chrono = { workspace = true }

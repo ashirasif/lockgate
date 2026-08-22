@@ -33,7 +33,7 @@ exists but you will notice what is missing.
 | **Display** | HTTP syntax highlighting, syntect for bodies (JSON, HTML, XML, GraphQL, protobuf, JS-in-`<script>`, …), JSON/HTML pretty-printing, OSC 52 clipboard |
 | **MCP** | 33 tools: recon, intercept, scope, send, format, findings, notes. Resources for full bodies |
 | **Findings** | File a flow as a finding, triage severity and status by keystroke, retitle, delete. The write-up is edited in place with the same vim buffer the Repeater uses, `^g` to hand it to `$EDITOR` — one markdown document whose `## Reproduction` / `## Impact` / `## Remediation` sections are the prose columns a report is generated from. Saved on the way out. Also over MCP |
-| **Notes** | Project markdown documents in a window of their own (N), edited in place with the same vim buffer the Repeater uses, `^g` to hand one to `$EDITOR`. Saved on the way out — there is no `:w`. Full CRUD over MCP, so an agent's working notes and yours are the same list |
+| **Notes** | Project markdown documents in a window of their own (K), edited in place with the same vim buffer the Repeater uses, `^g` to hand one to `$EDITOR`. Saved on the way out — there is no `:w`. Full CRUD over MCP, so an agent's working notes and yours are the same list |
 | **WebSockets** | A window of their own (W), separate from the HTTP history, with the handshake and a live frame transcript per connection. Correlated to the upgrade, also over MCP. Observed, not intercepted |
 | **Compressed bodies** | gzip, deflate and brotli decoded for display and over MCP, re-encoded when an intercepted body is edited. Stored bytes are always what arrived |
 
@@ -140,7 +140,7 @@ replay.
 
 `?` is not a help key; `:help` prints the summary and `<C-k>` opens the command
 palette. Windows are `P` proxy, `W` websocket, `I` intercept, `R` repeater,
-`C` scope, `T` findings, `N` notes, `S` sitemap, `A` automate — `gt`/`gT` cycle.
+`C` scope, `T` findings, `K` notes, `S` sitemap, `A` automate — `gt`/`gT` cycle.
 
 | | |
 |---|---|
