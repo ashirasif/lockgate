@@ -1,5 +1,7 @@
 # lockgate
 
+![lockgate — browsing a capture, replaying a request, filing a finding](docs/demo.gif)
+
 An intercepting HTTP proxy for security testing, in the shape of Burp or Caido
 but driven from a terminal — and with an MCP server on the side so an agent can
 work the same capture, queue and scope you are looking at.
@@ -12,7 +14,6 @@ Two frontends over one engine:
 Both hold the same `Arc<Engine>` in one process, so there is one SQLite writer
 and neither can see stale state.
 
-![lockgate — browsing a capture, replaying a request, filing a finding](docs/demo.gif)
 
 Reading the history, folding the sitemap, sending a `401` to the Repeater and
 replaying it with a token attached, then filing the result as a finding — all of
