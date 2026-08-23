@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/proxy-core", "crates/proxy-cli", "crates/proxy-mcp"]
+members = ["crates/lockgate-core", "crates/lockgate-cli", "crates/lockgate-mcp"]
 
 # Versions are declared once here; member crates opt in with
 # `dep = { workspace = true }` so they can never drift apart.
 [workspace.dependencies]
-proxy-core = { path = "crates/proxy-core" }
+lockgate-core = { path = "crates/lockgate-core" }
 
 hudsucker = "=0.24.1"
 http-body-util = "0.1.4"

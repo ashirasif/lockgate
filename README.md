@@ -1,4 +1,4 @@
-# proxy
+# lockgate
 
 An intercepting HTTP proxy for security testing, in the shape of Burp or Caido
 but driven from a terminal — and with an MCP server on the side so an agent can
@@ -73,24 +73,24 @@ it intercept your traffic.
 # EC P-256 in PKCS#8 — the form rcgen expects. RSA parses but is not what this
 # is built against, so stick to this unless you have a reason not to.
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-  -out crates/proxy-core/src/ca/ca.key
+  -out crates/lockgate-core/src/ca/ca.key
 
 openssl req -x509 -new -nodes \
-  -key crates/proxy-core/src/ca/ca.key \
+  -key crates/lockgate-core/src/ca/ca.key \
   -sha256 -days 3650 \
-  -subj "/CN=proxy local CA" \
-  -out crates/proxy-core/src/ca/ca.cer
+  -subj "/CN=lockgate local CA" \
+  -out crates/lockgate-core/src/ca/ca.cer
 ```
 
 ### 2. Trust it on the device under test
 
-Nothing HTTPS works until the CA is trusted. `crates/proxy-core/src/ca/ca.cer`
+Nothing HTTPS works until the CA is trusted. `crates/lockgate-core/src/ca/ca.cer`
 is the file to install.
 
-Or, once the proxy is running, browse to **http://proxy/** through it — that is
+Or, once the proxy is running, browse to **http://lockgate/** through it — that is
 the only practical route onto a phone. `--export-ca <path>` writes the same file.
 
-- **macOS** — `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain crates/proxy-core/src/ca/ca.cer`
+- **macOS** — `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain crates/lockgate-core/src/ca/ca.cer`
 - **Firefox** — has its own store: Settings → Privacy & Security → Certificates → Import
 - **iOS/Android** — transfer the `.cer`, install it, then enable it for full trust in the OS certificate settings
 
@@ -113,7 +113,7 @@ and what non-interactive runs want so they land on a known project without a men
 waiting on input.
 
 Point a browser or `curl -x http://127.0.0.1:3000` at it. Project data lives in
-`~/.proxy`; naming a project both creates and reopens it.
+`~/.lockgate`; naming a project both creates and reopens it.
 
 `--mcp-port 0` turns the MCP server off, which is what lets a second instance
 run quietly alongside the first.
@@ -124,13 +124,13 @@ The MCP server is streamable HTTP at **`http://127.0.0.1:3001/mcp`**. Register i
 with an agent — for Claude Code:
 
 ```sh
-claude mcp add --transport http proxy http://127.0.0.1:3001/mcp
+claude mcp add --transport http lockgate http://127.0.0.1:3001/mcp
 ```
 
 and the agent gets the same 33 tools: survey flows, read full bodies as `flow://`
 resources, walk the sitemap and WebSocket frames, replay through scope, file
 findings, and keep notes alongside yours. A bundled skill at
-`.claude/skills/proxy-recon` teaches the recon loop and the conventions that are judgement rather than mechanics — redact captured
+`.claude/skills/lockgate-recon` teaches the recon loop and the conventions that are judgement rather than mechanics — redact captured
 secrets by default, rate severity against the threat model, set scope before a
 replay.
 
@@ -162,12 +162,12 @@ Digits are vim counts, never window bindings — which is why tab selection is
 ## Architecture
 
 ```
-proxy-core   engine, capture, storage, scope, intercept, wire-text codec
-proxy-mcp    MCP server (HTTP, not stdio — the TUI owns this process's stdio)
-proxy-cli    the TUI, and the binary that wires all three together
+lockgate-core   engine, capture, storage, scope, intercept, wire-text codec
+lockgate-mcp    MCP server (HTTP, not stdio — the TUI owns this process's stdio)
+lockgate-cli    the TUI, and the binary that wires all three together
 ```
 
-`proxy-core` knows nothing about presentation; the frontends depend on it and
+`lockgate-core` knows nothing about presentation; the frontends depend on it and
 never the other way around. Anything both frontends need lives there — which is
 why `http_text` (messages as editable wire text) and `pretty` moved down into it
 rather than staying in the TUI.

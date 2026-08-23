@@ -2,10 +2,10 @@
 
 # CA private key — machine-local secret, never commit. Regenerate with the
 # openssl commands in the README if you clone fresh.
-/crates/proxy-core/src/ca/ca.key
+/crates/lockgate-core/src/ca/ca.key
 
 # runtime log (TUI redirects tracing here)
-proxy.log
+lockgate.log
 
 # Claude Code's scratch space, including git worktrees it creates under
 # .claude/worktrees. Those are checkouts of this same repo — committing them
