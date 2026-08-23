@@ -13,3 +13,7 @@ lockgate.log
 # except versioned skills, which are part of the tool and travel with it.
 /.claude/*
 !/.claude/skills/
+
+# demo capture — rebuilt by docs/demo/seed.sh, never committed
+/docs/demo/.data
+/docs/demo/.data.pristine
