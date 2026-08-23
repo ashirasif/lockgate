@@ -12,6 +12,12 @@ Two frontends over one engine:
 Both hold the same `Arc<Engine>` in one process, so there is one SQLite writer
 and neither can see stale state.
 
+![lockgate — browsing a capture, replaying a request, filing a finding](docs/demo.gif)
+
+Reading the history, folding the sitemap, sending a `401` to the Repeater and
+replaying it with a token attached, then filing the result as a finding — all of
+it from the keyboard.
+
 ---
 
 ## Status
@@ -229,6 +235,11 @@ cargo fmt --all
 
 Tests are the documentation of intent here — most assert *why* something
 behaves as it does, not just that it does.
+
+The README GIF is regenerated rather than re-performed —
+`docs/demo/seed.sh` builds a throwaway capture against a local origin and
+`docs/demo/record.sh` renders it with [vhs](https://github.com/charmbracelet/vhs).
+See [docs/demo](docs/demo/README.md).
 
 ---
 
