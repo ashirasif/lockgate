@@ -25,15 +25,24 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-/// ANSI-Shadow wordmark. Fixed width (42 cells); the column is sized around it.
+/// ANSI-Shadow wordmark. Every line is [`LOGO_WIDTH`] cells wide — written down
+/// rather than measured, since none of it is ASCII and the width is fixed.
 const LOGO: &[&str] = &[
-    r"██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗",
-    r"██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝",
-    r"██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ ",
-    r"██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝  ",
-    r"██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   ",
-    r"╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ",
+    r"██╗      ██████╗  ██████╗ ██╗  ██╗ ██████╗  █████╗ ████████╗███████╗",
+    r"██║     ██╔═══██╗██╔════╝ ██║ ██╔╝██╔════╝ ██╔══██╗╚══██╔══╝██╔════╝",
+    r"██║     ██║   ██║██║      █████╔╝ ██║  ███╗███████║   ██║   █████╗  ",
+    r"██║     ██║   ██║██║      ██╔═██╗ ██║   ██║██╔══██║   ██║   ██╔══╝  ",
+    r"███████╗╚██████╔╝╚██████╗ ██║  ██╗╚██████╔╝██║  ██║   ██║   ███████╗",
+    r"╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝",
 ];
+
+/// Cells the wordmark occupies. The word is long enough that a terminal can be
+/// narrower than it, so the art is not unconditional — see [`LOGO_PLAIN`].
+const LOGO_WIDTH: u16 = 68;
+
+/// What a terminal too narrow for the art gets instead. Truncated block letters
+/// read as corruption; a plain word reads as a name.
+const LOGO_PLAIN: &str = "lockgate";
 
 /// The centred column's width. Wide enough for the logo, narrow enough to feel
 /// like a prompt rather than a page.
@@ -226,12 +235,14 @@ impl<'a> Picker<'a> {
 
     fn draw(&self, frame: &mut Frame) {
         let width = WIDTH.min(frame.area().width);
-        // logo(6) + tagline(1) + gap(1) + input(3) + rows(5) + gap(1) + hint(1).
-        let height = 18u16.min(frame.area().height);
+        let art = frame.area().width >= LOGO_WIDTH;
+        let logo_height = if art { LOGO.len() as u16 } else { 1 };
+        // logo + tagline(1) + gap(1) + input(3) + rows(5) + gap(1) + hint(1).
+        let height = (logo_height + 12).min(frame.area().height);
         let column = center(frame.area(), width, height);
 
         let [logo, tagline, _gap, input, rows, _gap2, hint] = Layout::vertical([
-            Constraint::Length(LOGO.len() as u16),
+            Constraint::Length(logo_height),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(3),
@@ -241,7 +252,16 @@ impl<'a> Picker<'a> {
         ])
         .areas(column);
 
-        self.draw_logo(frame, logo);
+        // The wordmark is wider than the prompt column, so it gets the whole
+        // frame to centre itself in while everything below stays a prompt.
+        self.draw_logo(
+            frame,
+            Rect {
+                x: frame.area().x,
+                width: frame.area().width,
+                ..logo
+            },
+        );
         frame.render_widget(
             Line::from(format!(
                 "an intercepting proxy · v{}",
@@ -257,10 +277,18 @@ impl<'a> Picker<'a> {
     }
 
     fn draw_logo(&self, frame: &mut Frame, area: Rect) {
-        let lines: Vec<Line> = LOGO
-            .iter()
-            .map(|l| Line::from(*l).centered().fg(Color::Cyan))
-            .collect();
+        let lines: Vec<Line> = if area.width >= LOGO_WIDTH {
+            LOGO.iter()
+                .map(|l| Line::from(*l).centered().fg(Color::Cyan))
+                .collect()
+        } else {
+            vec![
+                Line::from(LOGO_PLAIN)
+                    .centered()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ]
+        };
         frame.render_widget(Paragraph::new(lines), area);
     }
 
@@ -449,9 +477,14 @@ mod tests {
     }
 
     /// Render a picker to an in-memory buffer, one `String` per row, so we can
-    /// assert on layout and content the way the TUI tests do.
+    /// assert on layout and content the way the TUI tests do. 80 columns: wide
+    /// enough for the wordmark, which is what a real terminal usually is.
     fn render(picker: &Picker) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        render_at(picker, 80)
+    }
+
+    fn render_at(picker: &Picker, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|frame| picker.draw(frame)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let width = buffer.area.width as usize;
@@ -484,6 +517,18 @@ mod tests {
         assert!(screen.contains("acme"), "project missing");
         assert!(screen.contains("opened"), "recency missing");
         assert!(screen.contains("esc quit"), "hint missing");
+    }
+
+    /// Narrower than the wordmark. Truncated block letters would read as a
+    /// corrupt screen, so the name is spelled out instead.
+    #[test]
+    fn a_narrow_terminal_gets_the_plain_wordmark() {
+        let (registry, dir) = seeded(&["acme"]);
+        let picker = Picker::new(&registry, &dir);
+        let screen = render_at(&picker, 60);
+        assert!(!screen.contains("██████"), "art should not be truncated in");
+        assert!(screen.contains("lockgate"), "plain wordmark missing");
+        assert!(screen.contains("acme"), "the picker still works");
     }
 
     #[test]

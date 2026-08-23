@@ -54,4 +54,3 @@ repository = "https://github.com/ashirasif/lockgate"
 # something an operator runs, not something anyone debugs. Backtraces still
 # name the crate and are recoverable by building without this.
 strip = true
-debug = true
