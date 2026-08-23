@@ -45,6 +45,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Muhammad Ashir"]
+repository = "https://github.com/ashirasif/proxy"
 
 [profile.release]
 # Symbols are ~4.5MB of a 20MB binary and buy nothing here: a release build is

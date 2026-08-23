@@ -229,3 +229,10 @@ cargo fmt --all
 
 Tests are the documentation of intent here — most assert *why* something
 behaves as it does, not just that it does.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it, fork it, sell it; just keep the copyright
+notice.
