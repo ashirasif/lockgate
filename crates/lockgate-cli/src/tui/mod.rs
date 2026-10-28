@@ -443,9 +443,17 @@ struct App {
     /// window — the state has nothing left to remember.
     ws_offset: usize,
     ws_row: usize,
+    /// Flow ids removed from *view* — `d` in the Proxy and WebSocket windows.
+    ///
+    /// Nothing is deleted: the rows stay in the database, the MCP sees them,
+    /// and a restart shows them again. Both lists draw from one `flow` table,
+    /// so one id set covers the HTTP and WebSocket histories alike, and the
+    /// set lives only as long as the session — which is what makes hiding a
+    /// safe thing to do to a capture you cannot re-take.
+    hidden: HashSet<u64>,
     /// Set when something other than the engine changes what the history
-    /// lists should contain — which is only ever the scope filter, since that
-    /// is applied at read time rather than being a property of the capture.
+    /// lists should contain — the scope filter or a hide, both applied at
+    /// read time rather than being properties of the capture.
     flows_stale: bool,
     /// Which flow `detail` was read for, so a cursor that has not moved does
     /// not pay for the read again.
@@ -543,6 +551,7 @@ impl App {
             ws_flows: Vec::new(),
             ws_offset: 0,
             ws_row: 0,
+            hidden: HashSet::new(),
             flows_stale: false,
             detail_id: None,
             detail: None,
@@ -713,6 +722,12 @@ impl App {
         } else {
             self.engine.list_ws_flows()
         };
+        // Hiding is a view concern like scope: applied after the read, so the
+        // engine never learns about it and every hidden row is still on disk.
+        if !self.hidden.is_empty() {
+            self.flows.retain(|f| !self.hidden.contains(&f.id));
+            self.ws_flows.retain(|f| !self.hidden.contains(&f.id));
+        }
         self.ws_row = self.ws_row.min(self.ws_flows.len().saturating_sub(1));
 
         match pinned.and_then(|id| self.flows.iter().position(|f| f.id == id)) {

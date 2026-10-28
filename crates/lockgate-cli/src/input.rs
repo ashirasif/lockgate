@@ -288,7 +288,12 @@ pub enum Action {
     ToggleIntercept,
     /// `<Space>s` — snapshot the selection into the Repeater for editing.
     SendToRepeater,
-    /// `<CR>` on a sitemap row — fold or unfold it.
+    /// `d` in the Proxy / WebSocket windows — take the selected history rows
+    /// out of view. Not a delete: the capture is untouched, `:unhide` brings
+    /// them back.
+    HideSelection,
+    /// Restore everything hidden this session.
+    UnhideAll,
     Toggle,
     /// `<CR>` on a queue row — step into the preview for that item.
     Enter,
@@ -369,6 +374,7 @@ enum Bind {
         forward: bool,
     },
     ToggleView,
+    HideSelection,
 }
 
 /// Bindings that only apply inside one window, checked before [`NORMAL_MAP`].
@@ -416,6 +422,11 @@ const WINDOW_MAP: &[(Window, &str, Bind)] = &[
     // Sitemap: put the highlighted host in scope, or take it out again.
     (Window::Sitemap, "a", Bind::ScopeAddHost),
     (Window::Sitemap, "d", Bind::ScopeRemoveHost),
+    // The histories are lists, not text: `d` has no line to operate on there,
+    // so the same escape hatch that spends it on Intercept's queue spends it
+    // here on removing a row from view (visual selection included).
+    (Window::Proxy, "d", Bind::HideSelection),
+    (Window::WebSocket, "d", Bind::HideSelection),
     // Scope: `<CR>` activates a scope or toggles a rule, depending on which
     // pane has the keys — the same "act on what is highlighted" shape the
     // other windows use. Patterns are free text, so the keys that need one
@@ -796,6 +807,7 @@ impl Input {
             Bind::SelectSession => Action::SelectSession(count),
             Bind::History { forward } => Action::History { forward },
             Bind::ToggleView => Action::ToggleView,
+            Bind::HideSelection => Action::HideSelection,
             Bind::Toggle => Action::Toggle,
             Bind::Enter => Action::Enter,
             Bind::ExternalEdit => Action::ExternalEdit,
@@ -1188,10 +1200,11 @@ mod tests {
 
     /// The keys vim reserves must stay reserved, or muscle memory starts lying.
     /// `i` has left this list: there are editable buffers now, and it does in
-    /// here exactly what it does in vim.
+    /// here exactly what it does in vim. `d` left it for the Proxy window only
+    /// — see [`f_and_d_stay_free_in_other_windows`].
     #[test]
     fn vim_reserved_keys_are_unbound() {
-        for key in ["q", "r", "x", "d", "c", "y", "p"] {
+        for key in ["q", "r", "x", "c", "y", "p"] {
             let mut input = Input::new();
             assert!(
                 feed(&mut input, key).is_empty(),
@@ -1328,18 +1341,34 @@ mod tests {
 
     #[test]
     fn f_and_d_stay_free_in_other_windows() {
-        // Proxy and Repeater can both put a text buffer under the cursor, so
-        // `d` there has to stay the delete operator.
-        for window in [Window::Proxy, Window::Repeater] {
+        // The Repeater can put a text buffer under the cursor, so `d` there
+        // has to stay the delete operator.
+        let mut input = Input::new();
+        input.set_window(Window::Repeater);
+        assert!(
+            feed(&mut input, "f").is_empty(),
+            "f should be unbound in Repeater"
+        );
+        assert!(
+            feed(&mut input, "d").is_empty(),
+            "d should be unbound in Repeater"
+        );
+
+        // Proxy's panes are read-only — there is no buffer for the delete
+        // operator to touch — so `d` is spent on the history instead: it takes
+        // the row out of view. WebSocket, a list with no buffer at all, spends
+        // it the same way.
+        for window in [Window::Proxy, Window::WebSocket] {
             let mut input = Input::new();
             input.set_window(window);
             assert!(
                 feed(&mut input, "f").is_empty(),
                 "f should be unbound in {window:?}"
             );
-            assert!(
-                feed(&mut input, "d").is_empty(),
-                "d should be unbound in {window:?}"
+            assert_eq!(
+                feed(&mut input, "d"),
+                vec![Action::HideSelection],
+                "d hides the row in {window:?}"
             );
         }
 

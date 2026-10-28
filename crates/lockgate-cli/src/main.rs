@@ -140,9 +140,9 @@ async fn main() -> std::io::Result<()> {
     // writer. A failure here (e.g. the port is taken) must not take the proxy or
     // TUI down: log it and carry on without the MCP.
     //
-    // Port 0 means the operator turned it off — running a second instance
-    // otherwise logs a bind failure that looks like a bug.
-    if args.mcp_port != 0 {
+    // Port 0 or `--no-mcp` means the operator turned it off — running a second
+    // instance otherwise logs a bind failure that looks like a bug.
+    if args.mcp_port != 0 && !args.no_mcp {
         let mcp_engine = engine.clone();
         let mcp_addr = args.mcp_addr();
         tokio::spawn(async move {
@@ -155,15 +155,32 @@ async fn main() -> std::io::Result<()> {
     // Whichever way we leave — clean quit, TUI error, or a signal — the writer
     // has to drain first, or the last batch of captured traffic dies with the
     // process.
-    let result = tokio::select! {
-        result = tui::run(engine.clone()) => result,
-        _ = terminate_signal() => {
-            // The TUI future is dropped here, part-way through its loop, so the
-            // `ratatui::restore()` at the end of `tui::run` never runs. Undo the
-            // raw mode and alternate screen ourselves; skipping this leaves the
-            // user staring at an unusable terminal.
-            ratatui::restore();
-            Ok(())
+    let result = if args.no_tui {
+        // Headless: nobody owns the terminal, so say where to point things and
+        // sit on the signal. There is no TUI future to race, and `ratatui`
+        // never ran, so there is nothing to restore either.
+        let mcp = if args.mcp_port != 0 && !args.no_mcp {
+            format!(", MCP http://{}/mcp", args.mcp_addr())
+        } else {
+            String::new()
+        };
+        println!(
+            "lockgate — proxy http://{}{mcp} — Ctrl-C to stop",
+            args.proxy_addr()
+        );
+        terminate_signal().await;
+        Ok(())
+    } else {
+        tokio::select! {
+            result = tui::run(engine.clone()) => result,
+            _ = terminate_signal() => {
+                // The TUI future is dropped here, part-way through its loop, so the
+                // `ratatui::restore()` at the end of `tui::run` never runs. Undo the
+                // raw mode and alternate screen ourselves; skipping this leaves the
+                // user staring at an unusable terminal.
+                ratatui::restore();
+                Ok(())
+            }
         }
     };
 

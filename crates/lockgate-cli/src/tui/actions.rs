@@ -287,6 +287,8 @@ impl App {
             Action::CycleStatus => self.cycle_finding(false),
             Action::ScopeAddHost => self.scope_add_host(),
             Action::ScopeRemoveHost => self.scope_remove_host(),
+            Action::HideSelection => self.hide_selection(),
+            Action::UnhideAll => self.unhide_all(),
             Action::NewSession => {
                 self.repeater.open();
                 self.content_scroll = 0;

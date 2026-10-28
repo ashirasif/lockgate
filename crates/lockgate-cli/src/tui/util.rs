@@ -3,7 +3,7 @@
 use super::*;
 
 /// Shown by `:help`. Deliberately lists only what differs from plain vim.
-pub(super) const HELP: &str = "^k palette · P/W/I/R/C/T/K/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · Findings (T): <CR> write up (## Reproduction/Impact/Remediation are sections), s severity, c status, r retitle, d delete, <Space>f file · Notes (K): n new, <CR> edit, r retitle, d delete, <Space>n new from anywhere · :q";
+pub(super) const HELP: &str = "^k palette · P/W/I/R/C/T/K/S/A windows, gt/gT cycle · <CR> edit: vim motions w/W b/B e ^ $ f{c}, operators d/c/y + motion|iw|aw|i\"|i(, v/V visual, counts (2d3w), u/^r · gq format body · ^g $EDITOR · Histories (P/W): d hide row from view (V+d range), :unhide restores · Repeater: n new tab, x close, {count}gs switch, [ ] history, p raw/pretty · Intercept: <Space>i hold, ^w pane, f/d answer · Scope (C): n new, a include, x exclude, d delete, <CR> activate, <Space>c bypass; Sitemap: a/d scope host · Findings (T): <CR> write up (## Reproduction/Impact/Remediation are sections), s severity, c status, r retitle, d delete, <Space>f file · Notes (K): n new, <CR> edit, r retitle, d delete, <Space>n new from anywhere · :q";
 
 /// Move a row cursor by a motion, clamped to `last`. The row-cursor windows
 /// (Intercept, Sitemap) have no jumplist or search, so this is the whole of

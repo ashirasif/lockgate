@@ -38,6 +38,10 @@ pub enum Command {
         verb: String,
         argument: String,
     },
+    /// `:unhide` — bring back everything `d` removed from the histories.
+    /// Listed because undoing a thing you can do blind needs a name, not a
+    /// chord nobody remembers.
+    Unhide,
     Help,
     Unknown(String),
 }
@@ -73,6 +77,7 @@ impl Command {
                 Command::Scope { verb, argument }
             }
             "set" => parse_set(rest),
+            "unhide" | "uh" => Command::Unhide,
             _ => Command::Unknown(name.to_string()),
         })
     }
@@ -102,6 +107,12 @@ mod tests {
         assert_eq!(Command::parse("quit"), Some(Command::Quit));
         assert_eq!(Command::parse("resend"), Some(Command::Resend));
         assert_eq!(Command::parse("rep"), Some(Command::Resend));
+    }
+
+    #[test]
+    fn unhide_parses_with_its_abbreviation() {
+        assert_eq!(Command::parse("unhide"), Some(Command::Unhide));
+        assert_eq!(Command::parse("uh"), Some(Command::Unhide));
     }
 
     #[test]

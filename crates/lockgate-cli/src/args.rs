@@ -26,6 +26,9 @@ OPTIONS:
         --project <NAME>     Open this project directly, skipping the picker
         --data-dir <PATH>    Where projects live (default ~/.lockgate)
         --export-ca <PATH>   Write the CA certificate here and exit
+        --no-tui             Run without the terminal UI (proxy + MCP only;
+                             needs --project, since the picker needs a terminal)
+        --no-mcp             Run without the MCP server (TUI + proxy only)
     -h, --help               Print this
     -V, --version            Print the version
 
@@ -48,6 +51,13 @@ pub struct Args {
     /// touch the filesystem, which is what makes it testable.
     pub data_dir: Option<PathBuf>,
     pub export_ca: Option<PathBuf>,
+    /// Run the proxy and MCP server without taking over the terminal — the
+    /// headless shape a server or container wants, where an agent drives
+    /// everything through the MCP.
+    pub no_tui: bool,
+    /// Skip the MCP server: the TUI and proxy only. Same effect as
+    /// `--mcp-port 0`, spelled as its own flag so it is discoverable.
+    pub no_mcp: bool,
 }
 
 impl Default for Args {
@@ -59,6 +69,8 @@ impl Default for Args {
             project: None,
             data_dir: None,
             export_ca: None,
+            no_tui: false,
+            no_mcp: false,
         }
     }
 }
@@ -136,10 +148,19 @@ where
                 Ok(path) => args.export_ca = Some(PathBuf::from(path)),
                 Err(e) => return Parsed::Error(e),
             },
+            "--no-tui" => args.no_tui = true,
+            "--no-mcp" => args.no_mcp = true,
             other => {
                 return Parsed::Error(format!("unknown argument: {other}\n\nTry --help."));
             }
         }
+    }
+
+    // The picker is a TUI, so headless mode has no way to choose a project:
+    // refusing here beats starting a process that blocks forever on a menu
+    // nobody can see.
+    if args.no_tui && args.project.is_none() {
+        return Parsed::Error("--no-tui needs --project: the picker needs a terminal".into());
     }
 
     Parsed::Run(Box::new(args))
@@ -241,6 +262,31 @@ mod tests {
         assert_eq!(run(&["--mcp-port", "0"]).mcp_port, 0);
     }
 
+    /// Each front-end can run on its own: `--no-tui` for a headless proxy
+    /// driven through the MCP, `--no-mcp` for a purely interactive session.
+    #[test]
+    fn either_frontend_can_be_switched_off() {
+        let args = run(&["--no-tui", "--project", "acme"]);
+        assert!(args.no_tui);
+        assert!(!args.no_mcp);
+        let args = run(&["--no-mcp"]);
+        assert!(args.no_mcp);
+        assert!(!args.no_tui);
+    }
+
+    /// The startup picker needs a terminal, so headless mode has to name its
+    /// project — otherwise the process would wait on a menu nobody can see.
+    #[test]
+    fn headless_needs_a_project() {
+        let e = error(&["--no-tui"]);
+        assert!(e.contains("--no-tui needs --project"), "{e}");
+        // And naming one is enough.
+        assert!(matches!(
+            parse(["--no-tui", "--project", "acme"]),
+            Parsed::Run(_)
+        ));
+    }
+
     #[test]
     fn export_ca_is_a_path() {
         let args = run(&["--export-ca", "/tmp/ca.cer"]);
@@ -256,6 +302,8 @@ mod tests {
             "--project",
             "--data-dir",
             "--export-ca",
+            "--no-tui",
+            "--no-mcp",
         ] {
             assert!(USAGE.contains(flag), "{flag} missing from --help");
         }

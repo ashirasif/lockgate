@@ -122,8 +122,17 @@ waiting on input.
 Point a browser or `curl -x http://127.0.0.1:3000` at it. Project data lives in
 `~/.lockgate`; naming a project both creates and reopens it.
 
-`--mcp-port 0` turns the MCP server off, which is what lets a second instance
-run quietly alongside the first.
+Either front-end can run on its own:
+
+```sh
+cargo run --release -- --no-tui --project acme   # headless: proxy + MCP, driven by an agent
+cargo run --release -- --no-mcp --project acme   # interactive: TUI + proxy, no MCP server
+```
+
+`--no-tui` needs `--project` — the startup picker is itself a TUI. `--mcp-port 0`
+turns the MCP server off too (same effect as `--no-mcp`), which is what lets a
+second instance run quietly alongside the first.
+
 
 ### 4. Drive it from an agent
 
@@ -152,7 +161,8 @@ palette. Windows are `P` proxy, `W` websocket, `I` intercept, `R` repeater,
 | | |
 |---|---|
 | **Everywhere** | `<Space>r` resend · `<Space>s` send to Repeater · `<Space>i` toggle hold · `<Space>c` bypass scope · `<Space>f` file a finding · `<Space>n` start a note · `:q` quit |
-| **WebSocket** | `j`/`k` move between connections · the selected one's handshake and frames show below |
+| **Histories** | `d` hide the row from view (`V` first for a range) · `:unhide` bring everything back — nothing is deleted |
+| **WebSocket** | `j`/`k` move between connections · `d` hide the connection · the selected one's handshake and frames show below |
 | **Intercept** | `f` forward · `d` drop · `F`/`D` all · `<C-w>` switch pane · `<CR>` open preview |
 | **Repeater** | `n` new tab · `x` close · `gs` / `{count}gs` switch · `[` `]` history · `p` raw/pretty |
 | **Scope** | `n` new · `a` include · `x` exclude · `d` delete · `<CR>` activate or toggle · `<C-w>` switch pane |

@@ -803,6 +803,86 @@ fn scope_filters_the_ws_history() {
     assert!(app.ws_flows[0].uri.to_string().contains("in.test"));
 }
 
+// --- hiding ---
+
+/// `d` removes the row from the history list, and only from there: what the
+/// engine holds is the capture, and hiding must not touch it.
+#[test]
+fn d_hides_a_flow_from_the_history_without_deleting_it() {
+    let engine = engine_with(3);
+    let mut app = App::new(engine.clone());
+    app.refresh();
+    assert_eq!(app.flows.len(), 3);
+
+    press(&mut app, "d");
+    assert_eq!(app.flows.len(), 2, "the row leaves the list");
+    assert_eq!(engine.list_flows().len(), 3, "the capture keeps it");
+    // The cursor stays put, so the flow that slid up is now under it.
+    assert_eq!(app.cursor(), 0);
+    let status = app.status.lock().unwrap().clone();
+    assert!(status.contains(":unhide"), "{status}");
+}
+
+/// A visual range hides as one, the same shape `<Space>r` resends as one.
+#[test]
+fn a_visual_range_hides_as_one() {
+    let engine = engine_with(4);
+    let mut app = App::new(engine);
+    app.refresh();
+
+    press(&mut app, "Vjd");
+    assert_eq!(app.flows.len(), 2);
+}
+
+/// `:unhide` brings back everything hidden this session.
+#[test]
+fn unhide_restores_what_was_hidden() {
+    let engine = engine_with(3);
+    let mut app = App::new(engine);
+    app.refresh();
+
+    press(&mut app, "dd");
+    assert_eq!(app.flows.len(), 1);
+
+    app.run_command("unhide");
+    assert_eq!(app.flows.len(), 3);
+    assert!(app.hidden.is_empty());
+}
+
+/// The WS window hides its connections the same way: same key, same set —
+/// and the frames are still on disk underneath.
+#[test]
+fn d_hides_a_websocket_connection() {
+    let engine = Engine::new();
+    record_ws(&engine, "https://a.test/socket");
+    record_ws(&engine, "https://b.test/socket");
+    let mut app = App::new(engine.clone());
+    app.refresh();
+    app.show_window(Window::WebSocket);
+
+    press(&mut app, "d");
+    assert_eq!(app.ws_flows.len(), 1);
+    assert_eq!(engine.list_ws_flows().len(), 2, "the capture keeps it");
+
+    app.run_command("unhide");
+    assert_eq!(app.ws_flows.len(), 2);
+}
+
+/// Bypassing scope widens what the engine returns; it must not quietly
+/// resurrect rows the operator removed from view.
+#[test]
+fn hiding_survives_a_scope_bypass() {
+    let engine = engine_with(2);
+    let mut app = App::new(engine);
+    app.refresh();
+
+    press(&mut app, "d");
+    assert_eq!(app.flows.len(), 1);
+
+    app.set_scope_filter(false);
+    assert_eq!(app.flows.len(), 1, "bypass undoes scope, not hiding");
+}
+
 // --- findings ---
 
 #[tokio::test]

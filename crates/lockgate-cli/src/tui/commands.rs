@@ -727,6 +727,15 @@ impl App {
         }
         commands.push(("Resend selection".into(), Action::Resend));
         commands.push(("Send selection to Repeater".into(), Action::SendToRepeater));
+        commands.push(("Hide selection from history".into(), Action::HideSelection));
+        // Only offered when it has something to do — the same rule the
+        // forward-all/drop-all entries follow just below.
+        if !self.hidden.is_empty() {
+            commands.push((
+                format!("Restore {} hidden flow(s)", self.hidden.len()),
+                Action::UnhideAll,
+            ));
+        }
         // Reads its own state, so the label says what will happen rather than
         // what is true — the same shape as the `rnu` toggle below.
         commands.push((
@@ -885,6 +894,7 @@ impl App {
             Command::Note(title) => self.create_note(&title),
             Command::RenameNote(title) => self.rename_note(&title),
             Command::Scope { verb, argument } => self.run_scope_command(&verb, &argument),
+            Command::Unhide => self.unhide_all(),
             Command::Help => self.note(HELP),
             Command::Unknown(name) => self.note(&format!("E492: not an editor command: {name}")),
         }
@@ -940,6 +950,56 @@ impl App {
         } else {
             "scope bypassed — showing everything"
         });
+    }
+
+    /// `d` in the histories — take the selected rows out of view.
+    ///
+    /// A view-level edit, like the scope filter: the capture itself is
+    /// untouched, so the MCP and a restart still see everything. That is the
+    /// whole point — this has to be safe to reach for on a capture you cannot
+    /// re-take.
+    pub(super) fn hide_selection(&mut self) {
+        // The WebSocket window hides its cursor's connection; Proxy hides the
+        // selection, visual range included — the same shape `<Space>r`
+        // resends.
+        let ids: Vec<u64> = if self.window == Window::WebSocket {
+            self.ws_flows
+                .get(self.ws_row)
+                .map(|f| f.id)
+                .into_iter()
+                .collect()
+        } else {
+            self.selected_rows()
+                .filter_map(|row| self.flows.get(row).map(|f| f.id))
+                .collect()
+        };
+        if ids.is_empty() {
+            self.note("nothing to hide");
+            return;
+        }
+        let n = ids.len();
+        for id in ids {
+            self.hidden.insert(id);
+        }
+        // The lists are read from the engine, so removing rows means reading
+        // them again — and the engine has not moved, so nothing else would
+        // ask for that.
+        self.flows_stale = true;
+        self.refresh();
+        self.note(&format!("{n} hidden — :unhide restores; nothing was deleted"));
+    }
+
+    /// `:unhide` — bring back everything hidden this session.
+    pub(super) fn unhide_all(&mut self) {
+        if self.hidden.is_empty() {
+            self.note("nothing is hidden");
+            return;
+        }
+        let n = self.hidden.len();
+        self.hidden.clear();
+        self.flows_stale = true;
+        self.refresh();
+        self.note(&format!("restored {n} flow(s)"));
     }
 
     pub(super) fn move_cursor(&mut self, motion: Motion, count: Option<usize>) {
