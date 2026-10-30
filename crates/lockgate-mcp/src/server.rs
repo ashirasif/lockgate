@@ -18,7 +18,9 @@
 
 use std::sync::Arc;
 
-use lockgate_core::{Engine, FlowQuery, Held, NewFinding, Pending, ResendError, Side, http_text};
+use lockgate_core::{
+    Engine, FlowQuery, Held, NewFinding, NewIdentity, Pending, ResendError, Side, http_text,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
@@ -31,8 +33,8 @@ use rmcp::{RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router}
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{
-    BodyPreview, FindingDto, FlowDetailDto, FlowDto, NoteDto, SitemapNodeDto, detail_headers,
-    encode_bytes,
+    BodyPreview, FindingDto, FlowDetailDto, FlowDto, IdentityDto, LeadDto, MaterialisedFileDto,
+    NoteDto, SitemapNodeDto, detail_headers, encode_bytes,
 };
 
 /// Default and ceiling on how many rows a listing returns. A ceiling matters
@@ -318,6 +320,12 @@ pub struct SendRequestParams {
     /// carries an origin-form target like `/path`. Omit only if the start line
     /// has an absolute URL or the text has a Host header.
     pub base_flow_id: Option<i64>,
+    /// Send *as* an identity: that identity's cookie jar replaces whatever
+    /// Cookie header the text carries. Scope still gates the send.
+    pub as_identity: Option<i64>,
+    /// Label the recorded flow with what this send was *for* — the lead or
+    /// question it answers. list_flows filters on it exactly.
+    pub tag: Option<String>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -368,6 +376,9 @@ pub struct ListFlowsParams {
     pub uri_contains: Option<String>,
     /// Only flows whose response has this status code.
     pub status: Option<u16>,
+    /// Exact tag match — the label a send carried (`lead:idor-3`). This is how
+    /// agent traffic is grouped by the question that produced it.
+    pub tag: Option<String>,
     /// Include Automate/Intruder-generated flows, which are hidden by default so
     /// a survey shows real traffic, not tool output. Ignored when `source` is set
     /// (an explicit source wins). Default false.
@@ -418,6 +429,15 @@ pub struct ResendFlowParams {
     /// The flow to replay. Its request is sent straight at the target and the
     /// fresh response is summarised here; the replay is recorded as a new flow.
     pub id: i64,
+    /// Send it *as* an identity: that identity's cookie jar replaces the
+    /// request's, so the replay is what that session would have sent — the
+    /// access-control primitive. Replay the same request under two identities
+    /// and diff the answers. Scope still gates the send.
+    pub as_identity: Option<i64>,
+    /// Label this replay with what it was *for* — `lead:idor-3`, `verify-cors`.
+    /// list_flows filters on it exactly, so evidence can be grouped by the
+    /// question that produced it.
+    pub tag: Option<String>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -561,6 +581,241 @@ pub struct RowsChangedResult {
     pub rows_changed: u64,
 }
 
+// --- identities ---
+
+/// One cookie supplied to create/update an identity. Values are accepted here
+/// (how else would a jar be built) and never reported back — reads return
+/// names, scopes and lengths only.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CookieInput {
+    pub name: String,
+    pub value: String,
+    /// The host (or parent domain) the cookie applies to. Defaults to the
+    /// identity's host when omitted there too — a jar then scoped entirely by
+    /// the host column.
+    pub domain: Option<String>,
+    /// Default "/".
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CreateIdentityParams {
+    /// A unique name — what `as_identity` takes. Name it for the role, not the
+    /// target: "admin", "user", "acme-user".
+    pub name: String,
+    /// The host the session belongs to. When set, replays are only offered the
+    /// jar for that host (per-cookie domains still scope the individual
+    /// cookies).
+    pub host: Option<String>,
+    #[serde(default)]
+    pub cookies: Vec<CookieInput>,
+    /// A base32 TOTP seed, when the login demands one — the code the agent
+    /// would need to re-derive at re-login. Store the *secret*, not a code.
+    pub totp_secret: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct IdentityIdParams {
+    pub identity_id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct UpdateIdentityParams {
+    pub identity_id: i64,
+    /// Omit to leave as is. Must stay unique.
+    pub name: Option<String>,
+    /// Omit to leave as is; "" clears the host binding.
+    pub host: Option<String>,
+    /// Omit to leave as is; "" clears the secret.
+    pub totp_secret: Option<String>,
+    /// Omit to leave as is; "" clears it.
+    pub note: Option<String>,
+    /// When given, replaces the whole jar. Omit to leave it alone.
+    pub cookies: Option<Vec<CookieInput>>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AdoptSessionParams {
+    /// A flow that shows the session — ideally one captured right after login,
+    /// so the response's Set-Cookie headers are on it.
+    pub flow_id: i64,
+    /// Name for the new identity.
+    pub name: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListIdentitiesResult {
+    pub identities: Vec<IdentityDto>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct IdentityIdResult {
+    pub identity_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct AdoptSessionResult {
+    pub identity_id: i64,
+    pub cookie_count: i64,
+    /// The host the session was captured on — now the identity's binding.
+    pub host: Option<String>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct BrowserEnsureResult {
+    /// The endpoint a browser client attaches to, e.g. http://127.0.0.1:9222.
+    pub cdp_url: String,
+    /// True when this call launched Chrome; false when one already listened.
+    pub spawned: bool,
+    /// The user-data-dir the browser carries its sessions in.
+    pub profile: String,
+    pub binary: String,
+    /// Headless (a VPS, or explicitly asked) — pages render, no window shows.
+    pub headless: bool,
+}
+
+// --- policy ---
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct PolicyRuleDto {
+    pub id: i64,
+    /// Today only `forbid_url_regex`.
+    pub kind: String,
+    pub pattern: String,
+    pub note: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct GetPolicyResult {
+    /// Max sends per second per host on the replay path. Null = unlimited.
+    pub rate_per_sec: Option<f64>,
+    pub note: Option<String>,
+    pub rules: Vec<PolicyRuleDto>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SetRateLimitParams {
+    /// Max sends per second per host on the replay path — the pace an agent's
+    /// fuzz loop may hold. `0` lifts the ceiling. Applies to every send path:
+    /// TUI, resend_flow, send_request.
+    pub per_host_per_sec: f64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AddPolicyRuleParams {
+    /// Only `forbid_url_regex` today. The pattern is matched unanchored —
+    /// write `^…$` when you mean exact.
+    pub kind: Option<String>,
+    /// URLs matching this are refused before anything leaves, in every send
+    /// path. This is the out-of-bounds list: r"^https://target\.com/pay",
+    /// r"tenant_b\.".
+    pub pattern: String,
+    /// Why it exists — future-you reads this.
+    pub note: Option<String>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct PolicyIdResult {
+    pub rule_id: i64,
+}
+
+// --- leads ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CreateLeadParams {
+    /// idor | authz | ratelimit | injection | logic | config | exposure | other
+    pub kind: String,
+    pub title: String,
+    /// Why this looks worth a probe: the observation, the mechanism you
+    /// suspect, what an attacker with the stated position could do.
+    pub rationale_md: String,
+    /// The URL the lead concerns.
+    pub endpoint: Option<String>,
+    /// The flow that inspired it, when there is one.
+    pub flow_id: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ListLeadsParams {
+    /// Only leads in this status. Omit for all.
+    pub status: Option<String>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListLeadsResult {
+    pub leads: Vec<LeadDto>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct LeadIdResult {
+    pub lead_id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct LeadIdParams {
+    pub lead_id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct UpdateLeadParams {
+    pub lead_id: i64,
+    /// proposed | verifying | verified | refuted | reported. Settling on
+    /// verified/refuted requires the verdict and control below — a conclusion
+    /// without the discriminating check is refused, in code.
+    pub status: Option<String>,
+    /// What actually happened when you probed it.
+    pub verdict: Option<String>,
+    /// The baseline-vs-exploit check that discriminates bug from intended
+    /// behaviour ("same request, tenant B's id: 200 vs 403").
+    pub control: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AdjudicateLeadParams {
+    pub lead_id: i64,
+    /// admissible | refuted
+    pub ruling: String,
+    /// Why — a ruling without its why is a vote.
+    pub ruling_reason: String,
+}
+
+// --- materialise / report / scan ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MaterialiseParams {
+    /// Directory to write the index into. Created if absent; the files it
+    /// owns are replaced. Relative paths resolve against the process cwd.
+    pub dir: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MaterialiseResult {
+    pub dir: String,
+    pub files: Vec<MaterialisedFileDto>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ReportResult {
+    /// The full engagement as one markdown document: findings by severity
+    /// with their evidence, then the leads ledger with verdicts and rulings.
+    pub markdown: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ScanFlowsParams {
+    /// How many of the most recent flows to scan. Default 500, capped 5000.
+    pub limit: Option<i64>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ScanResult {
+    pub scanned: i64,
+    /// New draft findings filed (deduplicated per rule+host).
+    pub filed: i64,
+}
+
 #[tool_router]
 impl ProxyServer {
     pub fn new(engine: Arc<Engine>) -> Self {
@@ -588,6 +843,7 @@ impl ProxyServer {
             source: p.source,
             uri_contains: p.uri_contains,
             status: p.status,
+            tag: p.tag,
             include_automate: p.include_automate.unwrap_or(false),
         };
         // Scope cannot be pushed into SQL — the patterns are globs, regexes and
@@ -682,7 +938,7 @@ impl ProxyServer {
     ) -> Result<Json<ResendFlowResult>, ErrorData> {
         let resent = self
             .engine
-            .resend(p.id as u64)
+            .resend_as(p.id as u64, p.as_identity, p.tag)
             .await
             .map_err(resend_error)?;
         let response = &resent.response;
@@ -988,7 +1244,12 @@ impl ProxyServer {
         let started = std::time::Instant::now();
         let sent = self
             .engine
-            .send_request(request, p.base_flow_id.map(|id| id as u64))
+            .send_request(
+                request,
+                p.base_flow_id.map(|id| id as u64),
+                p.as_identity,
+                p.tag,
+            )
             .await
             .map_err(resend_error)?;
         let millis = started.elapsed().as_millis() as i64;
@@ -1255,6 +1516,9 @@ impl ProxyServer {
             host: p.host,
             path: p.path,
             evidence: evidence.into_iter().map(|e| (e.flow_id, e.label)).collect(),
+            // A tool-filed finding is the operator's (or agent's) word —
+            // `workflow` is reserved for what the passive scanner raises.
+            origin: "manual".to_string(),
         };
         let id = self
             .engine
@@ -1435,6 +1699,479 @@ impl ProxyServer {
         let rows = self.engine.delete_note(p.id);
         Ok(Json(RowsChangedResult {
             rows_changed: rows as u64,
+        }))
+    }
+
+    // --- identities ---
+    //
+    // Named session jars a replay can be sent as. Values never leave this
+    // crate's core: reads report cookie names, scopes and lengths, so a
+    // transcript stays free of live credentials by construction.
+
+    #[tool(
+        description = "List session identities — named cookie jars a replay can be sent as \
+                       (as_identity on resend_flow / send_request). Cookie values are never \
+                       returned, only names, domains and lengths."
+    )]
+    async fn list_identities(&self) -> Result<Json<ListIdentitiesResult>, ErrorData> {
+        let identities = self
+            .engine
+            .identities()
+            .into_iter()
+            .map(IdentityDto::from)
+            .collect();
+        Ok(Json(ListIdentitiesResult { identities }))
+    }
+
+    #[tool(
+        description = "Create a session identity from a hand-supplied cookie jar. Prefer \
+                       adopt_flow_session: log in through the proxy once and adopt a captured \
+                       flow — it needs no secret pasted anywhere."
+    )]
+    async fn create_identity(
+        &self,
+        Parameters(p): Parameters<CreateIdentityParams>,
+    ) -> Result<Json<IdentityIdResult>, ErrorData> {
+        let name = p.name.trim().to_string();
+        if name.is_empty() {
+            return Err(ErrorData::invalid_params("name must not be empty", None));
+        }
+        let host = p.host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+        let mut cookies = Vec::new();
+        for c in &p.cookies {
+            cookies.push(cookie_input(host, c).map_err(|e| ErrorData::invalid_params(e, None))?);
+        }
+        let new = NewIdentity {
+            name,
+            host: host.map(str::to_string),
+            totp_secret: p.totp_secret.clone().filter(|s| !s.is_empty()),
+            note: p.note.clone().filter(|s| !s.is_empty()),
+            cookies,
+        };
+        let id = self
+            .engine
+            .create_identity(&new)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(IdentityIdResult { identity_id: id }))
+    }
+
+    #[tool(
+        description = "Edit an identity: rename, rebind its host, set or clear the TOTP \
+                       secret, or replace the whole cookie jar. Omitted fields are left \
+                       alone; an empty string clears a nullable one. Cookie values are \
+                       never returned, so there is nothing to re-read first."
+    )]
+    async fn update_identity(
+        &self,
+        Parameters(p): Parameters<UpdateIdentityParams>,
+    ) -> Result<Json<RowsChangedResult>, ErrorData> {
+        // A jar replacement resolves each cookie's default domain against the
+        // identity's host — which is either the one given here or the current
+        // binding.
+        let mut host = p
+            .host
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if host.is_none() {
+            host = self.engine.identity(p.identity_id).and_then(|i| i.host);
+        }
+        let cookies = match &p.cookies {
+            None => None,
+            Some(list) => {
+                let mut out = Vec::new();
+                for c in list {
+                    let host = host.as_deref();
+                    out.push(
+                        cookie_input(host, c).map_err(|e| ErrorData::invalid_params(e, None))?,
+                    );
+                }
+                Some(out)
+            }
+        };
+        let edit = lockgate_core::IdentityEdit {
+            name: p
+                .name
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            host: p.host.clone(),
+            totp_secret: p.totp_secret.clone(),
+            note: p.note.clone(),
+            cookies,
+        };
+        let rows = self
+            .engine
+            .update_identity(p.identity_id, &edit)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!(
+                    "no identity #{} — list_identities shows what exists",
+                    p.identity_id
+                ),
+                None,
+            ));
+        }
+        Ok(Json(RowsChangedResult {
+            rows_changed: rows as u64,
+        }))
+    }
+
+    #[tool(description = "Delete an identity and its cookie jar.")]
+    async fn delete_identity(
+        &self,
+        Parameters(p): Parameters<IdentityIdParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        let rows = self.engine.delete_identity(p.identity_id);
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!(
+                    "no identity #{} — list_identities shows what exists",
+                    p.identity_id
+                ),
+                None,
+            ));
+        }
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(
+        description = "Mint an identity from a captured flow's session: the flow's request \
+                       Cookie header merged with its response Set-Cookie headers (response \
+                       wins). This is how the operator's manual login becomes something the \
+                       agent can replay as — pick a flow captured right after login. Refuses \
+                       a flow that carries no cookies."
+    )]
+    async fn adopt_flow_session(
+        &self,
+        Parameters(p): Parameters<AdoptSessionParams>,
+    ) -> Result<Json<AdoptSessionResult>, ErrorData> {
+        let name = p.name.trim();
+        if name.is_empty() {
+            return Err(ErrorData::invalid_params("name must not be empty", None));
+        }
+        let id = self.engine.adopt_identity_from_flow(p.flow_id as u64, name);
+        match id {
+            Ok(id) => {
+                let identity = self.engine.identity(id);
+                let (count, host) = match &identity {
+                    Some(i) => (i.cookies.len() as i64, i.host.clone()),
+                    None => (0, None),
+                };
+                Ok(Json(AdoptSessionResult {
+                    identity_id: id,
+                    cookie_count: count,
+                    host,
+                }))
+            }
+            Err(e) => Err(match e {
+                lockgate_core::AdoptError::NotFound(id) => {
+                    ErrorData::resource_not_found(format!("no flow #{id}"), None)
+                }
+                lockgate_core::AdoptError::NoSession => ErrorData::invalid_params(
+                    "the flow carries no cookies — capture one from after a login",
+                    None,
+                ),
+                lockgate_core::AdoptError::DuplicateName(name) => ErrorData::invalid_params(
+                    format!("an identity named “{name}” already exists — pick another name"),
+                    None,
+                ),
+                lockgate_core::AdoptError::Db(e) => {
+                    ErrorData::internal_error(format!("adopt failed: {e}"), None)
+                }
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Make sure a CDP Chrome with a persistent profile is running, so a \
+                       browser client can attach to it (e.g. Playwright MCP with \
+                       --cdp-endpoint). Idempotent: returns at once when something already \
+                       listens. The profile carries the operator's logged-in sessions, so \
+                       pages served to this browser are seen as the operator — treat it as \
+                       the identity-bearing browser and drive it gently. Leaves Chrome \
+                       running when lockgate exits."
+    )]
+    async fn browser_ensure(&self) -> Result<Json<BrowserEnsureResult>, ErrorData> {
+        let cfg = lockgate_core::browser::CdpConfig::from_env();
+        match lockgate_core::browser::ensure(&cfg).await {
+            Ok(status) => Ok(Json(BrowserEnsureResult {
+                cdp_url: status.cdp_url,
+                spawned: !status.already_running,
+                profile: status.profile.display().to_string(),
+                binary: status.binary.display().to_string(),
+                headless: status.headless,
+            })),
+            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+        }
+    }
+
+    // --- policy ---
+    //
+    // The guardrails, as data the engine enforces on every send. Managing them
+    // over MCP is deliberate: the agent can *read* the floor it stands on, and
+    // the operator can draw it without touching a config file.
+
+    #[tool(
+        description = "Get the engagement's guardrails: the per-host send-rate ceiling and \
+                       the forbidden-URL rules. Enforced in the engine on every send path — \
+                       a refused URL never reaches the wire. Empty policy is permissive; \
+                       drawing it is how the operator bounds an agent's free hand."
+    )]
+    async fn get_policy(&self) -> Result<Json<GetPolicyResult>, ErrorData> {
+        let p = self.engine.policy();
+        let rules = self
+            .engine
+            .policy_rules()
+            .into_iter()
+            .map(|r| PolicyRuleDto {
+                id: r.id,
+                kind: r.kind,
+                pattern: r.pattern,
+                note: r.note,
+                enabled: r.enabled,
+            })
+            .collect();
+        Ok(Json(GetPolicyResult {
+            rate_per_sec: p.rate_per_sec,
+            note: p.note,
+            rules,
+        }))
+    }
+
+    #[tool(description = "Set the per-host send-rate ceiling (sends per second). `0` lifts it.")]
+    async fn set_rate_limit(
+        &self,
+        Parameters(p): Parameters<SetRateLimitParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        if p.per_host_per_sec < 0.0 {
+            return Err(ErrorData::invalid_params(
+                "rate must be >= 0 (0 lifts the ceiling)",
+                None,
+            ));
+        }
+        let rate = if p.per_host_per_sec == 0.0 {
+            None
+        } else {
+            Some(p.per_host_per_sec)
+        };
+        self.engine.set_rate_limit(rate);
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(
+        description = "Add an out-of-bounds rule: URLs matching the pattern are refused on \
+                       every send path. Draw the floor BEFORE letting an agent loose — \
+                       payment flows, other tenants, anything the program's policy excludes."
+    )]
+    async fn add_policy_rule(
+        &self,
+        Parameters(p): Parameters<AddPolicyRuleParams>,
+    ) -> Result<Json<PolicyIdResult>, ErrorData> {
+        let pattern = p.pattern.trim();
+        if pattern.is_empty() {
+            return Err(ErrorData::invalid_params("pattern must not be empty", None));
+        }
+        let kind = p.kind.as_deref().unwrap_or("forbid_url_regex");
+        let id = self
+            .engine
+            .add_policy_rule(kind, pattern, p.note.as_deref())
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(PolicyIdResult { rule_id: id }))
+    }
+
+    #[tool(description = "Delete an out-of-bounds rule.")]
+    async fn delete_policy_rule(
+        &self,
+        Parameters(p): Parameters<RuleIdParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        let rows = self.engine.delete_policy_rule(p.rule_id);
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!(
+                    "no policy rule #{} — get_policy lists what exists",
+                    p.rule_id
+                ),
+                None,
+            ));
+        }
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    // --- leads ---
+
+    #[tool(
+        description = "Propose a lead: an attack hypothesis worth a verifier's time. One \
+                       kind from the vocabulary, one title, and a rationale that states the \
+                       mechanism — not 'might be vulnerable'. A verifier (yours or another \
+                       agent) settles it with a control via update_lead; an adjudicator \
+                       rules on that via adjudicate_lead."
+    )]
+    async fn create_lead(
+        &self,
+        Parameters(p): Parameters<CreateLeadParams>,
+    ) -> Result<Json<LeadIdResult>, ErrorData> {
+        let id = self
+            .engine
+            .create_lead(&lockgate_core::NewLead {
+                kind: p.kind,
+                title: p.title,
+                rationale_md: p.rationale_md,
+                endpoint: p.endpoint,
+                flow_id: p.flow_id,
+            })
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(LeadIdResult { lead_id: id }))
+    }
+
+    #[tool(
+        description = "The leads ledger, newest first. This is the coordination artifact \
+                       between recon and verification: what was proposed, what settled, what \
+                       was ruled inadmissible and why."
+    )]
+    async fn list_leads(
+        &self,
+        Parameters(p): Parameters<ListLeadsParams>,
+    ) -> Result<Json<ListLeadsResult>, ErrorData> {
+        let leads = self
+            .engine
+            .leads(p.status.as_deref())
+            .into_iter()
+            .map(LeadDto::from)
+            .collect();
+        Ok(Json(ListLeadsResult { leads }))
+    }
+
+    #[tool(description = "One lead in full: rationale, verdict, control, ruling.")]
+    async fn get_lead(
+        &self,
+        Parameters(p): Parameters<LeadIdParams>,
+    ) -> Result<Json<LeadDto>, ErrorData> {
+        self.engine
+            .lead(p.lead_id)
+            .map(LeadDto::from)
+            .map(Json)
+            .ok_or_else(|| {
+                ErrorData::resource_not_found(
+                    format!("no lead #{} — list_leads shows what exists", p.lead_id),
+                    None,
+                )
+            })
+    }
+
+    #[tool(
+        description = "Record verification progress on a lead. Settling on verified/refuted \
+                       requires verdict AND control — the baseline-vs-exploit check that \
+                       discriminates the bug from intended behaviour. Refused in code \
+                       otherwise: a conclusion without a control is a guess."
+    )]
+    async fn update_lead(
+        &self,
+        Parameters(p): Parameters<UpdateLeadParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        let rows = self
+            .engine
+            .record_lead_verdict(
+                p.lead_id,
+                p.status.as_deref().unwrap_or("verifying"),
+                p.verdict.as_deref(),
+                p.control.as_deref(),
+            )
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!("no lead #{} — list_leads shows what exists", p.lead_id),
+                None,
+            ));
+        }
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(
+        description = "Rule on a verified/refuted lead: admissible or refuted, with a \
+                       reason. This is the epistemics pass — read the lead's verdict and \
+                       control, judge whether the control actually discriminates, and say \
+                       why. Refuses to run before a verdict exists."
+    )]
+    async fn adjudicate_lead(
+        &self,
+        Parameters(p): Parameters<AdjudicateLeadParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        let rows = self
+            .engine
+            .adjudicate_lead(p.lead_id, &p.ruling, &p.ruling_reason)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!("no lead #{} — list_leads shows what exists", p.lead_id),
+                None,
+            ));
+        }
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    // --- materialise / report / scan ---
+
+    #[tool(
+        description = "Write the capture's queryable index to a directory: endpoints.jsonl, \
+                       write-endpoints.jsonl (the mutating subset), sitemap.jsonl, \
+                       findings.jsonl, leads.jsonl, and a README. Deterministic. Full bodies \
+                       stay behind the flow:// resources — this is what you grep, not what \
+                       you read."
+    )]
+    async fn materialise(
+        &self,
+        Parameters(p): Parameters<MaterialiseParams>,
+    ) -> Result<Json<MaterialiseResult>, ErrorData> {
+        let dir = std::path::PathBuf::from(p.dir);
+        let out = self
+            .engine
+            .materialise(&dir)
+            .map_err(|e| ErrorData::internal_error(format!("materialise failed: {e}"), None))?;
+        Ok(Json(MaterialiseResult {
+            dir: out.dir.display().to_string(),
+            files: out
+                .files
+                .into_iter()
+                .map(|f| MaterialisedFileDto {
+                    name: f.name,
+                    lines: f.lines,
+                    bytes: f.bytes,
+                })
+                .collect(),
+        }))
+    }
+
+    #[tool(
+        description = "Render the whole engagement as one markdown report: findings by \
+                       severity with impact/repro/remediation and evidence flow ids, then \
+                       the leads ledger with verdicts and rulings. Pure assembly — the \
+                       prose is whatever the findings carry."
+    )]
+    async fn generate_report(&self) -> Result<Json<ReportResult>, ErrorData> {
+        let markdown = self.engine.generate_report().ok_or_else(|| {
+            ErrorData::internal_error("report generation failed".to_string(), None)
+        })?;
+        Ok(Json(ReportResult { markdown }))
+    }
+
+    #[tool(
+        description = "Run the passive scanner over recent flows and file what is new as \
+                       draft findings (origin: workflow): CORS wildcard+credentials, cookie \
+                       flags, missing HSTS/CSP, version banners. Deduped per rule+host. \
+                       These are observations to triage, not verdicts — the scanner never \
+                       sleeps, but it also never verifies."
+    )]
+    async fn scan_flows(
+        &self,
+        Parameters(p): Parameters<ScanFlowsParams>,
+    ) -> Result<Json<ScanResult>, ErrorData> {
+        let limit = p.limit.unwrap_or(500).clamp(1, 5000) as usize;
+        let out = self.engine.scan_recent(limit).await;
+        Ok(Json(ScanResult {
+            scanned: out.scanned as i64,
+            filed: out.filed as i64,
         }))
     }
 
@@ -1768,8 +2505,52 @@ fn resend_error(e: ResendError) -> ErrorData {
         ResendError::OutOfScope => {
             ErrorData::invalid_request("target is outside the active scope".to_string(), None)
         }
+        ResendError::Forbidden {
+            rule_id,
+            pattern,
+            url,
+        } => ErrorData::invalid_request(
+            format!(
+                "policy forbids {url} — it matches out-of-bounds rule #{rule_id} ({pattern}). \
+                 The floor is drawn in the engine; ask the operator before touching this."
+            ),
+            None,
+        ),
+        ResendError::RateLimited {
+            host,
+            retry_after_ms,
+        } => ErrorData::invalid_request(
+            format!(
+                "rate limit: {host} is paced — retry in {retry_after_ms}ms rather than \
+                 hammering; the ceiling is the program's, not a bug"
+            ),
+            None,
+        ),
+        ResendError::IdentityNotFound(id) => ErrorData::resource_not_found(
+            format!("no identity #{id} — list_identities shows what exists"),
+            None,
+        ),
         ResendError::Http(e) => ErrorData::internal_error(format!("resend failed: {e}"), None),
     }
+}
+
+/// Turn a wire cookie into a core one, defaulting its domain to the identity's
+/// host and its path to `/` — the two attributes a caller usually means.
+fn cookie_input(host: Option<&str>, c: &CookieInput) -> Result<lockgate_core::Cookie, String> {
+    let name = c.name.trim();
+    if name.is_empty() {
+        return Err("cookie name must not be empty".to_string());
+    }
+    Ok(lockgate_core::Cookie {
+        name: name.to_string(),
+        value: c.value.clone(),
+        domain: c
+            .domain
+            .clone()
+            .or_else(|| host.map(str::to_string))
+            .unwrap_or_default(),
+        path: c.path.clone().unwrap_or_else(|| "/".to_string()),
+    })
 }
 
 fn write_error(e: lockgate_core::engine::WriteError) -> ErrorData {
@@ -2111,6 +2892,8 @@ mod tests {
             .send_request(Parameters(SendRequestParams {
                 text: "GET /nowhere HTTP/1.1\n\n".into(),
                 base_flow_id: None,
+                as_identity: None,
+                tag: None,
             }))
             .await;
         let message = format!("{:?}", result.err().expect("should refuse"));
@@ -2124,6 +2907,8 @@ mod tests {
             .send_request(Parameters(SendRequestParams {
                 text: "GET / HTTP/1.1\nnot-a-header\n\n".into(),
                 base_flow_id: None,
+                as_identity: None,
+                tag: None,
             }))
             .await;
         let message = format!("{:?}", result.err().expect("should refuse"));
@@ -2137,6 +2922,8 @@ mod tests {
             .send_request(Parameters(SendRequestParams {
                 text: "GET /a HTTP/1.1\n\n".into(),
                 base_flow_id: Some(999),
+                as_identity: None,
+                tag: None,
             }))
             .await;
         assert!(result.is_err());
@@ -2401,6 +3188,7 @@ mod tests {
             source: None,
             uri_contains: None,
             status: None,
+            tag: None,
             include_automate: None,
             offset: None,
             limit: None,
@@ -2861,6 +3649,475 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identities_round_trip_and_never_leak_a_cookie_value() {
+        let (_engine, server) = setup();
+
+        let id = server
+            .create_identity(Parameters(CreateIdentityParams {
+                name: "admin".into(),
+                host: Some("example.com".into()),
+                cookies: vec![CookieInput {
+                    name: "sid".into(),
+                    value: "SECRET-VALUE".into(),
+                    domain: None,
+                    path: None,
+                }],
+                totp_secret: Some("JBSWY3DPEHPK3PXP".into()),
+                note: Some("the operator's login".into()),
+            }))
+            .await
+            .unwrap()
+            .0
+            .identity_id;
+
+        let listed = &server.list_identities().await.unwrap().0.identities[0];
+        assert_eq!(listed.name, "admin");
+        assert_eq!(listed.host.as_deref(), Some("example.com"));
+        assert!(listed.has_totp);
+        let cookie = &listed.cookies[0];
+        assert_eq!(cookie.name, "sid");
+        // Domain defaulted to the identity's host, path to /.
+        assert_eq!(cookie.domain, "example.com");
+        assert_eq!(cookie.path, "/");
+        assert_eq!(cookie.value_len, 12, "the length, never the value");
+        let rendered = serde_json::to_string(&server.list_identities().await.unwrap().0).unwrap();
+        assert!(
+            !rendered.contains("SECRET-VALUE"),
+            "a live session must never reach a transcript: {rendered}"
+        );
+
+        // A partial edit leaves the jar alone; a jar replacement is wholesale.
+        let rows = server
+            .update_identity(Parameters(UpdateIdentityParams {
+                identity_id: id,
+                name: None,
+                host: None,
+                totp_secret: None,
+                note: Some("now noted".into()),
+                cookies: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .rows_changed;
+        assert_eq!(rows, 1);
+        let listed = &server.list_identities().await.unwrap().0.identities[0];
+        assert_eq!(listed.cookies.len(), 1, "no cookies given, jar untouched");
+        assert_eq!(listed.note.as_deref(), Some("now noted"));
+
+        let rows = server
+            .update_identity(Parameters(UpdateIdentityParams {
+                identity_id: id,
+                name: None,
+                host: None,
+                totp_secret: None,
+                note: None,
+                cookies: Some(vec![CookieInput {
+                    name: "other".into(),
+                    value: "v2".into(),
+                    domain: None,
+                    path: None,
+                }]),
+            }))
+            .await
+            .unwrap()
+            .0
+            .rows_changed;
+        assert_eq!(rows, 1);
+        let listed = &server.list_identities().await.unwrap().0.identities[0];
+        assert_eq!(listed.cookies.len(), 1);
+        assert_eq!(listed.cookies[0].name, "other", "the jar was replaced");
+
+        // Names are unique, and the error says so rather than suffixing.
+        let err = server
+            .create_identity(Parameters(CreateIdentityParams {
+                name: "admin".into(),
+                host: None,
+                cookies: vec![],
+                totp_secret: None,
+                note: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("already exists"), "{}", err.message);
+
+        let ok = server
+            .delete_identity(Parameters(IdentityIdParams { identity_id: id }))
+            .await
+            .unwrap()
+            .0;
+        assert!(ok.ok);
+        assert!(
+            server
+                .list_identities()
+                .await
+                .unwrap()
+                .0
+                .identities
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn adopting_a_flow_mints_an_identity_from_its_session() {
+        let (engine, server) = setup();
+
+        // A post-login flow: request cookie plus two Set-Cookie responses.
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("cookie", "sid=abc123".parse().unwrap());
+        let flow_id = engine.record_request(CapturedRequest {
+            method: Method::GET,
+            uri: "https://example.com/app".parse::<Uri>().unwrap(),
+            version: Version::HTTP_11,
+            headers: req_headers,
+            body: Bytes::new(),
+        });
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.append("set-cookie", "role=admin".parse().unwrap());
+        engine.record_response(
+            flow_id,
+            CapturedResponse {
+                status: StatusCode::OK,
+                version: Version::HTTP_11,
+                headers: resp_headers,
+                body: Bytes::new(),
+            },
+        );
+
+        let res = server
+            .adopt_flow_session(Parameters(AdoptSessionParams {
+                flow_id: flow_id as i64,
+                name: "me".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res.cookie_count, 2, "request cookie merged with Set-Cookie");
+        assert_eq!(res.host.as_deref(), Some("example.com"));
+
+        let listed = &server.list_identities().await.unwrap().0.identities[0];
+        assert_eq!(listed.name, "me");
+        let names: Vec<_> = listed.cookies.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["role", "sid"]);
+        assert!(
+            !serde_json::to_string(&listed).unwrap().contains("abc123"),
+            "adopted values stay in the core"
+        );
+
+        // A flow with no session cannot mint one.
+        let plain = record(&engine, "http://example.com/x", "x");
+        let err = server
+            .adopt_flow_session(Parameters(AdoptSessionParams {
+                flow_id: plain,
+                name: "empty".into(),
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("no cookies"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn the_leads_ledger_enforces_its_epistemics() {
+        let (_engine, server) = setup();
+
+        let id = server
+            .create_lead(Parameters(CreateLeadParams {
+                kind: "idor".into(),
+                title: "Booking ids are sequential".into(),
+                rationale_md: "GET /bookings/4711 returned another tenant's booking.".into(),
+                endpoint: Some("https://target.com/bookings/{id}".into()),
+                flow_id: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .lead_id;
+
+        // Proposed, with nothing settled.
+        let lead = server
+            .get_lead(Parameters(LeadIdParams { lead_id: id }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(lead.status, "proposed");
+        assert_eq!(lead.ruling, None);
+        assert_eq!(
+            server
+                .list_leads(Parameters(ListLeadsParams {
+                    status: Some("proposed".into())
+                }))
+                .await
+                .unwrap()
+                .0
+                .leads
+                .len(),
+            1
+        );
+        assert!(
+            server
+                .list_leads(Parameters(ListLeadsParams {
+                    status: Some("verified".into())
+                }))
+                .await
+                .unwrap()
+                .0
+                .leads
+                .is_empty()
+        );
+
+        // A conclusion without a control is refused — in code, not in a prompt.
+        let err = server
+            .update_lead(Parameters(UpdateLeadParams {
+                lead_id: id,
+                status: Some("verified".into()),
+                verdict: Some("it worked".into()),
+                control: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("control"), "{}", err.message);
+
+        // The control makes the verdict land.
+        server
+            .update_lead(Parameters(UpdateLeadParams {
+                lead_id: id,
+                status: Some("verified".into()),
+                verdict: Some("200 with tenant B's id; 403 as tenant A".into()),
+                control: Some("same request, swapped tenant id: 200 vs 403".into()),
+            }))
+            .await
+            .unwrap();
+        let lead = server
+            .get_lead(Parameters(LeadIdParams { lead_id: id }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(lead.status, "verified");
+        assert!(lead.control.is_some());
+
+        // Adjudication refuses to run before a verdict exists...
+        let other = server
+            .create_lead(Parameters(CreateLeadParams {
+                kind: "config".into(),
+                title: "Unprobed guess".into(),
+                rationale_md: "vibes".into(),
+                endpoint: None,
+                flow_id: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .lead_id;
+        let err = server
+            .adjudicate_lead(Parameters(AdjudicateLeadParams {
+                lead_id: other,
+                ruling: "admissible".into(),
+                ruling_reason: "looks fine".into(),
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("verdict"), "{}", err.message);
+
+        // ...and on a real verdict, the ruling lands.
+        server
+            .adjudicate_lead(Parameters(AdjudicateLeadParams {
+                lead_id: id,
+                ruling: "admissible".into(),
+                ruling_reason: "the control discriminates: same request, different tenant".into(),
+            }))
+            .await
+            .unwrap();
+        let lead = server
+            .get_lead(Parameters(LeadIdParams { lead_id: id }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(lead.ruling.as_deref(), Some("admissible"));
+
+        // The report carries the verdict and the ruling.
+        let report = server.generate_report().await.unwrap().0.markdown;
+        assert!(report.contains("## Leads"), "{report}");
+        assert!(report.contains("admissible"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn materialise_and_scan_round_trip() {
+        let (engine, server) = setup();
+
+        // A response with every scanner rule firing.
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("host", "example.com".parse().unwrap());
+        let id = engine.record_request(CapturedRequest {
+            method: Method::GET,
+            uri: "https://example.com/app".parse::<Uri>().unwrap(),
+            version: Version::HTTP_11,
+            headers: req_headers,
+            body: Bytes::new(),
+        });
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("access-control-allow-origin", "*".parse().unwrap());
+        resp_headers.insert("access-control-allow-credentials", "true".parse().unwrap());
+        resp_headers.insert("server", "nginx/1.24.0".parse().unwrap());
+        resp_headers.append("set-cookie", "sid=abc; Path=/".parse().unwrap());
+        engine.record_response(
+            id,
+            CapturedResponse {
+                status: StatusCode::OK,
+                version: Version::HTTP_11,
+                headers: resp_headers,
+                body: Bytes::new(),
+            },
+        );
+
+        // The scanner files draft findings with origin=workflow, deduped.
+        let out = server
+            .scan_flows(Parameters(ScanFlowsParams { limit: Some(100) }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(out.scanned, 1);
+        assert!(
+            out.filed >= 4,
+            "CORS + cookies + HSTS + banner: {}",
+            out.filed
+        );
+
+        // Second run files nothing new — per rule+host dedup.
+        let again = server
+            .scan_flows(Parameters(ScanFlowsParams { limit: Some(100) }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(again.filed, 0, "dedup must hold across runs");
+
+        let findings = server.list_findings().await.unwrap().0.findings;
+        assert!(
+            findings.iter().all(|f| f.origin == "workflow"),
+            "the scanner speaks as the tool, not as verified work"
+        );
+        assert!(findings.iter().all(|f| f.status == "draft"));
+
+        // Materialise writes an index the report agrees with.
+        let dir = std::env::temp_dir().join(format!("lockgate-mcp-mat-{}", std::process::id()));
+        let out = server
+            .materialise(Parameters(MaterialiseParams {
+                dir: dir.display().to_string(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        let names: Vec<_> = out.files.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"endpoints.jsonl"), "{names:?}");
+        let endpoints = std::fs::read_to_string(dir.join("endpoints.jsonl")).unwrap();
+        assert!(endpoints.contains("example.com"), "{endpoints}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn policy_round_trips_and_validates_its_rules() {
+        let (_engine, server) = setup();
+
+        // Default: permissive. Nothing an existing session does changes.
+        let p = server.get_policy().await.unwrap().0;
+        assert_eq!(p.rate_per_sec, None);
+        assert!(p.rules.is_empty());
+
+        server
+            .set_rate_limit(Parameters(SetRateLimitParams {
+                per_host_per_sec: 2.5,
+            }))
+            .await
+            .unwrap();
+        let p = server.get_policy().await.unwrap().0;
+        assert_eq!(p.rate_per_sec, Some(2.5));
+
+        // 0 lifts the ceiling rather than wedging the project at zero.
+        server
+            .set_rate_limit(Parameters(SetRateLimitParams {
+                per_host_per_sec: 0.0,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(server.get_policy().await.unwrap().0.rate_per_sec, None);
+
+        let rule_id = server
+            .add_policy_rule(Parameters(AddPolicyRuleParams {
+                kind: None,
+                pattern: r"^https://target\\.com/pay".into(),
+                note: Some("money flows are out of bounds".into()),
+            }))
+            .await
+            .unwrap()
+            .0
+            .rule_id;
+        let p = server.get_policy().await.unwrap().0;
+        assert_eq!(p.rules.len(), 1);
+        assert_eq!(p.rules[0].kind, "forbid_url_regex");
+        assert!(p.rules[0].enabled);
+
+        // A rule that cannot compile — or matches everything — is refused at
+        // write time. A guardrail that silently never matches is worse than
+        // none.
+        for bad in ["(unclosed", ""] {
+            let err = server
+                .add_policy_rule(Parameters(AddPolicyRuleParams {
+                    kind: None,
+                    pattern: bad.into(),
+                    note: None,
+                }))
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(!err.message.is_empty());
+        }
+        assert_eq!(server.get_policy().await.unwrap().0.rules.len(), 1);
+
+        let ok = server
+            .delete_policy_rule(Parameters(RuleIdParams { rule_id }))
+            .await
+            .unwrap()
+            .0;
+        assert!(ok.ok);
+        assert!(server.get_policy().await.unwrap().0.rules.is_empty());
+
+        let err = server
+            .delete_policy_rule(Parameters(RuleIdParams { rule_id: 999 }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.message.contains("no policy rule #999"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn resend_with_an_unknown_identity_names_the_problem() {
+        let (engine, server) = setup();
+        let id = record(&engine, "http://example.com/x", "x");
+
+        let err = server
+            .resend_flow(Parameters(ResendFlowParams {
+                id,
+                as_identity: Some(7),
+                tag: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.message.contains("no identity #7"),
+            "message was: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn resend_refuses_out_of_scope() {
         use lockgate_core::scope::{self, Action, HostKind, RuleSpec};
 
@@ -2882,7 +4139,11 @@ mod tests {
         });
 
         let err = server
-            .resend_flow(Parameters(ResendFlowParams { id }))
+            .resend_flow(Parameters(ResendFlowParams {
+                id,
+                as_identity: None,
+                tag: None,
+            }))
             .await
             .map(|_| ())
             .unwrap_err();

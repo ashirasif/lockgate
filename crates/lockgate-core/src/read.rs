@@ -340,6 +340,8 @@ pub struct FlowRow {
     pub comment: Option<String>,
     pub highlight: Option<String>,
     pub error: Option<String>,
+    /// What put this flow on the wire (`lead:idor-3`), for agent sends.
+    pub tag: Option<String>,
 }
 
 /// A single flow in full, minus the body bytes (fetched separately as a resource
@@ -399,6 +401,9 @@ pub struct FlowQuery {
     pub uri_contains: Option<String>,
     /// Only responses with this exact status.
     pub status: Option<u16>,
+    /// Exact tag match — the label a send carried (`lead:idor-3`). How agent
+    /// traffic is filtered by the question that produced it.
+    pub tag: Option<String>,
     /// Include `automate`-source flows (Intruder/Automate output). When false
     /// they are excluded — unless `source` is set, which selects explicitly and
     /// overrides this. Default (via `Default`) is false: exclude them.
@@ -406,7 +411,7 @@ pub struct FlowQuery {
 }
 
 const FLOW_COLUMNS: &str = "id, method, uri, host, path, status, mime, resp_len,
-    source, started_at, ended_at, comment, highlight, error";
+    source, started_at, ended_at, comment, highlight, error, tag";
 
 fn row_to_flow(r: &rusqlite::Row) -> rusqlite::Result<FlowRow> {
     row_to_flow_offset(r, 0)
@@ -430,6 +435,7 @@ fn row_to_flow_offset(r: &rusqlite::Row, at: usize) -> rusqlite::Result<FlowRow>
         comment: r.get(at + 11)?,
         highlight: r.get(at + 12)?,
         error: r.get(at + 13)?,
+        tag: r.get(at + 14)?,
     })
 }
 
@@ -464,6 +470,10 @@ fn flow_filters(q: &FlowQuery) -> (Vec<String>, Vec<Box<dyn ToSql>>) {
     if let Some(status) = q.status {
         where_clauses.push(format!("status = ?{}", binds.len() + 1));
         binds.push(Box::new(status as i64));
+    }
+    if let Some(tag) = &q.tag {
+        where_clauses.push(format!("tag = ?{}", binds.len() + 1));
+        binds.push(Box::new(tag.clone()));
     }
     // Automate output shares the flow table; keep it out of a default survey
     // unless asked for, or unless a specific source was named (which wins).
@@ -584,12 +594,12 @@ pub fn flow_detail(conn: &Connection, id: i64) -> rusqlite::Result<Option<FlowDe
             [id],
             |r| {
                 let row = row_to_flow(r)?;
-                let http_version: String = r.get(14)?;
-                let parent_id: Option<i64> = r.get(15)?;
-                let req_headers: Vec<u8> = r.get(16)?;
-                let resp_headers: Option<Vec<u8>> = r.get(17)?;
-                let req_body_len: Option<i64> = r.get(18)?;
-                let resp_body_len: Option<i64> = r.get(19)?;
+                let http_version: String = r.get(15)?;
+                let parent_id: Option<i64> = r.get(16)?;
+                let req_headers: Vec<u8> = r.get(17)?;
+                let resp_headers: Option<Vec<u8>> = r.get(18)?;
+                let req_body_len: Option<i64> = r.get(19)?;
+                let resp_body_len: Option<i64> = r.get(20)?;
                 Ok(FlowDetail {
                     row,
                     http_version,

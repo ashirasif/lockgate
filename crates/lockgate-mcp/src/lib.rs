@@ -12,6 +12,7 @@
 
 mod dto;
 mod server;
+mod status;
 
 pub use server::ProxyServer;
 
@@ -33,14 +34,27 @@ pub const MCP_PATH: &str = "/mcp";
 /// A fresh [`ProxyServer`] is built per session by the transport's factory;
 /// each only clones the `Arc<Engine>`, so all sessions read and write the one
 /// project.
-pub async fn serve(engine: Arc<Engine>, addr: SocketAddr) -> std::io::Result<()> {
+///
+/// `/status` rides the same listener — the engagement at a glance from a
+/// phone. Loopback-bound by default; when the listener is exposed, set
+/// `status_token` and the page answers only with `?token=<it>`.
+pub async fn serve(
+    engine: Arc<Engine>,
+    addr: SocketAddr,
+    status_token: Option<String>,
+) -> std::io::Result<()> {
     let service = StreamableHttpService::new(
-        move || Ok(ProxyServer::new(engine.clone())),
+        {
+            let engine = engine.clone();
+            move || Ok(ProxyServer::new(engine.clone()))
+        },
         Arc::new(LocalSessionManager::default()),
         Default::default(),
     );
 
-    let app = axum::Router::new().nest_service(MCP_PATH, service);
+    let app = axum::Router::new()
+        .nest_service(MCP_PATH, service)
+        .merge(status::router(engine, status_token));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, path = MCP_PATH, "MCP server listening");
     axum::serve(listener, app).await

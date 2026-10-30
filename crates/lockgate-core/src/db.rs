@@ -31,7 +31,7 @@ use rusqlite::Connection;
 pub const INLINE_BODY_LIMIT: usize = 5 * 1024 * 1024;
 
 /// Bumped whenever `MIGRATIONS` grows. Persisted in SQLite's `user_version`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Applied in order, starting from whatever `user_version` the file is at.
 /// Append only — never edit a statement that has already shipped.
@@ -294,6 +294,101 @@ const MIGRATIONS: &[&str] = &[
     -- is built to be scanned rather than searched.
     CREATE INDEX flow_ws ON flow(id DESC, method, uri, started_at) WHERE status = 101;
     "#,
+    // v4 — identities: named session jars a replay can be sent as.
+    //
+    // One row per identity; the jar is a child table rather than a JSON blob
+    // because the jar is the thing that grows and changes (re-adoption
+    // replaces it wholesale) and because no query ever needs to look inside a
+    // cookie — they are read as a whole jar or not at all, so the split costs
+    // one indexed join and buys cascade delete for free.
+    r#"
+    CREATE TABLE identity (
+      id           INTEGER PRIMARY KEY,
+      name         TEXT NOT NULL UNIQUE,
+      -- The host the session belongs to, when it belongs to one. NULL means
+      -- the jar is offered to any replay; per-cookie domains still scope the
+      -- individual cookies.
+      host         TEXT,
+      totp_secret  TEXT,
+      note         TEXT,
+      created_at   INTEGER NOT NULL,
+      updated_at   INTEGER NOT NULL
+    );
+
+    -- (name, domain, path) is a cookie's identity in a jar (RFC 6265); the
+    -- value is the session. Duplicates across domains are normal — one cookie
+    -- name per host of a multi-host SSO is exactly what an identity carries.
+    CREATE TABLE identity_cookie (
+      identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE CASCADE,
+      name        TEXT NOT NULL,
+      value       TEXT NOT NULL,
+      domain      TEXT NOT NULL,
+      path        TEXT NOT NULL DEFAULT '/',
+      PRIMARY KEY (identity_id, name, domain, path)
+    );
+    "#,
+    // v5 — the engagement's guardrails as data, plus send attribution.
+    //
+    // Policy is one row, created here and never inserted again: rate limit
+    // and rules are edited in place. Empty policy is permissive on purpose —
+    // a hand-driven session should notice nothing — so an agent's free hand
+    // is exactly as wide as the operator has drawn it here.
+    r#"
+    CREATE TABLE policy (
+      id           INTEGER PRIMARY KEY CHECK (id = 1),
+      -- Max sends per second per host on the replay path. NULL = unlimited.
+      rate_per_sec REAL,
+      note         TEXT
+    );
+    INSERT INTO policy (id) VALUES (1);
+
+    -- URL patterns replay may never touch — the out-of-bounds list: payment
+    -- flows, other tenants, the endpoint that emails the CEO. `kind` exists so
+    -- later rule shapes (methods, headers) join the same table; today only
+    -- `forbid_url_regex` is defined and the engine refuses anything else.
+    CREATE TABLE policy_rule (
+      id      INTEGER PRIMARY KEY,
+      kind    TEXT NOT NULL,          -- forbid_url_regex
+      pattern TEXT NOT NULL,
+      note    TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1
+    );
+
+    -- What put this flow on the wire, for traffic an agent generated: the
+    -- caller labels its sends (`lead:idor-3`) so evidence can be filtered by
+    -- the question that produced it, not just by endpoint. Proxy traffic has
+    -- none — what the browser did was not planned by anyone. NULL-able ALTER,
+    -- so no rewrite of existing rows.
+    ALTER TABLE flow ADD COLUMN tag TEXT;
+    "#,
+    // v6 — the leads ledger: the coordination artifact between the agents
+    // that think and the agents that verify.
+    //
+    // Recon proposes leads; one verifier per lead settles it with a control;
+    // an adjudicator rules the verdict admissible or not. Three actors, three
+    // columns, each writable only through its own verb (see `lead.rs`): a
+    // verifier cannot write a ruling, an adjudicator cannot write a verdict.
+    // `control` is NOT NULL-checked in code, not in prompt wording — a verdict
+    // without a discriminating check is a guess (hector, lesson D).
+    r#"
+    CREATE TABLE lead (
+      id            INTEGER PRIMARY KEY,
+      kind          TEXT NOT NULL,   -- idor|authz|ratelimit|injection|logic|config|exposure|other
+      title         TEXT NOT NULL,
+      rationale_md  TEXT NOT NULL,   -- why this looks worth a probe
+      endpoint      TEXT,
+      flow_id       INTEGER REFERENCES flow(id),
+      status        TEXT NOT NULL DEFAULT 'proposed',
+      -- proposed | verifying | verified | refuted | reported
+      verdict       TEXT,            -- what actually happened when probed
+      control       TEXT,            -- the baseline-vs-exploit check that settles it
+      ruling        TEXT,            -- admissible | refuted
+      ruling_reason TEXT,
+      created_at    INTEGER NOT NULL,
+      updated_at    INTEGER NOT NULL
+    );
+    CREATE INDEX lead_status ON lead(status);
+    "#,
 ];
 
 /// Where a project's files live.
@@ -478,6 +573,47 @@ mod tests {
             .is_err(),
             "host_kind without host_pattern should violate the CHECK"
         );
+    }
+
+    /// Projects created before identities existed must upgrade in place.
+    #[test]
+    fn upgrades_a_v3_project_to_latest() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..3] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3i64).unwrap();
+
+        migrate(&conn, MIGRATIONS, SCHEMA_VERSION).unwrap();
+
+        // The identity tables exist and behave: cascade on the jar, unique name.
+        conn.execute(
+            "INSERT INTO identity (id, name, created_at, updated_at)
+             VALUES (1, 'admin', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO identity_cookie (identity_id, name, value, domain, path)
+             VALUES (1, 'sid', 'abc', 'example.com', '/')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO identity (id, name, created_at, updated_at)
+                 VALUES (2, 'admin', 0, 0)",
+                [],
+            )
+            .is_err(),
+            "names must be unique"
+        );
+        conn.execute("DELETE FROM identity WHERE id = 1", [])
+            .unwrap();
+        let cookies: i64 = conn
+            .query_row("SELECT COUNT(*) FROM identity_cookie", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cookies, 0, "deleting the identity takes its jar with it");
     }
 
     /// Migrating twice must be a no-op, not a re-application.

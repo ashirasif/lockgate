@@ -87,6 +87,10 @@ pub enum WriteEvent {
         parent_id: Option<FlowId>,
         started_at: i64,
         request: CapturedRequest,
+        /// What this send was *for* — the lead or question that fired it, on
+        /// the send path only. Proxy traffic has none: what the browser did
+        /// was not planned by anyone.
+        tag: Option<String>,
     },
     Response {
         id: FlowId,
@@ -284,6 +288,7 @@ pub(crate) fn write_batch(
                 parent_id,
                 started_at,
                 request,
+                tag,
             } => {
                 let body_id = intern_body(&tx, paths, &request.body)?;
                 let (scheme, host, port, path) = target_parts(&request);
@@ -292,8 +297,8 @@ pub(crate) fn write_batch(
                     "INSERT INTO flow (
                         id, run_id, source, parent_id, started_at,
                         method, uri, http_version, req_headers, req_body_id,
-                        host, scheme, path, port
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                        host, scheme, path, port, tag
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                     params![
                         id as i64,
                         run_id,
@@ -309,6 +314,7 @@ pub(crate) fn write_batch(
                         scheme,
                         &path,
                         port,
+                        tag,
                     ],
                 )?;
 
