@@ -9,7 +9,7 @@ lockgate-core = { path = "crates/lockgate-core" }
 
 hudsucker = "=0.24.1"
 http-body-util = "0.1.4"
-reqwest = "0.12"
+reqwest = { version = "0.12", features = ["socks"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.35"
 tracing-subscriber = "0.3"
@@ -41,6 +41,19 @@ regex = "1"
 # that reads the system zone; the default feature set drags in serde and
 # wasm shims we have no use for.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Mailbox backend (phase 6): IMAP over rustls. The `imap` crate is the
+# maintained 3.x alpha, pinned minor-bounded like every network dep here —
+# with default features OFF: its native-tls default and its rustls-connector
+# both take TLS out of our hands, and the connector ships a no-verify path.
+# We keep the TLS stream ours: rustls + webpki-roots, already in the graph
+# via hudsucker, so declaring them workspace deps aligns versions and links
+# nothing new.
+imap = { version = "3.0.0-alpha.15", default-features = false }
+rustls = "0.23"
+webpki-roots = "0.26"
+# Verification mails are MIME; hand-parsing MIME is how a "link" turns into
+# half a quoted-printable URL. Small, pure Rust, no transitive baggage.
+mailparse = "0.15"
 
 [workspace.package]
 version = "0.1.0"

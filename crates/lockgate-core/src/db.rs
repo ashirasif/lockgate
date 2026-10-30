@@ -31,7 +31,7 @@ use rusqlite::Connection;
 pub const INLINE_BODY_LIMIT: usize = 5 * 1024 * 1024;
 
 /// Bumped whenever `MIGRATIONS` grows. Persisted in SQLite's `user_version`.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Applied in order, starting from whatever `user_version` the file is at.
 /// Append only — never edit a statement that has already shipped.
@@ -388,6 +388,134 @@ const MIGRATIONS: &[&str] = &[
       updated_at    INTEGER NOT NULL
     );
     CREATE INDEX lead_status ON lead(status);
+    "#,
+    // v7 — self-provisioned identities (phase 6): the agent registers its own
+    // accounts, so the identity record learns where an account came from and
+    // gains custody of the password that created it; and mailboxes become a
+    // stored, engine-held thing, because registration is a
+    // form-fill → verification-mail → adopt loop the agent runs alone.
+    //
+    // `password` is write-only from every read path: it is not in `Identity`,
+    // it is fetched by a dedicated call for the browser re-login flow, and no
+    // list/get can leak what the struct does not carry. `provenance` is the
+    // auditable black-box claim — self-registered vs operator-seeded — and
+    // `seed_account` names the Google account/alias that seeded it, which is
+    // the cleanup registry when the run ends.
+    r#"
+    ALTER TABLE identity ADD COLUMN password TEXT;
+    ALTER TABLE identity ADD COLUMN provenance TEXT NOT NULL DEFAULT 'operator';
+    ALTER TABLE identity ADD COLUMN seed_account TEXT;
+
+    -- A mailbox the engine can read verification mail from. The app password
+    -- lives here and nowhere else — same custody rule as identity passwords
+    -- and TOTP secrets; reads return the account without any credential.
+    CREATE TABLE mailbox_account (
+      id           INTEGER PRIMARY KEY,
+      address      TEXT NOT NULL UNIQUE,
+      -- IMAP endpoint. Defaults in code (imap.gmail.com:993) rather than here,
+      -- so a different provider is an argument, not a migration.
+      imap_host    TEXT NOT NULL,
+      imap_port    INTEGER NOT NULL,
+      imap_username TEXT NOT NULL,
+      app_password TEXT NOT NULL,
+      note         TEXT,
+      created_at   INTEGER NOT NULL,
+      updated_at   INTEGER NOT NULL
+    );
+    "#,
+    // v8 — the goal plane and the run's records (phases 7-9).
+    //
+    // `goal` is the one row a run revolves around: what it is after, what the
+    // oracle is, and — once settled — which of the four legal stop states ended
+    // it and why. The LLM never owns `done()`: settling `achieved` is refused
+    // in code unless a canary nonce minted for the goal has a recorded hit
+    // (goal.rs), and every other state demands a written justification.
+    //
+    // `canary_nonce` is the oracle's evidence: one unique nonce per attempt,
+    // placed in the payload by the agent, fired back by the target at the
+    // operator's canary listener, and recorded here with the flow that proves
+    // which attempt fired.
+    //
+    // `frontier_item` and `milestone` are the long-run memory: the attack-tree
+    // frontier (with dead-ends, so a relaunched context cannot retry what the
+    // run already buried) and the progress trail a watchdog reads for stalls.
+    //
+    // `egress_exit` is the egress plane: trust classes, with the rule the
+    // engine enforces — identity-bearing traffic never leaves through a
+    // non-trusted exit. `identity.egress_exit_id` pins an identity to its
+    // exit; NULL is the engine's own (trusted, direct) egress.
+    r#"
+    CREATE TABLE goal (
+      id                 INTEGER PRIMARY KEY,
+      text               TEXT NOT NULL,
+      -- What counts as achieved, in prose the operator can audit: the
+      -- predicate the canary oracle implements for RCE, or the equivalent
+      -- observable for other goal shapes.
+      success_predicate_md TEXT NOT NULL,
+      -- The OOB listener's domain (phase-0 operator setup), embedded in
+      -- minted canary payloads as <nonce>.<canary_domain>.
+      canary_domain      TEXT,
+      budget_ms          INTEGER NOT NULL,
+      -- running | achieved | budget_exhausted | frontier_empty | operator_killed
+      status             TEXT NOT NULL DEFAULT 'running',
+      -- Required at settle time; the ledger refuses a silent stop.
+      stop_reason_md     TEXT,
+      created_at         INTEGER NOT NULL,
+      updated_at         INTEGER NOT NULL,
+      settled_at         INTEGER
+    );
+    CREATE INDEX goal_status ON goal(status);
+
+    CREATE TABLE canary_nonce (
+      id          INTEGER PRIMARY KEY,
+      goal_id     INTEGER NOT NULL REFERENCES goal(id),
+      nonce       TEXT NOT NULL UNIQUE,
+      label       TEXT,
+      hit_flow_id INTEGER REFERENCES flow(id),
+      hit_at      INTEGER,
+      minted_at   INTEGER NOT NULL
+    );
+
+    CREATE TABLE frontier_item (
+      id          INTEGER PRIMARY KEY,
+      goal_id     INTEGER NOT NULL REFERENCES goal(id),
+      title       TEXT NOT NULL,
+      -- The ladder vocabulary lives in frontier.rs; `other` plus a good title
+      -- covers the rest.
+      ladder      TEXT NOT NULL,
+      -- proposed | active | milestone_reached | dead_end | exhausted
+      status      TEXT NOT NULL DEFAULT 'proposed',
+      -- Higher wins when the strategy scheduler picks the next item.
+      priority    INTEGER NOT NULL DEFAULT 0,
+      note_md     TEXT,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+    CREATE INDEX frontier_status ON frontier_item(status);
+
+    CREATE TABLE milestone (
+      id          INTEGER PRIMARY KEY,
+      goal_id     INTEGER NOT NULL REFERENCES goal(id),
+      title       TEXT NOT NULL,
+      note        TEXT,
+      created_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE egress_exit (
+      id         INTEGER PRIMARY KEY,
+      name       TEXT NOT NULL UNIQUE,
+      -- trusted | pooled | hostile. Identity-bearing sends are refused on
+      -- anything but trusted — in the engine's send path, not in prompts.
+      kind       TEXT NOT NULL,
+      -- Proxy URL (http/https/socks5). NULL means direct egress; only a
+      -- trusted exit may be direct.
+      proxy_url  TEXT,
+      note       TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    ALTER TABLE identity ADD COLUMN egress_exit_id INTEGER REFERENCES egress_exit(id);
     "#,
 ];
 

@@ -19,6 +19,10 @@ sha2 = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
 regex = { workspace = true }
+imap = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+mailparse = { workspace = true }
 
 # Integration tests read the database back with their own connection.
 [dev-dependencies]

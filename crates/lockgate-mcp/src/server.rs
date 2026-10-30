@@ -33,8 +33,10 @@ use rmcp::{RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router}
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{
-    BodyPreview, FindingDto, FlowDetailDto, FlowDto, IdentityDto, LeadDto, MaterialisedFileDto,
-    NoteDto, SitemapNodeDto, detail_headers, encode_bytes,
+    BodyPreview, CanaryNonceDto, EgressExitDto, FindingDto, FlowDetailDto, FlowDto,
+    FrontierItemDto, GoalDto, IdentityDto, LeadDto, MailboxAccountDto, MaterialisedFileDto,
+    MilestoneDto, NoteDto, SitemapNodeDto, TierDiffDto, VerificationMailDto, detail_headers,
+    encode_bytes,
 };
 
 /// Default and ceiling on how many rows a listing returns. A ceiling matters
@@ -329,6 +331,10 @@ pub struct SendRequestParams {
     /// Label the recorded flow with what this send was *for* — the lead or
     /// question it answers. list_flows filters on it exactly.
     pub tag: Option<String>,
+    /// Route an anonymous send through a named egress exit (see
+    /// list_egress_exits). Refused for identity-bearing sends on anything
+    /// but a trusted exit — that rule is the engine's, not a request.
+    pub via_exit: Option<String>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -481,6 +487,9 @@ pub struct ResendFlowParams {
     /// list_flows filters on it exactly, so evidence can be grouped by the
     /// question that produced it.
     pub tag: Option<String>,
+    /// Route the replay through a named egress exit. Refused for
+    /// identity-bearing replays on anything but a trusted exit.
+    pub via_exit: Option<String>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -662,6 +671,18 @@ pub struct CreateIdentityParams {
     /// would need to re-derive at re-login. Store the *secret*, not a code.
     pub totp_secret: Option<String>,
     pub note: Option<String>,
+    /// The account's password, when the engine should hold it for re-login.
+    /// Write-only: no read path returns it.
+    pub password: Option<String>,
+    /// `operator` (default) or `self_registered` (the agent created the
+    /// account in a run). The report's black-box claim hangs off this.
+    pub provenance: Option<String>,
+    /// For a self-registered identity: the mailbox address it was created
+    /// with (`probe+t1@gmail.com`). The cleanup registry for the run.
+    pub seed_account: Option<String>,
+    /// Pin to an egress exit by id (see list_egress_exits). The engine still
+    /// refuses identity-bearing sends on non-trusted exits.
+    pub egress_exit_id: Option<i64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -682,6 +703,235 @@ pub struct UpdateIdentityParams {
     pub note: Option<String>,
     /// When given, replaces the whole jar. Omit to leave it alone.
     pub cookies: Option<Vec<CookieInput>>,
+    /// When given, sets the custody password (write-only; never returned).
+    pub password: Option<String>,
+    /// `operator` or `self_registered`. Omit to leave as is.
+    pub provenance: Option<String>,
+    /// Omit to leave as is; "" clears it.
+    pub seed_account: Option<String>,
+    /// Pin to an egress exit by id. Omit to leave as is.
+    pub egress_exit_id: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AddMailboxAccountParams {
+    /// The mailbox address (`probe@gmail.com`). Registration aliases
+    /// (`probe+t1@gmail.com`) are awaited with `address` on
+    /// `await_verification_mail`, not by registering more mailboxes.
+    pub address: String,
+    /// The app password (Gmail) or equivalent. Write-only: no read path can
+    /// return it.
+    pub app_password: String,
+    /// IMAP host. Omit for the Gmail default (imap.gmail.com).
+    pub imap_host: Option<String>,
+    /// IMAP port. Omit for 993.
+    pub imap_port: Option<i64>,
+    /// IMAP username, when it differs from the address.
+    pub imap_username: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MailboxIdParams {
+    pub mailbox_id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AwaitVerificationParams {
+    pub mailbox_id: i64,
+    /// The `To:` address to await — the plus-alias the signup form was given
+    /// (`probe+t1@gmail.com`). Defaults to the mailbox's own address.
+    pub address: Option<String>,
+    /// Only accept mail from a sender containing this (case-insensitive
+    /// substring, e.g. the target's domain). Omit to accept any sender.
+    pub sender_contains: Option<String>,
+    /// How long to keep polling, ms. Default 60s, ceiling 180s. Each poll is
+    /// one IMAP pass; nothing is deleted, the matched mail is marked seen.
+    pub timeout_ms: Option<i64>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListMailboxAccountsResult {
+    pub mailboxes: Vec<MailboxAccountDto>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MailboxIdResult {
+    pub mailbox_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct AwaitVerificationResult {
+    /// The mail that matched, reduced to sender, subject, link and code.
+    /// `None` with `timed_out: true` means nothing arrived in the window.
+    pub mail: Option<VerificationMailDto>,
+    pub timed_out: bool,
+}
+
+// --- the goal plane (phases 7-8) ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct OpenGoalParams {
+    /// The goal in one line, e.g. "Achieve RCE on app.example.com".
+    pub text: String,
+    /// What counts as achieved, in prose the operator can audit — the
+    /// predicate the canary oracle implements for RCE-shaped goals.
+    pub success_predicate_md: String,
+    /// The operator's canary listener domain. Minted nonces render as
+    /// `<nonce>.<domain>` (DNS-style) or `?c=<nonce>` (URL-style).
+    pub canary_domain: Option<String>,
+    /// Wall-clock budget in ms. The run is settled `budget_exhausted` past it.
+    pub budget_ms: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct GoalIdParams {
+    pub goal_id: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SettleGoalParams {
+    /// Which goal. Omit for the running one.
+    pub goal_id: Option<i64>,
+    /// One of: achieved | budget_exhausted | frontier_empty | operator_killed.
+    /// These are the only four exits; "I think I'm done" is not among them.
+    pub state: String,
+    /// The written justification. Required — the ledger refuses a silent
+    /// stop, and `achieved` additionally requires a canary hit.
+    pub reason_md: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MintCanaryParams {
+    /// What this nonce is embedded in ("upload-then-traverse"). The hit
+    /// names the exact attempt that fired.
+    pub label: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RecordCanaryHitParams {
+    /// The nonce that fired, as the canary listener reported it.
+    pub nonce: String,
+    /// The flow whose payload carried the nonce — the evidence link from
+    /// "it fired" to "this request did it".
+    pub flow_id: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ProposeFrontierParams {
+    pub title: String,
+    /// One of the ladders: auth_bypass | upload_traversal | deserialization |
+    /// ssti | cmd_injection | ssrf_internal | known_cve | tenant_admin |
+    /// signup_mass_assignment | config_exposure | other
+    pub ladder: String,
+    /// Higher wins when picking the next item to expand. Default 0.
+    pub priority: Option<i64>,
+    pub note_md: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct UpdateFrontierParams {
+    pub frontier_id: i64,
+    /// proposed | active | milestone_reached | dead_end | exhausted. Burying
+    /// an item (dead_end, exhausted) requires a note saying why — that note
+    /// is what a relaunched context reads instead of repeating the attempt.
+    pub status: Option<String>,
+    pub note: Option<String>,
+    pub priority: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ListFrontierParams {
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RecordMilestoneParams {
+    pub title: String,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ListMilestonesParams {
+    /// Default 20.
+    pub limit: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AddEgressExitParams {
+    pub name: String,
+    /// trusted | pooled | hostile. Identity-bearing sends are refused on
+    /// anything but trusted — enforced in the engine's send path.
+    pub kind: String,
+    /// http(s)/socks5 proxy URL. Omit only for the trusted direct exit,
+    /// which exists exactly once.
+    pub proxy_url: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct EgressIdParams {
+    pub exit_id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct DiffTiersParams {
+    /// Directory of the first tier's materialisation (containing
+    /// endpoints.jsonl).
+    pub dir_a: String,
+    pub dir_b: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct GoalIdResult {
+    pub goal_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct GetGoalResult {
+    pub goal: GoalDto,
+    /// Milestones and canary standing, rendered for a fresh context.
+    pub state_digest: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListCanariesResult {
+    pub nonces: Vec<CanaryNonceDto>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct FrontierIdResult {
+    pub frontier_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListFrontierResult {
+    pub items: Vec<FrontierItemDto>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MilestoneIdResult {
+    pub milestone_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListMilestonesResult {
+    pub milestones: Vec<MilestoneDto>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct StateDigestResult {
+    pub digest: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct EgressIdResult {
+    pub exit_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListEgressExitsResult {
+    pub exits: Vec<EgressExitDto>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1140,7 +1390,7 @@ impl ProxyServer {
     ) -> Result<Json<ResendFlowResult>, ErrorData> {
         let (target, engine) = self.resolve(p.target.as_deref())?;
         let resent = engine
-            .resend_as(p.id as u64, p.as_identity, p.tag)
+            .resend_as(p.id as u64, p.as_identity, p.tag, p.via_exit.as_deref())
             .await
             .map_err(resend_error)?;
         let response = &resent.response;
@@ -1449,11 +1699,12 @@ impl ProxyServer {
         let (target, engine) = self.resolve(p.target.as_deref())?;
         let started = std::time::Instant::now();
         let sent = engine
-            .send_request(
+            .send_request_via(
                 request,
                 p.base_flow_id.map(|id| id as u64),
                 p.as_identity,
                 p.tag,
+                p.via_exit.as_deref(),
             )
             .await
             .map_err(resend_error)?;
@@ -1954,6 +2205,14 @@ impl ProxyServer {
             totp_secret: p.totp_secret.clone().filter(|s| !s.is_empty()),
             note: p.note.clone().filter(|s| !s.is_empty()),
             cookies,
+            password: p.password.clone().filter(|s| !s.is_empty()),
+            provenance: parse_provenance(p.provenance.as_deref())?,
+            seed_account: p
+                .seed_account
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            egress_exit_id: p.egress_exit_id,
         };
         let id = self
             .engine()
@@ -2006,6 +2265,14 @@ impl ProxyServer {
             totp_secret: p.totp_secret.clone(),
             note: p.note.clone(),
             cookies,
+            // Empty is "nothing to say", not "clear".
+            password: p.password.clone().filter(|s| !s.is_empty()),
+            provenance: match p.provenance.as_deref() {
+                None => None,
+                Some(s) => Some(parse_provenance(Some(s))?),
+            },
+            seed_account: p.seed_account.clone(),
+            egress_exit_id: p.egress_exit_id,
         };
         let rows = self
             .engine()
@@ -2041,6 +2308,557 @@ impl ProxyServer {
             ));
         }
         Ok(Json(OkResult { ok: true }))
+    }
+
+    // --- mailboxes ---
+    //
+    // Where the engine reads verification mail from. The app password is
+    // engine-held custody: registering one takes the credential, and no read
+    // path — here or in the TUI — can give it back, because the read types
+    // have no field for it.
+
+    #[tool(
+        description = "Register a mailbox the engine can read verification mail from — \
+                       a Gmail address and its app password is enough (host/port default \
+                       to imap.gmail.com:993). The app password is stored under engine \
+                       custody and is never returned by any tool. Aliases are awaited \
+                       with await_verification_mail's address parameter; do not register \
+                       one mailbox per plus-alias."
+    )]
+    async fn add_mailbox_account(
+        &self,
+        Parameters(p): Parameters<AddMailboxAccountParams>,
+    ) -> Result<Json<MailboxIdResult>, ErrorData> {
+        let address = p.address.trim().to_string();
+        if address.is_empty() {
+            return Err(ErrorData::invalid_params("address must not be empty", None));
+        }
+        let password = p.app_password.trim().to_string();
+        if password.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "app_password must not be empty",
+                None,
+            ));
+        }
+        let new = lockgate_core::NewMailboxAccount {
+            imap_host: p
+                .imap_host
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| lockgate_core::GMAIL_IMAP_HOST.to_string()),
+            imap_port: p
+                .imap_port
+                .filter(|port| (1..=65535).contains(port))
+                .unwrap_or(lockgate_core::GMAIL_IMAP_PORT as i64) as u16,
+            imap_username: p
+                .imap_username
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| address.clone()),
+            address,
+            app_password: password,
+            note: p.note.clone().filter(|s| !s.is_empty()),
+        };
+        let id = self
+            .engine()
+            .add_mailbox_account(&new)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(MailboxIdResult { mailbox_id: id }))
+    }
+
+    #[tool(
+        description = "List registered mailboxes — address and IMAP endpoint only. The \
+                       app password is never returned; delete and re-add to rotate it."
+    )]
+    async fn list_mailbox_accounts(&self) -> Result<Json<ListMailboxAccountsResult>, ErrorData> {
+        let mailboxes = self
+            .engine()
+            .mailbox_accounts()
+            .into_iter()
+            .map(MailboxAccountDto::from)
+            .collect();
+        Ok(Json(ListMailboxAccountsResult { mailboxes }))
+    }
+
+    #[tool(description = "Forget a mailbox. Its stored app password goes with it.")]
+    async fn delete_mailbox_account(
+        &self,
+        Parameters(p): Parameters<MailboxIdParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        let rows = self.engine().delete_mailbox_account(p.mailbox_id);
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!(
+                    "no mailbox #{} — list_mailbox_accounts shows what exists",
+                    p.mailbox_id
+                ),
+                None,
+            ));
+        }
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(
+        description = "Await a verification mail: polls the mailbox for the newest unseen \
+                       mail to the given address (the plus-alias the signup form was \
+                       given) and returns its confirm link and/or code, marking it seen. \
+                       One IMAP pass per poll, a few seconds apart, within timeout_ms \
+                       (default 60000, ceiling 180000). Returns timed_out: true when \
+                       nothing matched — re-submit the form or widen the sender filter \
+                       rather than looping forever here; the poll is bounded on purpose."
+    )]
+    async fn await_verification_mail(
+        &self,
+        Parameters(p): Parameters<AwaitVerificationParams>,
+    ) -> Result<Json<AwaitVerificationResult>, ErrorData> {
+        let address = {
+            let accounts = self.engine().mailbox_accounts();
+            let account = accounts
+                .into_iter()
+                .find(|m| m.id == p.mailbox_id)
+                .ok_or_else(|| {
+                    ErrorData::resource_not_found(
+                        format!(
+                            "no mailbox #{} — list_mailbox_accounts shows what exists",
+                            p.mailbox_id
+                        ),
+                        None,
+                    )
+                })?;
+            p.address
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(account.address)
+        };
+        const MIN_TIMEOUT_MS: i64 = 1_000;
+        const MAX_TIMEOUT_MS: i64 = 180_000;
+        const POLL_INTERVAL_MS: u64 = 3_000;
+        let timeout_ms = p
+            .timeout_ms
+            .unwrap_or(60_000)
+            .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let sender = p.sender_contains.as_deref().map(str::to_string);
+        loop {
+            // One IMAP pass is blocking network I/O; it must not sit on a
+            // tokio worker, and it must not sit inside the engine's
+            // connection mutex — spawn_blocking gets both.
+            let engine = self.engine().clone();
+            let address = address.clone();
+            let sender = sender.clone();
+            let pass = tokio::task::spawn_blocking(move || {
+                engine.fetch_verification_mail(p.mailbox_id, &address, sender.as_deref())
+            })
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("poll task: {e}"), None))?;
+            let mail = pass.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            match mail {
+                Some(mail) => {
+                    return Ok(Json(AwaitVerificationResult {
+                        mail: Some(VerificationMailDto::from(mail)),
+                        timed_out: false,
+                    }));
+                }
+                None if std::time::Instant::now() >= deadline => {
+                    return Ok(Json(AwaitVerificationResult {
+                        mail: None,
+                        timed_out: true,
+                    }));
+                }
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await
+                }
+            }
+        }
+    }
+
+    // --- the goal plane (phases 7-8) ---
+    //
+    // The run's records. The refusals live in the core: `achieved` without a
+    // canary hit, a settle without a justification, a second goal while one
+    // runs. This layer is the door, and the door does not open on belief.
+
+    #[tool(
+        description = "Open the run's goal — exactly one may run at a time, and it can only \
+                       end in one of four states (see settle_goal). Record the success \
+                       predicate as something auditable: for RCE-shaped goals that is a \
+                       canary callback carrying our nonce."
+    )]
+    async fn open_goal(
+        &self,
+        Parameters(p): Parameters<OpenGoalParams>,
+    ) -> Result<Json<GoalIdResult>, ErrorData> {
+        let text = p.text.trim().to_string();
+        if text.is_empty() {
+            return Err(ErrorData::invalid_params("text must not be empty", None));
+        }
+        let id = self
+            .engine()
+            .open_goal(&lockgate_core::NewGoal {
+                text,
+                success_predicate_md: p.success_predicate_md,
+                canary_domain: p
+                    .canary_domain
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                budget_ms: p.budget_ms.max(0),
+            })
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(GoalIdResult { goal_id: id }))
+    }
+
+    #[tool(
+        description = "The running goal (or one by id) with the run's state digest: active \
+                       frontier, milestones, dead ends, canary standing. This is what a \
+                       relaunched context reads first to resume a run."
+    )]
+    async fn get_goal(
+        &self,
+        Parameters(p): Parameters<GoalIdParams>,
+    ) -> Result<Json<GetGoalResult>, ErrorData> {
+        let goal = match p.goal_id {
+            Some(id) => self
+                .engine()
+                .goal(id)
+                .ok_or_else(|| ErrorData::resource_not_found(format!("no goal #{id}"), None))?,
+            None => self.engine().running_goal().ok_or_else(|| {
+                ErrorData::resource_not_found("no goal running — open_goal first", None)
+            })?,
+        };
+        Ok(Json(GetGoalResult {
+            state_digest: self.engine().run_state_digest(),
+            goal: GoalDto::from(goal),
+        }))
+    }
+
+    #[tool(
+        description = "Settle the running goal into one of the four legal stop states: \
+                       achieved | budget_exhausted | frontier_empty | operator_killed. Every \
+                       settle requires a written reason; `achieved` additionally requires a \
+                       recorded canary hit (mint with mint_canary, record with \
+                       record_canary_hit). Believing you succeeded is not evidence — the \
+                       oracle is. You cannot settle silently and you cannot settle twice."
+    )]
+    async fn settle_goal(
+        &self,
+        Parameters(p): Parameters<SettleGoalParams>,
+    ) -> Result<Json<GoalDto>, ErrorData> {
+        let id = match p.goal_id {
+            Some(id) => id,
+            None => self
+                .engine()
+                .running_goal()
+                .map(|g| g.id)
+                .ok_or_else(|| ErrorData::resource_not_found("no goal running", None))?,
+        };
+        self.engine()
+            .settle_goal(id, &p.state, &p.reason_md)
+            .map_err(|e| ErrorData::invalid_request(e.to_string(), None))?;
+        let goal = self.engine().goal(id).ok_or_else(|| {
+            ErrorData::internal_error("goal vanished after settle".to_string(), None)
+        })?;
+        Ok(Json(GoalDto::from(goal)))
+    }
+
+    #[tool(
+        description = "Mint a canary nonce for the running goal — one per attempt, so a hit \
+                       names the exact payload that fired. Place it as \
+                       <nonce>.<canary_domain> (DNS-style, e.g. in an SSRF, file path, or \
+                       command) or ?c=<nonce> (URL-style). The listener (operator \
+                       infrastructure) reports the callback; record it with \
+                       record_canary_hit. `achieved` settles only with a hit."
+    )]
+    async fn mint_canary(
+        &self,
+        Parameters(p): Parameters<MintCanaryParams>,
+    ) -> Result<Json<CanaryNonceDto>, ErrorData> {
+        let goal = self.engine().running_goal().ok_or_else(|| {
+            ErrorData::resource_not_found("no goal running — open_goal first", None)
+        })?;
+        let nonce = self
+            .engine()
+            .mint_canary(
+                goal.id,
+                p.label.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            )
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(CanaryNonceDto::from(nonce)))
+    }
+
+    #[tool(
+        description = "Record that a canary nonce fired, when the listener reports the \
+                       callback. Pass the flow whose payload carried the nonce — that link \
+                       is what turns 'it fired' into evidence. This is what satisfies the \
+                       oracle for an `achieved` settle."
+    )]
+    async fn record_canary_hit(
+        &self,
+        Parameters(p): Parameters<RecordCanaryHitParams>,
+    ) -> Result<Json<CanaryNonceDto>, ErrorData> {
+        let nonce = self
+            .engine()
+            .record_canary_hit(p.nonce.trim(), p.flow_id)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?
+            .ok_or_else(|| {
+                ErrorData::resource_not_found(
+                    format!("no unhit nonce {:?} — mint_canary first", p.nonce),
+                    None,
+                )
+            })?;
+        Ok(Json(CanaryNonceDto::from(nonce)))
+    }
+
+    #[tool(
+        description = "The running goal's canary nonces, with which fired and which flow \
+                       each hit links to."
+    )]
+    async fn list_canaries(&self) -> Result<Json<ListCanariesResult>, ErrorData> {
+        let goal = self
+            .engine()
+            .running_goal()
+            .ok_or_else(|| ErrorData::resource_not_found("no goal running", None))?;
+        Ok(Json(ListCanariesResult {
+            nonces: self
+                .engine()
+                .canaries(goal.id)
+                .into_iter()
+                .map(CanaryNonceDto::from)
+                .collect(),
+        }))
+    }
+
+    // --- the frontier and the milestone trail (phase 8) ---
+
+    #[tool(
+        description = "Propose a rung of the attack-tree frontier for the running goal: the \
+                       ladders (auth_bypass, upload_traversal, deserialization, ssti, \
+                       cmd_injection, ssrf_internal, known_cve, tenant_admin, \
+                       signup_mass_assignment, config_exposure, other) with a priority. \
+                       Seed broadly at the start — the dead-ends you bury are also a result."
+    )]
+    async fn propose_frontier_item(
+        &self,
+        Parameters(p): Parameters<ProposeFrontierParams>,
+    ) -> Result<Json<FrontierIdResult>, ErrorData> {
+        let goal = self.engine().running_goal().ok_or_else(|| {
+            ErrorData::resource_not_found("no goal running — open_goal first", None)
+        })?;
+        let id = self
+            .engine()
+            .propose_frontier_item(&lockgate_core::NewFrontierItem {
+                goal_id: goal.id,
+                title: p.title.trim().to_string(),
+                ladder: p.ladder,
+                priority: p.priority.unwrap_or(0),
+                note_md: p.note_md.filter(|s| !s.trim().is_empty()),
+            })
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(FrontierIdResult { frontier_id: id }))
+    }
+
+    #[tool(
+        description = "Move a frontier item: set it active (the current expansion), \
+                       milestone_reached (graded progress), or bury it — dead_end (it does \
+                       not work) or exhausted (budget ran out mid-ladder). Burying requires \
+                       a note saying why; a relaunched context reads that note instead of \
+                       repeating the attempt. Consult the dead ends before retrying anything."
+    )]
+    async fn update_frontier_item(
+        &self,
+        Parameters(p): Parameters<UpdateFrontierParams>,
+    ) -> Result<Json<RowsChangedResult>, ErrorData> {
+        let rows = self
+            .engine()
+            .set_frontier_status(
+                p.frontier_id,
+                p.status.as_deref().unwrap_or(""),
+                p.note.as_deref(),
+            )
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        if let Some(priority) = p.priority {
+            let _ = self.engine().set_frontier_priority(p.frontier_id, priority);
+        }
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!("no frontier item #{}", p.frontier_id),
+                None,
+            ));
+        }
+        Ok(Json(RowsChangedResult {
+            rows_changed: rows as u64,
+        }))
+    }
+
+    #[tool(
+        description = "The running goal's frontier, optionally filtered by status. \
+                       dead_end is the ledger of what not to retry; proposed ordered by \
+                       priority is what to expand next."
+    )]
+    async fn list_frontier(
+        &self,
+        Parameters(p): Parameters<ListFrontierParams>,
+    ) -> Result<Json<ListFrontierResult>, ErrorData> {
+        let goal = self
+            .engine()
+            .running_goal()
+            .ok_or_else(|| ErrorData::resource_not_found("no goal running", None))?;
+        let items = self
+            .engine()
+            .frontier(goal.id, p.status.as_deref())
+            .into_iter()
+            .map(FrontierItemDto::from)
+            .collect();
+        Ok(Json(ListFrontierResult { items }))
+    }
+
+    #[tool(
+        description = "Record a milestone — graded progress toward the goal ('have T1 \
+                       session', 'SSRF to internal confirmed'). The trail is what a \
+                       watchdog reads: no milestone in a long stretch is a stall, however \
+                       busy the transcript looks."
+    )]
+    async fn record_milestone(
+        &self,
+        Parameters(p): Parameters<RecordMilestoneParams>,
+    ) -> Result<Json<MilestoneIdResult>, ErrorData> {
+        let goal = self
+            .engine()
+            .running_goal()
+            .ok_or_else(|| ErrorData::resource_not_found("no goal running", None))?;
+        let title = p.title.trim().to_string();
+        if title.is_empty() {
+            return Err(ErrorData::invalid_params("title must not be empty", None));
+        }
+        let id = self
+            .engine()
+            .record_milestone(goal.id, &title, p.note.as_deref());
+        Ok(Json(MilestoneIdResult { milestone_id: id }))
+    }
+
+    #[tool(description = "The running goal's milestones, newest first.")]
+    async fn list_milestones(
+        &self,
+        Parameters(p): Parameters<ListMilestonesParams>,
+    ) -> Result<Json<ListMilestonesResult>, ErrorData> {
+        let goal = self
+            .engine()
+            .running_goal()
+            .ok_or_else(|| ErrorData::resource_not_found("no goal running", None))?;
+        let milestones = self
+            .engine()
+            .milestones(goal.id, p.limit.unwrap_or(20).clamp(1, 200))
+            .into_iter()
+            .map(MilestoneDto::from)
+            .collect();
+        Ok(Json(ListMilestonesResult { milestones }))
+    }
+
+    #[tool(
+        description = "The run's state digest as markdown — goal and budget, active \
+                       frontier, recent milestones, dead ends, canary standing. Read this \
+                       first when resuming a run in a fresh context; it is the whole story \
+                       the previous context left behind."
+    )]
+    async fn run_state_digest(&self) -> Result<Json<StateDigestResult>, ErrorData> {
+        Ok(Json(StateDigestResult {
+            digest: self.engine().run_state_digest(),
+        }))
+    }
+
+    // --- the egress plane (phase 9) ---
+
+    #[tool(
+        description = "Register an egress exit. trusted = the engine's own egress or an \
+                       exit the operator vouches for (their VPS, their residential exit); \
+                       pooled = a commercial pool; hostile = harvested free proxies — \
+                       expect to be MITM'd. Identity-bearing sends are refused on anything \
+                       but trusted, in the engine. The direct trusted exit (no proxy URL) \
+                       exists exactly once."
+    )]
+    async fn add_egress_exit(
+        &self,
+        Parameters(p): Parameters<AddEgressExitParams>,
+    ) -> Result<Json<EgressIdResult>, ErrorData> {
+        let name = p.name.trim().to_string();
+        if name.is_empty() {
+            return Err(ErrorData::invalid_params("name must not be empty", None));
+        }
+        let id = self
+            .engine()
+            .add_egress_exit(&lockgate_core::NewEgressExit {
+                name,
+                kind: p.kind,
+                proxy_url: p
+                    .proxy_url
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                note: p.note.filter(|s| !s.trim().is_empty()),
+            })
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(EgressIdResult { exit_id: id }))
+    }
+
+    #[tool(
+        description = "The registered egress exits with their trust classes. Pin an \
+                       identity to one with update_identity's egress_exit_id; route an \
+                       anonymous send through one with via_exit on the send tools."
+    )]
+    async fn list_egress_exits(&self) -> Result<Json<ListEgressExitsResult>, ErrorData> {
+        Ok(Json(ListEgressExitsResult {
+            exits: self
+                .engine()
+                .egress_exits()
+                .into_iter()
+                .map(EgressExitDto::from)
+                .collect(),
+        }))
+    }
+
+    #[tool(description = "Forget an egress exit. Refused while an identity is pinned to it.")]
+    async fn delete_egress_exit(
+        &self,
+        Parameters(p): Parameters<EgressIdParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        let rows = self
+            .engine()
+            .delete_egress_exit(p.exit_id)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!("no egress exit #{}", p.exit_id),
+                None,
+            ));
+        }
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    // --- the tier diff (phase 10) ---
+
+    #[tool(
+        description = "Diff the endpoints.jsonl of two materialised directories — the \
+                       boundary between two tiers. Crawl as each identity, materialise \
+                       each crawl to its own directory, diff: every only_in_* row is an \
+                       access-control question ('why does t1 reach this and t0 not?'). \
+                       Shared rows are the common surface."
+    )]
+    async fn diff_tiers(
+        &self,
+        Parameters(p): Parameters<DiffTiersParams>,
+    ) -> Result<Json<TierDiffDto>, ErrorData> {
+        let diff = lockgate_core::materialise::tier_diff(
+            std::path::Path::new(&p.dir_a),
+            std::path::Path::new(&p.dir_b),
+        )
+        .map_err(|e| ErrorData::invalid_params(format!("cannot diff: {e}"), None))?;
+        Ok(Json(TierDiffDto {
+            only_in_a: diff.only_in_a,
+            only_in_b: diff.only_in_b,
+            shared: diff.shared as i64,
+        }))
     }
 
     #[tool(
@@ -2756,12 +3574,46 @@ fn resend_error(e: ResendError) -> ErrorData {
             format!("no identity #{id} — list_identities shows what exists"),
             None,
         ),
+        ResendError::EgressRefused {
+            identity,
+            exit,
+            kind,
+        } => ErrorData::invalid_request(
+            format!(
+                "egress refused: “{identity}” would leave through “{exit}” ({kind}) — \
+                 identity-bearing traffic never rides a non-trusted exit. This is the \
+                 engine's rule; move the identity's pin or drop as_identity."
+            ),
+            None,
+        ),
+        ResendError::ExitNotFound(name) => {
+            ErrorData::resource_not_found(format!("no egress exit named “{name}”"), None)
+        }
+        ResendError::ExitUnusable { exit, cause } => ErrorData::invalid_request(
+            format!("egress exit “{exit}” cannot be used: {cause}"),
+            None,
+        ),
         ResendError::Http(e) => ErrorData::internal_error(format!("resend failed: {e}"), None),
     }
 }
 
 /// Turn a wire cookie into a core one, defaulting its domain to the identity's
 /// host and its path to `/` — the two attributes a caller usually means.
+/// `provenance` as the wire takes it: `operator` or `self_registered`,
+/// anything else refused. The report's black-box claim hangs off this column,
+/// so a typo must not silently default the run's story to "operator".
+fn parse_provenance(s: Option<&str>) -> Result<lockgate_core::Provenance, ErrorData> {
+    match s {
+        None => Ok(lockgate_core::Provenance::Operator),
+        Some("operator") => Ok(lockgate_core::Provenance::Operator),
+        Some("self_registered") => Ok(lockgate_core::Provenance::SelfRegistered),
+        Some(other) => Err(ErrorData::invalid_params(
+            format!("provenance must be \"operator\" or \"self_registered\", not {other:?}"),
+            None,
+        )),
+    }
+}
+
 fn cookie_input(host: Option<&str>, c: &CookieInput) -> Result<lockgate_core::Cookie, String> {
     let name = c.name.trim();
     if name.is_empty() {
@@ -3121,6 +3973,8 @@ mod tests {
                 base_flow_id: None,
                 as_identity: None,
                 tag: None,
+
+                via_exit: None,
             }))
             .await;
         let message = format!("{:?}", result.err().expect("should refuse"));
@@ -3137,6 +3991,8 @@ mod tests {
                 base_flow_id: None,
                 as_identity: None,
                 tag: None,
+
+                via_exit: None,
             }))
             .await;
         let message = format!("{:?}", result.err().expect("should refuse"));
@@ -3153,6 +4009,8 @@ mod tests {
                 base_flow_id: Some(999),
                 as_identity: None,
                 tag: None,
+
+                via_exit: None,
             }))
             .await;
         assert!(result.is_err());
@@ -3894,6 +4752,11 @@ mod tests {
                 }],
                 totp_secret: Some("JBSWY3DPEHPK3PXP".into()),
                 note: Some("the operator's login".into()),
+
+                password: None,
+                provenance: None,
+                seed_account: None,
+                egress_exit_id: None,
             }))
             .await
             .unwrap()
@@ -3925,6 +4788,11 @@ mod tests {
                 totp_secret: None,
                 note: Some("now noted".into()),
                 cookies: None,
+
+                password: None,
+                provenance: None,
+                seed_account: None,
+                egress_exit_id: None,
             }))
             .await
             .unwrap()
@@ -3948,6 +4816,11 @@ mod tests {
                     domain: None,
                     path: None,
                 }]),
+
+                password: None,
+                provenance: None,
+                seed_account: None,
+                egress_exit_id: None,
             }))
             .await
             .unwrap()
@@ -3966,6 +4839,11 @@ mod tests {
                 cookies: vec![],
                 totp_secret: None,
                 note: None,
+
+                password: None,
+                provenance: None,
+                seed_account: None,
+                egress_exit_id: None,
             }))
             .await
             .map(|_| ())
@@ -3987,6 +4865,265 @@ mod tests {
                 .identities
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_self_registered_identity_carries_provenance_and_keeps_its_password() {
+        let (_engine, server) = setup();
+
+        server
+            .create_identity(Parameters(CreateIdentityParams {
+                name: "selfreg:t1:u1".into(),
+                host: Some("app.example.com".into()),
+                cookies: vec![],
+                totp_secret: None,
+                note: None,
+                password: Some("REGISTRATION-PASSWORD".into()),
+                provenance: Some("self_registered".into()),
+                seed_account: Some("probe+t1@gmail.com".into()),
+                egress_exit_id: None,
+            }))
+            .await
+            .unwrap();
+
+        let listed = &server.list_identities().await.unwrap().0.identities[0];
+        assert_eq!(listed.provenance, "self_registered");
+        assert_eq!(listed.seed_account.as_deref(), Some("probe+t1@gmail.com"));
+        // The length, never the value.
+        assert_eq!(listed.password_len, Some(21));
+        // The transcript never carries the credential.
+        let rendered = serde_json::to_string(&server.list_identities().await.unwrap().0).unwrap();
+        assert!(
+            !rendered.contains("REGISTRATION-PASSWORD"),
+            "a registration password must never reach a transcript: {rendered}"
+        );
+
+        // Provenance is a closed set: a typo is refused, not defaulted — the
+        // report's black-box claim hangs off this column.
+        let err = server
+            .create_identity(Parameters(CreateIdentityParams {
+                name: "typo".into(),
+                host: None,
+                cookies: vec![],
+                totp_secret: None,
+                note: None,
+                password: None,
+                provenance: Some("self-registered".into()),
+                seed_account: None,
+                egress_exit_id: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("provenance"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn the_frontier_and_digest_survive_a_context_relaunch() {
+        let (_engine, server) = setup();
+
+        server
+            .open_goal(Parameters(OpenGoalParams {
+                text: "RCE".into(),
+                success_predicate_md: "canary".into(),
+                canary_domain: None,
+                budget_ms: 0,
+            }))
+            .await
+            .unwrap();
+        let item = server
+            .propose_frontier_item(Parameters(ProposeFrontierParams {
+                title: "Upload + path traversal to webroot".into(),
+                ladder: "upload_traversal".into(),
+                priority: Some(9),
+                note_md: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .frontier_id;
+
+        // Burying without the reason is refused — the reason is what a
+        // relaunched context reads instead of repeating the attempt.
+        let err = server
+            .update_frontier_item(Parameters(UpdateFrontierParams {
+                frontier_id: item,
+                status: Some("dead_end".into()),
+                note: Some("  ".into()),
+                priority: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("note"), "{}", err.message);
+
+        server
+            .record_milestone(Parameters(RecordMilestoneParams {
+                title: "anonymous surface mapped".into(),
+                note: Some("endpoints materialised".into()),
+            }))
+            .await
+            .unwrap();
+
+        let digest = server.run_state_digest().await.unwrap().0.digest;
+        assert!(digest.contains("Upload + path traversal"));
+        assert!(digest.contains("anonymous surface mapped"));
+        assert!(digest.contains("Dead ends"));
+    }
+
+    #[tokio::test]
+    async fn mailboxes_round_trip_without_their_app_password() {
+        let (_engine, server) = setup();
+
+        let id = server
+            .add_mailbox_account(Parameters(AddMailboxAccountParams {
+                address: "probe@gmail.com".into(),
+                app_password: "APP-PASSWORD-VALUE".into(),
+                imap_host: None,
+                imap_port: None,
+                imap_username: None,
+                note: Some("the operator's throwaway".into()),
+            }))
+            .await
+            .unwrap()
+            .0
+            .mailbox_id;
+
+        let listed = &server.list_mailbox_accounts().await.unwrap().0.mailboxes[0];
+        assert_eq!(listed.id, id);
+        assert_eq!(listed.address, "probe@gmail.com");
+        // Gmail defaults filled in where the caller said nothing.
+        assert_eq!(listed.imap_host, "imap.gmail.com");
+        assert_eq!(listed.imap_port, 993);
+        assert_eq!(listed.imap_username, "probe@gmail.com");
+        let rendered =
+            serde_json::to_string(&server.list_mailbox_accounts().await.unwrap().0).unwrap();
+        assert!(
+            !rendered.contains("APP-PASSWORD-VALUE"),
+            "an app password must never reach a transcript: {rendered}"
+        );
+        assert!(
+            !rendered.contains("app_password"),
+            "not even the field name belongs in a read: {rendered}"
+        );
+
+        // One mailbox per address; duplicates are refused.
+        let err = server
+            .add_mailbox_account(Parameters(AddMailboxAccountParams {
+                address: "probe@gmail.com".into(),
+                app_password: "x".into(),
+                imap_host: None,
+                imap_port: None,
+                imap_username: None,
+                note: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.message.contains("already registered"),
+            "{}",
+            err.message
+        );
+
+        // Awaiting on an unknown mailbox fails before any network happens.
+        let err = server
+            .await_verification_mail(Parameters(AwaitVerificationParams {
+                mailbox_id: 999,
+                address: None,
+                sender_contains: None,
+                timeout_ms: Some(1_000),
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("no mailbox"), "{}", err.message);
+
+        let ok = server
+            .delete_mailbox_account(Parameters(MailboxIdParams { mailbox_id: id }))
+            .await
+            .unwrap()
+            .0;
+        assert!(ok.ok);
+        assert!(
+            server
+                .list_mailbox_accounts()
+                .await
+                .unwrap()
+                .0
+                .mailboxes
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_settles_achieved_only_through_the_oracle() {
+        let (_engine, server) = setup();
+
+        server
+            .open_goal(Parameters(OpenGoalParams {
+                text: "Achieve RCE on app.example.com".into(),
+                success_predicate_md: "canary callback carrying our nonce".into(),
+                canary_domain: Some("canary.example.net".into()),
+                budget_ms: 3_600_000,
+            }))
+            .await
+            .unwrap();
+
+        let nonce = server
+            .mint_canary(Parameters(MintCanaryParams {
+                label: Some("upload-then-traverse".into()),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        // Belief is not evidence: the settle is refused until the listener
+        // reports the hit. This refusal is the module's whole point.
+        let err = server
+            .settle_goal(Parameters(SettleGoalParams {
+                goal_id: None,
+                state: "achieved".into(),
+                reason_md: "pretty sure it worked".into(),
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("canary"), "{}", err.message);
+
+        server
+            .record_canary_hit(Parameters(RecordCanaryHitParams {
+                nonce: nonce.nonce.clone(),
+                flow_id: None,
+            }))
+            .await
+            .unwrap();
+        let settled = server
+            .settle_goal(Parameters(SettleGoalParams {
+                goal_id: None,
+                state: "achieved".into(),
+                reason_md: "nonce fired; evidence flow linked".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(settled.status, "achieved");
+        assert_eq!(
+            settled.stop_reason_md.as_deref(),
+            Some("nonce fired; evidence flow linked")
+        );
+
+        // And a settled run opens no second goal by accident: a new one can
+        // start, because the previous story is finished.
+        server
+            .open_goal(Parameters(OpenGoalParams {
+                text: "next run".into(),
+                success_predicate_md: "x".into(),
+                canary_domain: None,
+                budget_ms: 0,
+            }))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4442,6 +5579,8 @@ mod tests {
                 id,
                 as_identity: Some(7),
                 tag: None,
+
+                via_exit: None,
             }))
             .await
             .map(|_| ())
@@ -4480,6 +5619,8 @@ mod tests {
                 id,
                 as_identity: None,
                 tag: None,
+
+                via_exit: None,
             }))
             .await
             .map(|_| ())

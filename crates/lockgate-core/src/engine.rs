@@ -11,6 +11,7 @@ use crate::db::ProjectPaths;
 use crate::finding::{Finding, FindingEdit, NewFinding, WriteUp};
 use crate::identity::{self, Identity, IdentityEdit, NewIdentity};
 use crate::intercept::Intercept;
+use crate::mailbox;
 use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary, now_micros};
 use crate::note::{NewNote, Note};
 use crate::read::{self, BodySlice, FlowDetail, FlowQuery, FlowRow, Side, SitemapNode};
@@ -54,6 +55,10 @@ pub struct Engine {
     /// A mutex because the engine lives in an `Arc` and notifications are
     /// configured once, after construction, by whoever built it.
     notifier: std::sync::Mutex<crate::notify::Notifier>,
+    /// One client (and connection pool) per proxied egress exit, built on
+    /// first use and kept: a pool is only worth pooling. The direct exit is
+    /// `http` above, so an engine with no proxied exits builds nothing.
+    egress_clients: Mutex<HashMap<i64, reqwest::Client>>,
 }
 
 /// Everything observable about engine state, collapsed to a value that can be
@@ -138,6 +143,22 @@ pub enum ResendError {
     },
     /// The replay asked to be sent as an identity that does not exist.
     IdentityNotFound(i64),
+    /// The send would leave through a non-trusted egress exit while carrying
+    /// an identity — the egress plane's one rule, refused by the engine
+    /// before anything is recorded. A pin is where a session *should* leave
+    /// from, not permission to leak it through a proxy nobody vouched for.
+    EgressRefused {
+        identity: String,
+        exit: String,
+        kind: String,
+    },
+    /// `via_exit` named an exit that does not exist.
+    ExitNotFound(String),
+    /// The exit's proxy URL could not become a client.
+    ExitUnusable {
+        exit: String,
+        cause: String,
+    },
     Http(reqwest::Error),
 }
 
@@ -177,6 +198,7 @@ impl Engine {
             send_lasts: Mutex::new(HashMap::new()),
             scanned: Mutex::new(HashSet::new()),
             notifier: std::sync::Mutex::new(crate::notify::Notifier::disabled()),
+            egress_clients: Mutex::new(HashMap::new()),
         })
     }
 
@@ -204,6 +226,7 @@ impl Engine {
             send_lasts: Mutex::new(HashMap::new()),
             scanned: Mutex::new(HashSet::new()),
             notifier: std::sync::Mutex::new(crate::notify::Notifier::disabled()),
+            egress_clients: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -679,6 +702,57 @@ impl Engine {
         identity::adopt(&conn, flow_id, name, now_micros())
     }
 
+    /// The custody password for an identity, when one is stored. The only
+    /// engine read path for it; `identities()`/`identity()` cannot return it.
+    pub fn identity_password(&self, id: i64) -> Option<String> {
+        let conn = self.read_conn().lock().unwrap();
+        identity::password(&conn, id).ok().flatten()
+    }
+
+    // --- mailboxes ---
+    //
+    // Where verification mail is read from (see `mailbox`). The app password
+    // is engine-held: the account reads back without any credential, and the
+    // fetch below snapshots the endpoint under the lock and lets go of it
+    // before any network runs — a two-second IMAP round-trip must never sit
+    // inside the connection mutex.
+
+    pub fn mailbox_accounts(&self) -> Vec<mailbox::MailboxAccount> {
+        self.read(mailbox::list)
+    }
+
+    pub fn add_mailbox_account(
+        &self,
+        new: &mailbox::NewMailboxAccount,
+    ) -> Result<i64, mailbox::MailboxError> {
+        let conn = self.read_conn().lock().unwrap();
+        mailbox::insert(&conn, new, now_micros())
+    }
+
+    pub fn delete_mailbox_account(&self, id: i64) -> usize {
+        self.with_db(|conn| mailbox::delete(conn, id))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    /// One IMAP pass for the newest unseen mail to `to_address`. `None` means
+    /// nothing matched — the caller's poll loop decides whether to try again.
+    /// Blocking by design; the MCP layer parks it on a blocking thread.
+    pub fn fetch_verification_mail(
+        &self,
+        mailbox_id: i64,
+        to_address: &str,
+        sender_contains: Option<&str>,
+    ) -> Result<Option<mailbox::VerificationMail>, mailbox::MailboxError> {
+        let (endpoint, password) = {
+            let conn = self.read_conn().lock().unwrap();
+            mailbox::endpoint_and_password(&conn, mailbox_id)
+                .map_err(mailbox::MailboxError::Db)?
+                .ok_or_else(|| mailbox::MailboxError::Imap(format!("no mailbox #{mailbox_id}")))?
+        };
+        mailbox::fetch_verification(&endpoint, &password, to_address, sender_contains)
+    }
+
     // --- policy ---
     //
     // The engagement's guardrails. Reads happen per send inside `send_request`;
@@ -968,7 +1042,7 @@ impl Engine {
     /// The replay is itself recorded as a new flow carrying `parent_id = id`,
     /// so a send and its origin stay linked instead of the result vanishing.
     pub async fn resend(&self, id: FlowId) -> Result<Resent, ResendError> {
-        self.resend_as(id, None, None).await
+        self.resend_as(id, None, None, None).await
     }
 
     /// [`Engine::resend`], optionally sent *as* an identity: the identity's
@@ -978,14 +1052,17 @@ impl Engine {
     ///
     /// `tag` labels the replay with what it was *for* (`lead:idor-3`), so
     /// evidence can be filtered by the question that produced it.
+    /// `via_exit` names an egress exit; the engine still refuses
+    /// identity-bearing replays on non-trusted exits.
     pub async fn resend_as(
         &self,
         id: FlowId,
         as_identity: Option<i64>,
         tag: Option<String>,
+        via_exit: Option<&str>,
     ) -> Result<Resent, ResendError> {
         let flow = self.get_flow(id).ok_or(ResendError::NotFound(id))?;
-        self.send_request(flow.request, Some(id), as_identity, tag)
+        self.send_request_via(flow.request, Some(id), as_identity, tag, via_exit)
             .await
     }
 
@@ -999,14 +1076,32 @@ impl Engine {
     /// its purpose.
     ///
     /// Every send passes the same gates, in order: scope, policy (forbidden
-    /// URLs then the rate ceiling), identity. A refusal happens before anything
-    /// is recorded — history only ever shows traffic that actually left.
+    /// URLs then the rate ceiling), egress, identity. A refusal happens before
+    /// anything is recorded — history only ever shows traffic that actually
+    /// left. [`Engine::send_request_via`] is the same send with an explicit
+    /// egress exit.
     pub async fn send_request(
+        &self,
+        req: CapturedRequest,
+        origin: Option<FlowId>,
+        as_identity: Option<i64>,
+        tag: Option<String>,
+    ) -> Result<Resent, ResendError> {
+        self.send_request_via(req, origin, as_identity, tag, None)
+            .await
+    }
+
+    /// [`Engine::send_request`] with an explicit egress exit by name — for
+    /// anonymous traffic the agent wants to route through a pooled or
+    /// hostile exit. Identity-bearing sends are refused on anything but a
+    /// trusted exit no matter what is asked here.
+    pub async fn send_request_via(
         &self,
         mut req: CapturedRequest,
         origin: Option<FlowId>,
         as_identity: Option<i64>,
         tag: Option<String>,
+        via_exit: Option<&str>,
     ) -> Result<Resent, ResendError> {
         let url = target_url(&req).ok_or(ResendError::NoTarget)?;
 
@@ -1047,12 +1142,25 @@ impl Engine {
         }
         self.enforce_rate_limit(policy.as_ref(), &req)?;
 
+        // Egress: which exit this send leaves through. The exit is the
+        // explicit `via_exit` when given, else the identity's pin, else the
+        // engine's own. The plane's one rule runs here, in code: a send
+        // carrying an identity never leaves through an exit nobody vouched
+        // for. Refused before cookies are applied and before anything is
+        // recorded — history only ever shows traffic that actually left.
+        let identity = match as_identity {
+            Some(identity_id) => Some(
+                self.identity(identity_id)
+                    .ok_or(ResendError::IdentityNotFound(identity_id))?,
+            ),
+            None => None,
+        };
+        let exit = self.resolve_exit(via_exit, identity.as_ref())?;
+        let client = self.client_for(exit.as_ref())?;
+
         // Applied before the replay is recorded, so history shows the request
         // exactly as it went on the wire — the evidence must carry the identity.
-        if let Some(identity_id) = as_identity {
-            let identity = self
-                .identity(identity_id)
-                .ok_or(ResendError::IdentityNotFound(identity_id))?;
+        if let Some(identity) = &identity {
             let path = req
                 .uri
                 .path_and_query()
@@ -1072,8 +1180,7 @@ impl Engine {
 
         let replay_id = self.record_tagged(req.clone(), Source::Repeater, origin, tag);
 
-        let resp = self
-            .http
+        let resp = client
             .request(req.method, url)
             .headers(req.headers)
             .body(req.body)
@@ -1097,6 +1204,213 @@ impl Engine {
             replay_id,
             response,
         })
+    }
+
+    /// The exit a send leaves through: the named one when given, else the
+    /// identity's pin, else `None` (the engine's own egress). The plane's
+    /// rule runs here — identity-bearing traffic never rides a non-trusted
+    /// exit, whatever the pin or the caller says.
+    fn resolve_exit(
+        &self,
+        via_exit: Option<&str>,
+        identity: Option<&Identity>,
+    ) -> Result<Option<crate::egress::EgressExit>, ResendError> {
+        let named = match via_exit {
+            None => None,
+            Some(name) => {
+                let exits = self.egress_exits();
+                Some(
+                    exits
+                        .into_iter()
+                        .find(|e| e.name == name)
+                        .ok_or_else(|| ResendError::ExitNotFound(name.to_string()))?,
+                )
+            }
+        };
+        let pinned = match (&named, identity.and_then(|i| i.egress_exit_id)) {
+            // An explicit exit outranks the pin: the caller knew what they
+            // asked for, and the rule below still applies to it.
+            (Some(_), _) => named.clone(),
+            (None, Some(exit_id)) => self.egress_exit(exit_id),
+            (None, None) => None,
+        };
+        if let (Some(identity), Some(exit)) = (identity, &pinned)
+            && exit.kind != "trusted"
+        {
+            return Err(ResendError::EgressRefused {
+                identity: identity.name.clone(),
+                exit: exit.name.clone(),
+                kind: exit.kind.clone(),
+            });
+        }
+        Ok(pinned)
+    }
+
+    /// The client for an exit. `None` is the engine's own client; a proxied
+    /// exit gets its own, cached — a connection pool is only worth pooling.
+    fn client_for(
+        &self,
+        exit: Option<&crate::egress::EgressExit>,
+    ) -> Result<reqwest::Client, ResendError> {
+        let Some(exit) = exit else {
+            return Ok(self.http.clone());
+        };
+        let Some(proxy_url) = &exit.proxy_url else {
+            // A trusted exit with no URL *is* the direct exit.
+            return Ok(self.http.clone());
+        };
+        if let Some(client) = self.egress_clients.lock().unwrap().get(&exit.id) {
+            return Ok(client.clone());
+        }
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| ResendError::ExitUnusable {
+            exit: exit.name.clone(),
+            cause: e.to_string(),
+        })?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .build()
+            .map_err(|e| ResendError::ExitUnusable {
+                exit: exit.name.clone(),
+                cause: e.to_string(),
+            })?;
+        self.egress_clients
+            .lock()
+            .unwrap()
+            .insert(exit.id, client.clone());
+        Ok(client)
+    }
+
+    // --- the goal plane (phase 7-8) ---
+    //
+    // The run's records, on the same synchronous-write pattern as identities:
+    // a handful of rows the caller must see landed before continuing. The
+    // refusals that matter live in goal.rs, not here — the engine is just the
+    // door.
+
+    pub fn running_goal(&self) -> Option<crate::goal::Goal> {
+        self.read(crate::goal::running)
+    }
+
+    pub fn goal(&self, id: i64) -> Option<crate::goal::Goal> {
+        self.read(|conn| crate::goal::get(conn, id))
+    }
+
+    pub fn open_goal(&self, new: &crate::goal::NewGoal) -> Result<i64, crate::goal::GoalError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::goal::open(&conn, new, now_micros())
+    }
+
+    pub fn settle_goal(
+        &self,
+        goal_id: i64,
+        state: &str,
+        reason_md: &str,
+    ) -> Result<usize, crate::goal::GoalError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::goal::settle(&conn, goal_id, state, reason_md, now_micros())
+    }
+
+    pub fn mint_canary(
+        &self,
+        goal_id: i64,
+        label: Option<&str>,
+    ) -> Result<crate::goal::CanaryNonce, crate::goal::GoalError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::goal::mint_nonce(&conn, goal_id, label, now_micros())
+    }
+
+    pub fn record_canary_hit(
+        &self,
+        nonce: &str,
+        flow_id: Option<i64>,
+    ) -> Result<Option<crate::goal::CanaryNonce>, crate::goal::GoalError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::goal::record_hit(&conn, nonce, flow_id, now_micros())
+    }
+
+    pub fn canaries(&self, goal_id: i64) -> Vec<crate::goal::CanaryNonce> {
+        self.read(|conn| crate::goal::nonces(conn, goal_id))
+    }
+
+    // --- the frontier and the milestone trail (phase 8) ---
+
+    pub fn propose_frontier_item(
+        &self,
+        new: &crate::frontier::NewFrontierItem,
+    ) -> Result<i64, crate::frontier::FrontierError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::frontier::propose(&conn, new, now_micros())
+    }
+
+    pub fn set_frontier_status(
+        &self,
+        id: i64,
+        status: &str,
+        note: Option<&str>,
+    ) -> Result<usize, crate::frontier::FrontierError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::frontier::set_status(&conn, id, status, note, now_micros())
+    }
+
+    pub fn set_frontier_priority(
+        &self,
+        id: i64,
+        priority: i64,
+    ) -> Result<usize, crate::frontier::FrontierError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::frontier::set_priority(&conn, id, priority, now_micros())
+    }
+
+    pub fn frontier(
+        &self,
+        goal_id: i64,
+        status: Option<&str>,
+    ) -> Vec<crate::frontier::FrontierItem> {
+        self.read(|conn| crate::frontier::list(conn, goal_id, status))
+    }
+
+    pub fn frontier_item(&self, id: i64) -> Option<crate::frontier::FrontierItem> {
+        self.read(|conn| crate::frontier::get(conn, id))
+    }
+
+    pub fn record_milestone(&self, goal_id: i64, title: &str, note: Option<&str>) -> i64 {
+        let conn = self.read_conn().lock().unwrap();
+        crate::frontier::milestone(&conn, goal_id, title, note, now_micros()).unwrap_or(0)
+    }
+
+    pub fn milestones(&self, goal_id: i64, limit: i64) -> Vec<crate::frontier::Milestone> {
+        self.read(|conn| crate::frontier::milestones(conn, goal_id, limit))
+    }
+
+    /// The state digest: what a relaunched context is handed to resume the
+    /// run — goal, frontier, milestones, dead ends, oracle standing.
+    pub fn run_state_digest(&self) -> String {
+        self.read(crate::frontier::state_digest)
+    }
+
+    // --- the egress plane (phase 9) ---
+
+    pub fn egress_exits(&self) -> Vec<crate::egress::EgressExit> {
+        self.read(crate::egress::list)
+    }
+
+    pub fn egress_exit(&self, id: i64) -> Option<crate::egress::EgressExit> {
+        self.read(|conn| crate::egress::get(conn, id))
+    }
+
+    pub fn add_egress_exit(
+        &self,
+        new: &crate::egress::NewEgressExit,
+    ) -> Result<i64, crate::egress::EgressError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::egress::insert(&conn, new, now_micros())
+    }
+
+    pub fn delete_egress_exit(&self, id: i64) -> Result<usize, crate::egress::EgressError> {
+        // The InUse refusal arrives as Ok(Err(..)) and must survive; a dead
+        // channel means nothing was deleted, same shape as delete_identity.
+        self.with_db(|conn| crate::egress::delete(conn, id))
+            .unwrap_or(Ok(0))
     }
 
     // --- read verbs backed by the project database (used by the MCP) ---

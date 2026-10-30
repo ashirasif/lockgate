@@ -363,3 +363,120 @@ async fn a_tagged_send_is_findable_by_its_tag() {
     );
     assert!(empty.is_empty(), "an unrelated tag matches nothing");
 }
+
+#[tokio::test]
+async fn identity_bearing_traffic_never_rides_a_non_trusted_exit() {
+    let (addr, _received) = spawn_echo_origin().await;
+    let engine = Engine::new();
+
+    let flow = record_login_flow(&engine, "127.0.0.1", addr.port());
+    let identity_id = engine
+        .adopt_identity_from_flow(flow, "t1")
+        .expect("the flow carries a session");
+
+    // A harvested proxy: hostile by class, present in the plane.
+    let hostile = engine
+        .add_egress_exit(&lockgate_core::NewEgressExit {
+            name: "free-proxy-1".into(),
+            kind: "hostile".into(),
+            proxy_url: Some("socks5://127.0.0.1:9".into()), // nothing listens
+            note: None,
+        })
+        .unwrap();
+
+    // Pin the identity to it: the pin records intent, it does not grant
+    // permission.
+    engine
+        .update_identity(
+            identity_id,
+            &lockgate_core::IdentityEdit {
+                egress_exit_id: Some(hostile),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let err = engine
+        .send_request(
+            request_to(addr, "127.0.0.1", "/dashboard"),
+            None,
+            Some(identity_id),
+            None,
+        )
+        .await
+        .unwrap_err();
+    match &err {
+        lockgate_core::ResendError::EgressRefused {
+            identity,
+            exit,
+            kind,
+        } => {
+            assert_eq!(identity, "t1");
+            assert_eq!(exit, "free-proxy-1");
+            assert_eq!(kind, "hostile");
+        }
+        other => panic!("expected the egress refusal, got {other:?}"),
+    }
+
+    // An explicit via_exit cannot route around the rule either.
+    let err = engine
+        .send_request_via(
+            request_to(addr, "127.0.0.1", "/x"),
+            None,
+            Some(identity_id),
+            None,
+            Some("free-proxy-1"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        lockgate_core::ResendError::EgressRefused { .. }
+    ));
+
+    // And a refusal leaves no trace in history: nothing left, nothing recorded.
+    let before = engine
+        .query_flows(&lockgate_core::FlowQuery::default(), 0, 100)
+        .len();
+    let _ = engine
+        .send_request(
+            request_to(addr, "127.0.0.1", "/dashboard"),
+            None,
+            Some(identity_id),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let _ = engine
+        .send_request_via(
+            request_to(addr, "127.0.0.1", "/x"),
+            None,
+            Some(identity_id),
+            None,
+            Some("free-proxy-1"),
+        )
+        .await
+        .unwrap_err();
+    let after = engine
+        .query_flows(&lockgate_core::FlowQuery::default(), 0, 100)
+        .len();
+    assert_eq!(before, after, "refused sends must not be recorded");
+
+    // Anonymous traffic through the pooled/hostile exit is none of the rule's
+    // business — the send leaves (or fails on the dead proxy), but it is not
+    // refused here. The dead proxy proves the client was actually built.
+    let err = engine
+        .send_request_via(
+            request_to(addr, "127.0.0.1", "/anon"),
+            None,
+            None,
+            None,
+            Some("free-proxy-1"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lockgate_core::ResendError::Http(_)),
+        "unreachable proxy, not a policy refusal: {err:?}"
+    );
+}

@@ -267,6 +267,18 @@ pub struct IdentityDto {
     /// The host the session belongs to, when it belongs to one.
     pub host: Option<String>,
     pub has_totp: bool,
+    /// `operator` — adopted or hand-built by the operator — or
+    /// `self_registered` — the agent created the account in a run. The
+    /// report's black-box claim hangs off this value.
+    pub provenance: String,
+    /// The mailbox address that seeded a self-registered identity
+    /// (`probe+t1@gmail.com`): the cleanup registry for a run's accounts.
+    pub seed_account: Option<String>,
+    /// Byte-length of the custody password, when the engine holds one for
+    /// re-login. The length, never the value — same rule as cookie jars.
+    pub password_len: Option<i64>,
+    /// The egress exit this identity is pinned to, when it is.
+    pub egress_exit_id: Option<i64>,
     pub note: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -280,6 +292,10 @@ impl From<Identity> for IdentityDto {
             name: i.name,
             host: i.host,
             has_totp: i.totp_secret.is_some(),
+            provenance: i.provenance.as_str().to_string(),
+            seed_account: i.seed_account,
+            password_len: i.password_len,
+            egress_exit_id: i.egress_exit_id,
             note: i.note,
             created_at: i.created_at,
             updated_at: i.updated_at,
@@ -295,6 +311,193 @@ impl From<Identity> for IdentityDto {
                 .collect(),
         }
     }
+}
+
+/// A registered mailbox: where verification mail is read from. The type has
+/// no credential field — an app password cannot leak through a read that has
+/// nowhere to put it.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MailboxAccountDto {
+    pub id: i64,
+    pub address: String,
+    pub imap_host: String,
+    pub imap_port: i64,
+    pub imap_username: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<lockgate_core::MailboxAccount> for MailboxAccountDto {
+    fn from(m: lockgate_core::MailboxAccount) -> Self {
+        Self {
+            id: m.id,
+            address: m.address,
+            imap_host: m.imap_host,
+            imap_port: m.imap_port as i64,
+            imap_username: m.imap_username,
+            note: m.note,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
+
+/// One verification mail, reduced to what registration needs.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct VerificationMailDto {
+    pub from: String,
+    pub subject: String,
+    pub link: Option<String>,
+    pub code: Option<String>,
+}
+
+impl From<lockgate_core::VerificationMail> for VerificationMailDto {
+    fn from(v: lockgate_core::VerificationMail) -> Self {
+        Self {
+            from: v.from,
+            subject: v.subject,
+            link: v.link,
+            code: v.code,
+        }
+    }
+}
+
+/// The run's goal: what it is after, and which of the four stop states
+/// ended it — with the justification, because a silent stop is refused.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct GoalDto {
+    pub id: i64,
+    pub text: String,
+    pub success_predicate_md: String,
+    pub canary_domain: Option<String>,
+    pub budget_ms: i64,
+    /// running | achieved | budget_exhausted | frontier_empty | operator_killed
+    pub status: String,
+    pub stop_reason_md: Option<String>,
+    pub created_at: i64,
+    pub settled_at: Option<i64>,
+}
+
+impl From<lockgate_core::Goal> for GoalDto {
+    fn from(g: lockgate_core::Goal) -> Self {
+        Self {
+            id: g.id,
+            text: g.text,
+            success_predicate_md: g.success_predicate_md,
+            canary_domain: g.canary_domain,
+            budget_ms: g.budget_ms,
+            status: g.status,
+            stop_reason_md: g.stop_reason_md,
+            created_at: g.created_at,
+            settled_at: g.settled_at,
+        }
+    }
+}
+
+/// One minted canary nonce — and, when the listener reported it, the flow
+/// whose payload carried it.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct CanaryNonceDto {
+    pub id: i64,
+    pub nonce: String,
+    pub label: Option<String>,
+    pub hit_flow_id: Option<i64>,
+    pub hit_at: Option<i64>,
+    pub minted_at: i64,
+}
+
+impl From<lockgate_core::CanaryNonce> for CanaryNonceDto {
+    fn from(c: lockgate_core::CanaryNonce) -> Self {
+        Self {
+            id: c.id,
+            nonce: c.nonce,
+            label: c.label,
+            hit_flow_id: c.hit_flow_id,
+            hit_at: c.hit_at,
+            minted_at: c.minted_at,
+        }
+    }
+}
+
+/// One rung of the attack-tree frontier.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct FrontierItemDto {
+    pub id: i64,
+    pub title: String,
+    pub ladder: String,
+    /// proposed | active | milestone_reached | dead_end | exhausted
+    pub status: String,
+    pub priority: i64,
+    pub note_md: Option<String>,
+    pub updated_at: i64,
+}
+
+impl From<lockgate_core::FrontierItem> for FrontierItemDto {
+    fn from(f: lockgate_core::FrontierItem) -> Self {
+        Self {
+            id: f.id,
+            title: f.title,
+            ladder: f.ladder,
+            status: f.status,
+            priority: f.priority,
+            note_md: f.note_md,
+            updated_at: f.updated_at,
+        }
+    }
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MilestoneDto {
+    pub id: i64,
+    pub title: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+}
+
+impl From<lockgate_core::Milestone> for MilestoneDto {
+    fn from(m: lockgate_core::Milestone) -> Self {
+        Self {
+            id: m.id,
+            title: m.title,
+            note: m.note,
+            created_at: m.created_at,
+        }
+    }
+}
+
+/// One egress exit. `kind` is the trust class; the engine refuses
+/// identity-bearing sends on anything but `trusted`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct EgressExitDto {
+    pub id: i64,
+    pub name: String,
+    /// trusted | pooled | hostile
+    pub kind: String,
+    pub proxy_url: Option<String>,
+    pub note: Option<String>,
+}
+
+impl From<lockgate_core::EgressExit> for EgressExitDto {
+    fn from(e: lockgate_core::EgressExit) -> Self {
+        Self {
+            id: e.id,
+            name: e.name,
+            kind: e.kind,
+            proxy_url: e.proxy_url,
+            note: e.note,
+        }
+    }
+}
+
+/// The boundary between two materialised tiers: what each side reaches that
+/// the other does not. Every row is an access-control question.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct TierDiffDto {
+    /// `METHOD host path` rows in A only.
+    pub only_in_a: Vec<String>,
+    pub only_in_b: Vec<String>,
+    pub shared: i64,
 }
 
 /// A lead: what recon proposed, how verification left it, and the ruling.

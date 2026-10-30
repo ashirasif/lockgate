@@ -29,6 +29,36 @@ pub struct Cookie {
     pub path: String,
 }
 
+/// Where an identity's account came from. The report's black-box claim hangs
+/// off this: findings demonstrated by `SelfRegistered` identities needed no
+/// operator credentials; `Operator` ones did, and say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Provenance {
+    /// Logged in / adopted / pasted by the operator.
+    #[default]
+    Operator,
+    /// Registered by the agent during a run, with credentials the engine
+    /// generated and held.
+    SelfRegistered,
+}
+
+impl Provenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provenance::Operator => "operator",
+            Provenance::SelfRegistered => "self_registered",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "operator" => Some(Provenance::Operator),
+            "self_registered" => Some(Provenance::SelfRegistered),
+            _ => None,
+        }
+    }
+}
+
 /// What a caller supplies to mint an identity. `id` and timestamps are stamped
 /// on insert.
 #[derive(Clone, Debug, Default)]
@@ -41,9 +71,28 @@ pub struct NewIdentity {
     pub totp_secret: Option<String>,
     pub note: Option<String>,
     pub cookies: Vec<Cookie>,
+    /// The password the account was registered with, when the agent created
+    /// the account itself. Stored under engine custody; never in `Identity`,
+    /// so no read path can carry it. `identity::password` is the only way out,
+    /// for the browser re-login flow.
+    pub password: Option<String>,
+    /// Where this account came from. Defaults to `Operator` — the adopt and
+    /// hand-built paths — because a missing value must not quietly claim the
+    /// agent earned it.
+    pub provenance: Provenance,
+    /// The mailbox address that seeded it (`probe+t1@gmail.com`): the cleanup
+    /// registry for accounts a run created.
+    pub seed_account: Option<String>,
+    /// Pin to an egress exit (see `egress`). `None` is the engine's own
+    /// egress. A pin to a non-trusted exit never weakens the refusal rule —
+    /// the send fails rather than leak the session.
+    pub egress_exit_id: Option<i64>,
 }
 
-/// A stored identity, read back with its jar.
+/// A stored identity, read back with its jar. Deliberately no `password`:
+/// the read type cannot leak a credential it does not hold; the browser
+/// re-login flow fetches it with [`password`]. `password_len` is the
+/// byte-length — the same structural redaction the cookie jars read with.
 #[derive(Clone, Debug)]
 pub struct Identity {
     pub id: i64,
@@ -51,6 +100,12 @@ pub struct Identity {
     pub host: Option<String>,
     pub totp_secret: Option<String>,
     pub note: Option<String>,
+    pub provenance: Provenance,
+    pub seed_account: Option<String>,
+    /// Byte-length of the custody password, when one is stored. `None` means
+    /// no password — the value itself never leaves [`password`].
+    pub password_len: Option<i64>,
+    pub egress_exit_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub cookies: Vec<Cookie>,
@@ -65,6 +120,13 @@ pub struct IdentityEdit {
     pub totp_secret: Option<String>,
     pub note: Option<String>,
     pub cookies: Option<Vec<Cookie>>,
+    /// Sets the custody password. Not clearable to `None` by edit once set —
+    /// an account either has this password or the edit is a mistake; empty
+    /// string is ignored rather than interpreted as "clear".
+    pub password: Option<String>,
+    pub provenance: Option<Provenance>,
+    pub seed_account: Option<String>,
+    pub egress_exit_id: Option<i64>,
 }
 
 /// Why minting or editing an identity can fail, beyond a lost database.
@@ -105,9 +167,21 @@ pub fn insert(conn: &Connection, n: &NewIdentity, now: i64) -> Result<i64, Ident
         return Err(IdentityError::DuplicateName(n.name.clone()));
     }
     conn.execute(
-        "INSERT INTO identity (name, host, totp_secret, note, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![n.name, n.host, n.totp_secret, n.note, now],
+        "INSERT INTO identity
+           (name, host, totp_secret, note, password, provenance, seed_account,
+            egress_exit_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        params![
+            n.name,
+            n.host,
+            n.totp_secret,
+            n.note,
+            n.password,
+            n.provenance.as_str(),
+            n.seed_account,
+            n.egress_exit_id,
+            now
+        ],
     )
     .map_err(IdentityError::Db)?;
     let id = conn.last_insert_rowid();
@@ -128,7 +202,8 @@ pub fn list(conn: &Connection) -> rusqlite::Result<Vec<Identity>> {
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Identity>> {
     let Some(mut identity) = conn
         .query_row(
-            "SELECT id, name, host, totp_secret, note, created_at, updated_at
+            "SELECT id, name, host, totp_secret, note, provenance, seed_account,
+                    length(password), egress_exit_id, created_at, updated_at
                FROM identity WHERE id = ?1",
             [id],
             |r| {
@@ -138,8 +213,13 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Identity>> {
                     host: r.get(2)?,
                     totp_secret: r.get(3)?,
                     note: r.get(4)?,
-                    created_at: r.get(5)?,
-                    updated_at: r.get(6)?,
+                    provenance: Provenance::parse(&r.get::<_, String>(5)?)
+                        .unwrap_or(Provenance::Operator),
+                    seed_account: r.get(6)?,
+                    password_len: r.get(7)?,
+                    egress_exit_id: r.get(8)?,
+                    created_at: r.get(9)?,
+                    updated_at: r.get(10)?,
                     cookies: Vec::new(),
                 })
             },
@@ -187,10 +267,15 @@ pub fn update(
     let host = edit.host.clone().or(current.host);
     let totp_secret = edit.totp_secret.clone().or(current.totp_secret);
     let note = edit.note.clone().or(current.note);
+    let seed_account = edit.seed_account.clone().or(current.seed_account);
+    let egress_exit_id = edit.egress_exit_id.or(current.egress_exit_id);
     let changed = conn
         .execute(
             "UPDATE identity
-                SET name = ?2, host = ?3, totp_secret = ?4, note = ?5, updated_at = ?6
+                SET name = ?2, host = ?3, totp_secret = ?4, note = ?5,
+                    password = COALESCE(?6, password),
+                    provenance = ?7, seed_account = ?8, egress_exit_id = ?9,
+                    updated_at = ?10
               WHERE id = ?1",
             params![
                 id,
@@ -198,6 +283,12 @@ pub fn update(
                 host,
                 totp_secret,
                 note,
+                // Empty is "nothing to say", not "clear": a password once set
+                // cannot be silently dropped.
+                edit.password.clone().filter(|p| !p.is_empty()),
+                edit.provenance.unwrap_or(current.provenance).as_str(),
+                seed_account,
+                egress_exit_id,
                 now
             ],
         )
@@ -210,6 +301,17 @@ pub fn update(
 
 pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<usize> {
     conn.execute("DELETE FROM identity WHERE id = ?1", [id])
+}
+
+/// The custody password for an identity, when one is stored. The only read
+/// path for it — `Identity` does not carry it, so list/get cannot leak it, and
+/// the browser re-login flow (which must type it into a real form) is the only
+/// caller that has a reason to.
+pub fn password(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT password FROM identity WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })
+    .optional()
 }
 
 fn replace_cookies(conn: &Connection, id: i64, cookies: &[Cookie]) -> rusqlite::Result<()> {

@@ -161,10 +161,39 @@ establish controls).
 | 3 | Program layer + port the loop: programs in the registry, materialise, leads ledger, recon → verify over lockgate MCP | **done** (lockgate side) |
 | 4 | Adjudicate + report generation | **done** (lockgate side) |
 | 5 | Passive scanner on capture | **done** |
+| 6 | Self-provisioned identities: mailbox abstraction (Gmail/IMAP backend), engine-side credential custody, registration provenance, provisioning over MCP | **done** (core + MCP; browser playbooks are the next layer) |
+| 7 | Goal plane: goal object, four stop states, budgets, OOB canary with nonce → flow correlation | **done** |
+| 8 | Long-run mechanics: checkpoint/restore, state-digest relaunch, stall watchdog, burn-rate alarms | **done** (records + digest; the watchdog's ntfy alarm rides phase 11) |
+| 9 | Egress plane: trust classes (trusted/pooled/hostile), per-identity egress pinning, Cloudflare ladder | **done** (engine rule + exits; the ladder is skill prose) |
+| 10 | Goal-mode loop: tier matrix diff, attack-tree frontier + milestones + dead-ends, strategy scheduler | **done** (diff + ledger + goal-mode skill; the scheduler is skill discipline) |
+| 11 | First end-to-end run + postmortem cadence | **runbook ready** — `docs/GOAL_RUN.md`; the run itself waits on phase-0 operator setup |
 
 Phases 3–4 live partly outside this repo (the orchestrator harness and its
 prompts) but every capability they need — scope, identities, policy, tagging,
 findings with evidence links — lands here first.
+
+Each phase 6–11 carries a "done when" acceptance criterion:
+
+- **6 — Self-provisioned identities.** Done when an agent registers a T1
+  account on a fresh test app with zero operator credentials, and the
+  transcript contains no secret values. The agent *uses* Google accounts from
+  a pre-provisioned operator pool; it never creates them.
+- **7 — Goal plane.** Done when a mock run that "believes" it succeeded cannot
+  stop — only the oracle, an exhausted budget, an empty frontier, or an
+  operator kill ends the run, each writing its justification to the ledger.
+  `done()` belongs to the harness, never the LLM.
+- **8 — Long-run mechanics.** Done when a kill -9 mid-run and relaunch resumes
+  at the same frontier item.
+- **9 — Egress plane.** Done when a send with an identity attached is refused
+  on a hostile proxy by the engine, not the prompt. Identity-bearing traffic
+  never rides a hostile exit, in code.
+- **10 — Goal-mode loop.** Done when a full run produces a frontier ledger, a
+  milestone trail, and findings with evidence — not a linear transcript.
+- **11 — First run.** Done when the second run measurably outperforms the first.
+
+Explicitly out of scope for 6–11: captcha-solver infrastructure (a policy
+decision, not a build), automated Google account creation, an in-process
+brain, HTTP/2, the nine-worker fan-out.
 
 ## Principles this must not betray
 
