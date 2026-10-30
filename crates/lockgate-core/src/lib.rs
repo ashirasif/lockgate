@@ -5,6 +5,7 @@
 
 pub mod browser;
 pub mod ca;
+pub mod chain;
 pub mod db;
 pub mod encoding;
 pub mod engine;
@@ -28,6 +29,9 @@ pub mod scope;
 pub mod server;
 pub mod writer;
 
+pub use chain::{
+    ChainError, ChainQuestion, FiledChain, Member, NewChain, Review, ReviewChain, ReviewFinding,
+};
 pub use db::ProjectPaths;
 pub use engine::{Engine, ResendError, Resent, Revision};
 pub use finding::{Finding, FindingEdit, NewFinding, WriteUp};

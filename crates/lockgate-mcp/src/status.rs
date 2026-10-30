@@ -442,6 +442,7 @@ mod tests {
             rationale_md: "sequential ids".into(),
             endpoint: None,
             flow_id: None,
+            chain_id: None,
         })
         .unwrap();
         b.create_finding(lockgate_core::NewFinding {

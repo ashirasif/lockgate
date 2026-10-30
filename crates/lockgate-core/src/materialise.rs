@@ -247,12 +247,15 @@ fn write_leads(conn: &Connection, dir: &Path) -> Result<MaterialisedFile, Materi
     let mut out = String::new();
     for l in leads {
         out.push_str(&format!(
-            "{{\"id\":{},\"kind\":{},\"title\":{},\"status\":{},\"endpoint\":{},\"ruling\":{}}}\n",
+            "{{\"id\":{},\"kind\":{},\"title\":{},\"status\":{},\"endpoint\":{},\"chain\":{},\"ruling\":{}}}\n",
             l.id,
             json(&l.kind),
             json(&l.title),
             json(&l.status),
             opt_json(&l.endpoint),
+            // The chain id as a string: jsonl consumers grep it, and `12` vs
+            // `"12"` should not decide that.
+            opt_json(&l.chain_id.map(|id| id.to_string())),
             opt_json(&l.ruling),
         ));
     }

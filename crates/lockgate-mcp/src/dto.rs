@@ -307,6 +307,8 @@ pub struct LeadDto {
     pub endpoint: Option<String>,
     /// The flow that inspired the lead, when there was one.
     pub flow_id: Option<i64>,
+    /// The chain this lead is a question under (see `chain_review`), if any.
+    pub chain_id: Option<i64>,
     /// proposed | verifying | verified | refuted | reported
     pub status: String,
     pub verdict: Option<String>,
@@ -327,6 +329,7 @@ impl From<Lead> for LeadDto {
             rationale_md: l.rationale_md,
             endpoint: l.endpoint,
             flow_id: l.flow_id,
+            chain_id: l.chain_id,
             status: l.status,
             verdict: l.verdict,
             control: l.control,

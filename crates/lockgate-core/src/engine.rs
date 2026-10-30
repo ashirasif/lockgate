@@ -766,9 +766,20 @@ impl Engine {
     // --- leads: the ledger between the thinking agents and the probing ones ---
 
     /// Recon proposes. Returns the new lead id.
+    ///
+    /// A lead that lands on a primitive the chain playbook knows also runs the
+    /// chain pass (see [`crate::chain`]) — silently, and never recursively: a
+    /// `chain` lead classifies as nothing.
     pub fn create_lead(&self, lead: &crate::lead::NewLead) -> Result<i64, crate::lead::LeadError> {
-        let conn = self.read_conn().lock().unwrap();
-        crate::lead::propose(&conn, lead, now_micros())
+        let id = {
+            let conn = self.read_conn().lock().unwrap();
+            crate::lead::propose(&conn, lead, now_micros())?
+        };
+        if let Some(stored) = self.lead(id) {
+            let _ =
+                self.with_db(|conn| crate::chain::propose_for_lead(conn, &stored, now_micros()));
+        }
+        Ok(id)
     }
 
     /// The ledger, newest first, optionally narrowed to one status.
@@ -792,19 +803,27 @@ impl Engine {
             let conn = self.read_conn().lock().unwrap();
             crate::lead::record_verdict(&conn, id, status, verdict, control, now_micros())?
         };
-        // Only the settlements buzz: proposed→verifying is process, not news.
         if rows > 0
-            && matches!(status, "verified" | "refuted" | "reported")
             && let Some(lead) = self.lead(id)
         {
-            self.notifier
-                .lock()
-                .unwrap()
-                .notify(crate::notify::Event::LeadSettled {
-                    lead_id: id,
-                    title: lead.title,
-                    status: status.to_string(),
-                });
+            // Only the settlements buzz: proposed→verifying is process, not news.
+            if matches!(status, "verified" | "refuted" | "reported") {
+                self.notifier
+                    .lock()
+                    .unwrap()
+                    .notify(crate::notify::Event::LeadSettled {
+                        lead_id: id,
+                        title: lead.title.clone(),
+                        status: status.to_string(),
+                    });
+            }
+            // A primitive that just settled as verified is load-bearing: run
+            // the chain pass so compositions with it get their question filed.
+            // No-op for kinds the playbook does not speak, chains included.
+            if status == "verified" {
+                let _ =
+                    self.with_db(|conn| crate::chain::propose_for_lead(conn, &lead, now_micros()));
+            }
         }
         Ok(rows)
     }
@@ -819,6 +838,31 @@ impl Engine {
     ) -> Result<usize, crate::lead::LeadError> {
         let conn = self.read_conn().lock().unwrap();
         crate::lead::adjudicate(&conn, id, ruling, reason, now_micros())
+    }
+
+    // --- chains: the model pass's read and write ---
+
+    /// The model pass's write path: a chain the playbook cannot see, with its
+    /// members and the questions to dispatch (see [`crate::chain::file_chain`]).
+    /// Idempotent on title — running the pass twice files nothing twice.
+    pub fn file_chain(
+        &self,
+        new: crate::chain::NewChain,
+    ) -> Result<crate::chain::FiledChain, crate::chain::ChainError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::chain::file_chain(&conn, &new, now_micros())
+    }
+
+    /// One chain reassembled: its members and its questions.
+    pub fn chain(&self, id: i64) -> Option<crate::chain::ReviewChain> {
+        self.with_db(|conn| crate::chain::chain(conn, id)).flatten()
+    }
+
+    /// The model pass's read: everything held, compacted for reasoning about
+    /// compositions (see [`crate::chain::review`]). Deterministic — the
+    /// reasoning is the caller's; this is the brief it reasons over.
+    pub fn chain_review(&self) -> Option<crate::chain::Review> {
+        self.with_db(crate::chain::review)
     }
 
     // --- materialise: the capture as a greppable directory ---
@@ -1179,6 +1223,12 @@ impl Engine {
     }
 
     /// Author a finding, returning its new id once the row is durably committed.
+    ///
+    /// A finding that lands on a primitive the chain playbook knows also runs
+    /// the chain pass (see [`crate::chain`]) after the write commits: severity
+    /// lives in compositions, and the moment a new leg arrives next to the old
+    /// ones is when the composition becomes visible. Scanner drafts go through
+    /// here too, so capture-time findings chain as well.
     pub async fn create_finding(&self, finding: NewFinding) -> Result<i64, WriteError> {
         let (reply, rx) = oneshot::channel();
         self.write(WriteEvent::CreateFinding {
@@ -1195,6 +1245,9 @@ impl Engine {
                     title: finding.title.clone(),
                     host: finding.host.clone(),
                 });
+            let _ = self.with_db(|conn| {
+                crate::chain::propose_for_finding(conn, id, &finding, now_micros())
+            });
         }
         Ok(id)
     }

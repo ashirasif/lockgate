@@ -14,7 +14,10 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The lead vocabulary. Free to extend — `other` plus a good title covers the
-/// rest — but named here so prompts and reports share one list.
+/// rest — but named here so prompts and reports share one list. `chain` is the
+/// one kind the engine itself files: composition candidates out of the chain
+/// playbook (see [`crate::chain`]), proposed as leads so they settle and get
+/// ruled like any other hypothesis.
 pub const LEAD_KINDS: &[&str] = &[
     "idor",
     "authz",
@@ -23,6 +26,7 @@ pub const LEAD_KINDS: &[&str] = &[
     "logic",
     "config",
     "exposure",
+    "chain",
     "other",
 ];
 
@@ -40,6 +44,9 @@ pub struct NewLead {
     pub rationale_md: String,
     pub endpoint: Option<String>,
     pub flow_id: Option<i64>,
+    /// The chain this lead is a question under, when it is one. Only the chain
+    /// machinery sets this; a hand-filed lead leaves it alone.
+    pub chain_id: Option<i64>,
 }
 
 /// A stored lead, read back whole.
@@ -51,6 +58,8 @@ pub struct Lead {
     pub rationale_md: String,
     pub endpoint: Option<String>,
     pub flow_id: Option<i64>,
+    /// The chain this lead is a question under (see `chain`), if any.
+    pub chain_id: Option<i64>,
     pub status: String,
     pub verdict: Option<String>,
     pub control: Option<String>,
@@ -120,14 +129,15 @@ pub fn propose(conn: &Connection, lead: &NewLead, now: i64) -> Result<i64, LeadE
         ));
     }
     conn.execute(
-        "INSERT INTO lead (kind, title, rationale_md, endpoint, flow_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        "INSERT INTO lead (kind, title, rationale_md, endpoint, flow_id, chain_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         params![
             lead.kind,
             lead.title.trim(),
             lead.rationale_md,
             lead.endpoint,
             lead.flow_id,
+            lead.chain_id,
             now
         ],
     )
@@ -137,7 +147,7 @@ pub fn propose(conn: &Connection, lead: &NewLead, now: i64) -> Result<i64, LeadE
 
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Lead>> {
     conn.query_row(
-        "SELECT id, kind, title, rationale_md, endpoint, flow_id, status,
+        "SELECT id, kind, title, rationale_md, endpoint, flow_id, chain_id, status,
                 verdict, control, ruling, ruling_reason, created_at, updated_at
            FROM lead WHERE id = ?1",
         [id],
@@ -146,7 +156,7 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Lead>> {
     .optional()
 }
 
-const LEAD_COLUMNS: &str = "id, kind, title, rationale_md, endpoint, flow_id, status, verdict, control, ruling, \
+const LEAD_COLUMNS: &str = "id, kind, title, rationale_md, endpoint, flow_id, chain_id, status, verdict, control, ruling, \
      ruling_reason, created_at, updated_at";
 
 pub fn list(conn: &Connection, status: Option<&str>) -> rusqlite::Result<Vec<Lead>> {
@@ -159,6 +169,18 @@ pub fn list(conn: &Connection, status: Option<&str>) -> rusqlite::Result<Vec<Lea
     rows.collect()
 }
 
+/// One chain's questions: the leads parented to it, oldest first — the order
+/// they were asked, which is the order a dispatcher works them.
+pub fn list_for_chain(conn: &Connection, chain_id: i64) -> rusqlite::Result<Vec<Lead>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LEAD_COLUMNS} FROM lead
+          WHERE chain_id = ?1
+          ORDER BY id"
+    ))?;
+    let rows = stmt.query_map([chain_id], row_to_lead)?;
+    rows.collect()
+}
+
 fn row_to_lead(r: &rusqlite::Row) -> rusqlite::Result<Lead> {
     Ok(Lead {
         id: r.get(0)?,
@@ -167,13 +189,14 @@ fn row_to_lead(r: &rusqlite::Row) -> rusqlite::Result<Lead> {
         rationale_md: r.get(3)?,
         endpoint: r.get(4)?,
         flow_id: r.get(5)?,
-        status: r.get(6)?,
-        verdict: r.get(7)?,
-        control: r.get(8)?,
-        ruling: r.get(9)?,
-        ruling_reason: r.get(10)?,
-        created_at: r.get(11)?,
-        updated_at: r.get(12)?,
+        chain_id: r.get(6)?,
+        status: r.get(7)?,
+        verdict: r.get(8)?,
+        control: r.get(9)?,
+        ruling: r.get(10)?,
+        ruling_reason: r.get(11)?,
+        created_at: r.get(12)?,
+        updated_at: r.get(13)?,
     })
 }
 
@@ -258,6 +281,7 @@ mod tests {
             rationale_md: "GET /bookings/4711 returned another tenant's data".into(),
             endpoint: Some("https://target.com/bookings/{id}".into()),
             flow_id: None,
+            chain_id: None,
         }
     }
 

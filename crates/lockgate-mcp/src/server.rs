@@ -819,6 +819,145 @@ pub struct LeadIdResult {
     pub lead_id: i64,
 }
 
+// --- chains: the model pass ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ChainReviewParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
+}
+
+/// One finding, compacted for reasoning: no prose, just what classifies it.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ReviewFindingDto {
+    pub id: i64,
+    pub title: String,
+    pub severity: String,
+    pub status: String,
+    pub cwe: Option<String>,
+    pub host: Option<String>,
+    pub path: Option<String>,
+    /// The chain playbook's classification (xss, ssrf, idor, …), when the
+    /// CWE or kind names one.
+    pub primitive: Option<String>,
+}
+
+impl From<lockgate_core::ReviewFinding> for ReviewFindingDto {
+    fn from(f: lockgate_core::ReviewFinding) -> Self {
+        Self {
+            id: f.id,
+            title: f.title,
+            severity: f.severity,
+            status: f.status,
+            cwe: f.cwe,
+            host: f.host,
+            path: f.path,
+            primitive: f.primitive.map(str::to_string),
+        }
+    }
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ChainMemberDto {
+    /// finding | lead
+    pub kind: String,
+    pub id: i64,
+}
+
+/// A chain as the brief and `get_chain` show it: the container's title and
+/// status, the legs it composes, and the questions filed under it.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ReviewChainDto {
+    pub id: i64,
+    pub title: String,
+    pub status: String,
+    pub members: Vec<ChainMemberDto>,
+    pub questions: Vec<LeadDto>,
+}
+
+impl From<lockgate_core::ReviewChain> for ReviewChainDto {
+    fn from(c: lockgate_core::ReviewChain) -> Self {
+        Self {
+            id: c.id,
+            title: c.title,
+            status: c.status,
+            members: c
+                .members
+                .into_iter()
+                .map(|m| ChainMemberDto {
+                    kind: m.kind,
+                    id: m.id,
+                })
+                .collect(),
+            questions: c.questions.into_iter().map(LeadDto::from).collect(),
+        }
+    }
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ChainReviewResult {
+    pub target: String,
+    /// The deterministic playbook's pattern names — the classics it already
+    /// covers, so the reasoning spends its attention elsewhere.
+    pub playbook: Vec<String>,
+    pub findings: Vec<ReviewFindingDto>,
+    pub leads: Vec<LeadDto>,
+    pub chains: Vec<ReviewChainDto>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ChainMemberParams {
+    /// finding | lead
+    pub kind: String,
+    pub id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ChainQuestionParams {
+    /// One of the lead kinds — the question is filed as an ordinary lead.
+    pub kind: String,
+    pub title: String,
+    pub rationale_md: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct FileChainParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
+    pub title: String,
+    pub rationale_md: String,
+    pub endpoint: Option<String>,
+    pub members: Vec<ChainMemberParams>,
+    pub questions: Option<Vec<ChainQuestionParams>>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct FileChainResult {
+    pub target: String,
+    pub chain_id: i64,
+    /// False when a chain with this title already existed and only its new
+    /// questions were added.
+    pub created: bool,
+    pub question_ids: Vec<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct GetChainParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
+    pub chain_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct GetChainResult {
+    pub target: String,
+    #[serde(flatten)]
+    pub chain: ReviewChainDto,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct LeadIdParams {
     pub lead_id: i64,
@@ -1685,7 +1824,12 @@ impl ProxyServer {
 
     #[tool(
         description = "Author a security finding with severity, status, markdown write-up, \
-                       optional CVSS/CWE, and evidence flows. Returns the new finding id."
+                       optional CVSS/CWE, and evidence flows. Returns the new finding id. \
+                       Filing also runs the chain pass: a CWE the playbook knows files a \
+                       chain lead (kind \"chain\") when it composes with what is held, and — \
+                       when no partner is held yet — files research questions under a basis \
+                       chain, ready to dispatch. Check list_leads after filing, and give \
+                       findings a CWE so they classify."
     )]
     async fn create_finding(
         &self,
@@ -2215,7 +2359,10 @@ impl ProxyServer {
                        kind from the vocabulary, one title, and a rationale that states the \
                        mechanism — not 'might be vulnerable'. A verifier (yours or another \
                        agent) settles it with a control via update_lead; an adjudicator \
-                       rules on that via adjudicate_lead."
+                       rules on that via adjudicate_lead. Leads of kind \"chain\" are \
+                       composition hypotheses (severity lives in the combination, not the \
+                       parts); the engine files the ones its playbook can see — filing your \
+                       own for pairs it cannot is encouraged, it only knows a few."
     )]
     async fn create_lead(
         &self,
@@ -2229,6 +2376,9 @@ impl ProxyServer {
                 rationale_md: p.rationale_md,
                 endpoint: p.endpoint,
                 flow_id: p.flow_id,
+                // Questions are filed under their chain by the chain machinery
+                // (file_chain); a lead proposed here stands on its own.
+                chain_id: None,
             })
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         Ok(Json(LeadIdResult {
@@ -2240,7 +2390,10 @@ impl ProxyServer {
     #[tool(
         description = "The leads ledger, newest first. This is the coordination artifact \
                        between recon and verification: what was proposed, what settled, what \
-                       was ruled inadmissible and why."
+                       was ruled inadmissible and why. Chain candidates (kind \"chain\") \
+                       arrive here automatically whenever a new finding or lead composes \
+                       with what is held — treat each as a question to settle, not noise: \
+                       the severity of a composition beats the severity of its parts."
     )]
     async fn list_leads(
         &self,
@@ -2276,7 +2429,10 @@ impl ProxyServer {
         description = "Record verification progress on a lead. Settling on verified/refuted \
                        requires verdict AND control — the baseline-vs-exploit check that \
                        discriminates the bug from intended behaviour. Refused in code \
-                       otherwise: a conclusion without a control is a guess."
+                       otherwise: a conclusion without a control is a guess. For a chain \
+                       lead (kind \"chain\") the control is the composition end to end: \
+                       step 1's output spent as step 2's input, evidence flows for both \
+                       legs — file those flows on the member findings."
     )]
     async fn update_lead(
         &self,
@@ -2333,6 +2489,116 @@ impl ProxyServer {
             ErrorData::internal_error("lead vanished after adjudication".to_string(), None)
         })?;
         Ok(Json(LeadMutationResult { target, lead }))
+    }
+
+    // --- chains: the model pass, both directions ---
+
+    #[tool(
+        description = "The model pass's brief: everything held, for reasoning about \
+                       compositions. Findings compacted to id/title/severity/status/CWE/\
+                       host/primitive (read a write-up with get_finding when one matters); \
+                       every lead whole, rationales included — that is the run's reasoning; \
+                       every chain with its members and open questions. `playbook` names the \
+                       patterns the engine already covers, so spend your attention on what it \
+                       cannot see: pairs that compose through the target's own logic, not \
+                       through bug classes. Pure read; run it after filings settle and at any \
+                       cadence. File what you see via file_chain."
+    )]
+    async fn chain_review(
+        &self,
+        Parameters(p): Parameters<ChainReviewParams>,
+    ) -> Result<Json<ChainReviewResult>, ErrorData> {
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let review = engine
+            .chain_review()
+            .ok_or_else(|| ErrorData::internal_error("chain review failed".to_string(), None))?;
+        Ok(Json(ChainReviewResult {
+            target,
+            playbook: review.playbook.into_iter().map(str::to_string).collect(),
+            findings: review
+                .findings
+                .into_iter()
+                .map(ReviewFindingDto::from)
+                .collect(),
+            leads: review.leads.into_iter().map(LeadDto::from).collect(),
+            chains: review
+                .chains
+                .into_iter()
+                .map(ReviewChainDto::from)
+                .collect(),
+        }))
+    }
+
+    #[tool(
+        description = "File a chain: a composition hypothesis — severity lives in the \
+                       combination, not the parts. `members` are the findings/leads it \
+                       composes (they must exist); `questions` are optional leads filed \
+                       under the chain (their chain_id is set), one per line of research to \
+                       dispatch — hand one to a sub-agent like any other lead, settle it \
+                       with update_lead. Idempotent on title: filing the same chain again \
+                       only adds questions it does not already ask. The engine's playbook \
+                       files its own chains through this same path; this one is yours for \
+                       what it cannot see."
+    )]
+    async fn file_chain(
+        &self,
+        Parameters(p): Parameters<FileChainParams>,
+    ) -> Result<Json<FileChainResult>, ErrorData> {
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let filed = engine
+            .file_chain(lockgate_core::NewChain {
+                title: p.title,
+                rationale_md: p.rationale_md,
+                endpoint: p.endpoint,
+                members: p
+                    .members
+                    .into_iter()
+                    .map(|m| lockgate_core::Member {
+                        kind: m.kind,
+                        id: m.id,
+                    })
+                    .collect(),
+                questions: p
+                    .questions
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|q| lockgate_core::ChainQuestion {
+                        kind: q.kind,
+                        title: q.title,
+                        rationale_md: q.rationale_md,
+                    })
+                    .collect(),
+            })
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(FileChainResult {
+            target,
+            chain_id: filed.id,
+            created: filed.created,
+            question_ids: filed.question_ids,
+        }))
+    }
+
+    #[tool(
+        description = "One chain reassembled: its members and its questions. The \
+                       dispatcher's view — pick an open question, work it (or hand it off), \
+                       settle it with update_lead; when a missing leg lands as a finding, \
+                       the chain pass pairs it automatically."
+    )]
+    async fn get_chain(
+        &self,
+        Parameters(p): Parameters<GetChainParams>,
+    ) -> Result<Json<GetChainResult>, ErrorData> {
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let chain = engine
+            .chain(p.chain_id)
+            .map(ReviewChainDto::from)
+            .ok_or_else(|| {
+                ErrorData::resource_not_found(
+                    format!("no chain #{} — chain_review lists what exists", p.chain_id),
+                    None,
+                )
+            })?;
+        Ok(Json(GetChainResult { target, chain }))
     }
 
     // --- materialise / report / scan ---
@@ -4068,7 +4334,9 @@ mod tests {
             .0
             .lead_id;
 
-        // Proposed, with nothing settled.
+        // Proposed, with nothing settled. The chain machinery files its own
+        // leads alongside (a basis chain and its questions), so the count
+        // below filters those out.
         let lead = server
             .get_lead(Parameters(LeadIdParams { lead_id: id }))
             .await
@@ -4085,7 +4353,9 @@ mod tests {
                 .unwrap()
                 .0
                 .leads
-                .len(),
+                .iter()
+                .filter(|l| l.kind != "chain" && l.chain_id.is_none())
+                .count(),
             1
         );
         assert!(
@@ -4180,6 +4450,131 @@ mod tests {
         let report = server.generate_report().await.unwrap().0.markdown;
         assert!(report.contains("## Leads"), "{report}");
         assert!(report.contains("admissible"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn the_chain_pass_and_the_model_pass_round_trip() {
+        let (_engine, server) = setup();
+
+        // A session-readable cookie finding lands alone: no pair yet, so the
+        // optimistic pass files a basis chain with its question.
+        server
+            .create_finding(Parameters(CreateFindingParams {
+                target: None,
+                title: "Session cookie readable from JavaScript".into(),
+                severity: "low".into(),
+                status: Some("confirmed".into()),
+                cwe: Some("1004".into()),
+                description_md: "no HttpOnly on sid".into(),
+                host: Some("target.com".into()),
+                path: None,
+                cvss_vector: None,
+                cvss_score: None,
+                cvss_version: None,
+                repro_md: None,
+                impact_md: None,
+                remediation_md: None,
+                evidence: None,
+            }))
+            .await
+            .unwrap();
+
+        let review = server
+            .chain_review(Parameters(ChainReviewParams { target: None }))
+            .await
+            .unwrap()
+            .0;
+        assert!(review.playbook.len() >= 5, "the classics are named");
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(
+            review.findings[0].primitive.as_deref(),
+            Some("js-readable-session")
+        );
+        assert_eq!(review.chains.len(), 1, "the basis chain");
+        let basis = &review.chains[0];
+        assert_eq!(basis.members.len(), 1);
+        assert_eq!(basis.questions.len(), 1, "where is the XSS?");
+
+        // The model pass goes beyond the playbook and files its own chain,
+        // with a question to dispatch.
+        let filed = server
+            .file_chain(Parameters(FileChainParams {
+                target: None,
+                title: "chain[session-token-in-url] f#1".into(),
+                rationale_md: "The token travels in the URL, so any Referer leak \
+                               hands over the session."
+                    .into(),
+                endpoint: Some("target.com".into()),
+                members: vec![ChainMemberParams {
+                    kind: "finding".into(),
+                    id: 1,
+                }],
+                questions: Some(vec![ChainQuestionParams {
+                    kind: "exposure".into(),
+                    title: "Does the site send external Referer with the token URL?".into(),
+                    rationale_md: "Third-party fetches leak the URL.".into(),
+                }]),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(filed.created);
+        assert_eq!(filed.question_ids.len(), 1);
+
+        // Filing it again is idempotent.
+        let again = server
+            .file_chain(Parameters(FileChainParams {
+                target: None,
+                title: "chain[session-token-in-url] f#1".into(),
+                rationale_md: "same chain, second pass".into(),
+                endpoint: None,
+                members: vec![ChainMemberParams {
+                    kind: "finding".into(),
+                    id: 1,
+                }],
+                questions: Some(vec![ChainQuestionParams {
+                    kind: "exposure".into(),
+                    title: "Does the site send external Referer with the token URL?".into(),
+                    rationale_md: "already asked".into(),
+                }]),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!again.created);
+        assert!(again.question_ids.is_empty());
+
+        // get_chain reassembles it for the dispatcher, and the question is an
+        // ordinary lead with the chain id set.
+        let full = server
+            .get_chain(Parameters(GetChainParams {
+                target: None,
+                chain_id: filed.chain_id,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(full.chain.title, "chain[session-token-in-url] f#1");
+        assert_eq!(full.chain.questions.len(), 1);
+        assert_eq!(full.chain.questions[0].chain_id, Some(filed.chain_id));
+
+        // A member that does not exist is refused with a clear error.
+        let err = server
+            .file_chain(Parameters(FileChainParams {
+                target: None,
+                title: "chain[ghost] f#99".into(),
+                rationale_md: "r".into(),
+                endpoint: None,
+                members: vec![ChainMemberParams {
+                    kind: "finding".into(),
+                    id: 99,
+                }],
+                questions: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("#99"), "{}", err.message);
     }
 
     #[tokio::test]

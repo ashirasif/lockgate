@@ -31,7 +31,7 @@ use rusqlite::Connection;
 pub const INLINE_BODY_LIMIT: usize = 5 * 1024 * 1024;
 
 /// Bumped whenever `MIGRATIONS` grows. Persisted in SQLite's `user_version`.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Applied in order, starting from whatever `user_version` the file is at.
 /// Append only — never edit a statement that has already shipped.
@@ -388,6 +388,22 @@ const MIGRATIONS: &[&str] = &[
       updated_at    INTEGER NOT NULL
     );
     CREATE INDEX lead_status ON lead(status);
+    "#,
+    // v7 — chains, both directions. A chain lead is the container: its members
+    // name the legs it composes (in `chain_member`), and the questions it
+    // spawned hang off it via `lead.chain_id` — a question is an ordinary
+    // lead, proposed so a verifier (or a dispatched agent) can work it, and
+    // parented so the chain it belongs to is one query away. The playbook
+    // writes here; so does the model pass, through `file_chain`.
+    r#"
+    ALTER TABLE lead ADD COLUMN chain_id INTEGER REFERENCES lead(id);
+    CREATE INDEX lead_chain ON lead(chain_id);
+    CREATE TABLE chain_member (
+      chain_id INTEGER NOT NULL REFERENCES lead(id),
+      leg_kind TEXT NOT NULL,   -- finding | lead
+      leg_id   INTEGER NOT NULL,
+      PRIMARY KEY (chain_id, leg_kind, leg_id)
+    );
     "#,
 ];
 

@@ -195,6 +195,7 @@ mod tests {
                 rationale_md: "sequential".into(),
                 endpoint: None,
                 flow_id: None,
+                chain_id: None,
             },
             3,
         )
