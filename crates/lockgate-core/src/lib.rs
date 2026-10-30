@@ -6,9 +6,12 @@
 pub mod browser;
 pub mod ca;
 pub mod db;
+pub mod egress;
 pub mod encoding;
 pub mod engine;
 pub mod finding;
+pub mod frontier;
+pub mod goal;
 pub mod http_text;
 pub mod identity;
 pub mod intercept;
@@ -30,8 +33,13 @@ pub mod server;
 pub mod writer;
 
 pub use db::ProjectPaths;
+pub use egress::{EGRESS_KINDS, EgressError, EgressExit, NewEgressExit};
 pub use engine::{Engine, ResendError, Resent, Revision};
 pub use finding::{Finding, FindingEdit, NewFinding, WriteUp};
+pub use frontier::{
+    FRONTIER_STATUSES, FrontierError, FrontierItem, LADDERS, Milestone, NewFrontierItem,
+};
+pub use goal::{CanaryNonce, GOAL_STATUSES, Goal, GoalError, NewGoal};
 pub use identity::{AdoptError, Cookie, Identity, IdentityEdit, NewIdentity, Provenance};
 pub use intercept::{Held, Intercept, Pending, TicketId, Verdict};
 pub use lead::{Lead, LeadError, NewLead};

@@ -83,6 +83,10 @@ pub struct NewIdentity {
     /// The mailbox address that seeded it (`probe+t1@gmail.com`): the cleanup
     /// registry for accounts a run created.
     pub seed_account: Option<String>,
+    /// Pin to an egress exit (see `egress`). `None` is the engine's own
+    /// egress. A pin to a non-trusted exit never weakens the refusal rule —
+    /// the send fails rather than leak the session.
+    pub egress_exit_id: Option<i64>,
 }
 
 /// A stored identity, read back with its jar. Deliberately no `password`:
@@ -101,6 +105,7 @@ pub struct Identity {
     /// Byte-length of the custody password, when one is stored. `None` means
     /// no password — the value itself never leaves [`password`].
     pub password_len: Option<i64>,
+    pub egress_exit_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub cookies: Vec<Cookie>,
@@ -121,6 +126,7 @@ pub struct IdentityEdit {
     pub password: Option<String>,
     pub provenance: Option<Provenance>,
     pub seed_account: Option<String>,
+    pub egress_exit_id: Option<i64>,
 }
 
 /// Why minting or editing an identity can fail, beyond a lost database.
@@ -163,8 +169,8 @@ pub fn insert(conn: &Connection, n: &NewIdentity, now: i64) -> Result<i64, Ident
     conn.execute(
         "INSERT INTO identity
            (name, host, totp_secret, note, password, provenance, seed_account,
-            created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            egress_exit_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         params![
             n.name,
             n.host,
@@ -173,6 +179,7 @@ pub fn insert(conn: &Connection, n: &NewIdentity, now: i64) -> Result<i64, Ident
             n.password,
             n.provenance.as_str(),
             n.seed_account,
+            n.egress_exit_id,
             now
         ],
     )
@@ -196,7 +203,7 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Identity>> {
     let Some(mut identity) = conn
         .query_row(
             "SELECT id, name, host, totp_secret, note, provenance, seed_account,
-                    length(password), created_at, updated_at
+                    length(password), egress_exit_id, created_at, updated_at
                FROM identity WHERE id = ?1",
             [id],
             |r| {
@@ -210,8 +217,9 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Identity>> {
                         .unwrap_or(Provenance::Operator),
                     seed_account: r.get(6)?,
                     password_len: r.get(7)?,
-                    created_at: r.get(8)?,
-                    updated_at: r.get(9)?,
+                    egress_exit_id: r.get(8)?,
+                    created_at: r.get(9)?,
+                    updated_at: r.get(10)?,
                     cookies: Vec::new(),
                 })
             },
@@ -260,13 +268,14 @@ pub fn update(
     let totp_secret = edit.totp_secret.clone().or(current.totp_secret);
     let note = edit.note.clone().or(current.note);
     let seed_account = edit.seed_account.clone().or(current.seed_account);
+    let egress_exit_id = edit.egress_exit_id.or(current.egress_exit_id);
     let changed = conn
         .execute(
             "UPDATE identity
                 SET name = ?2, host = ?3, totp_secret = ?4, note = ?5,
                     password = COALESCE(?6, password),
-                    provenance = ?7, seed_account = ?8,
-                    updated_at = ?9
+                    provenance = ?7, seed_account = ?8, egress_exit_id = ?9,
+                    updated_at = ?10
               WHERE id = ?1",
             params![
                 id,
@@ -279,6 +288,7 @@ pub fn update(
                 edit.password.clone().filter(|p| !p.is_empty()),
                 edit.provenance.unwrap_or(current.provenance).as_str(),
                 seed_account,
+                egress_exit_id,
                 now
             ],
         )

@@ -152,7 +152,7 @@ fn write_endpoints(conn: &Connection, dir: &Path) -> Result<MaterialisedFile, Ma
     let mut out = String::new();
     for (method, host, path, status, mime, resp_len, started_at, flow_id) in rows {
         out.push_str(&format!(
-            "{{\"method\":{},{},\"path\":{},\"status\":{},\"mime\":{},\"resp_len\":{},\"last_seen\":{},\"flow_id\":{flow_id}}}\n",
+            "{{\"method\":{},\"host\":{},\"path\":{},\"status\":{},\"mime\":{},\"resp_len\":{},\"last_seen\":{},\"flow_id\":{flow_id}}}\n",
             json(&method),
             json(&host),
             json(&path),
@@ -282,6 +282,63 @@ MCP resources, which decode content-encoding and report truncation honestly.
     write_file(dir, "README.md", content.to_string()).map_err(std::io::Error::other)
 }
 
+// --- the tier diff (phase 10) ---
+
+/// The boundary between two tiers, as endpoint sets: what each side can see
+/// that the other cannot. The access-control lead generator — crawl per
+/// identity, materialise per identity, diff, and every `only_in_*` row is a
+/// question ("why does t1 reach this and t0 not? — or is it t0-only and
+/// mispriced?").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TierDiff {
+    /// `METHOD host path` rows present in A, absent in B.
+    pub only_in_a: Vec<String>,
+    /// Present in B, absent in A.
+    pub only_in_b: Vec<String>,
+    pub shared: usize,
+}
+
+/// Read one JSON-escaped string field out of a flat JSONL line. The writers
+/// here are the only producers, so the escape rules are ours: no nested
+/// objects on these lines, values never contain unescaped quotes.
+fn field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(
+        rest[..end]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+            .replace("\\n", "\n"),
+    )
+}
+
+/// Diff the `endpoints.jsonl` of two materialised directories. The caller
+/// decides which crawl is A and which is B; naming the tiers in the result is
+/// the caller's job too, because the files do not know.
+pub fn tier_diff(a_endpoints: &Path, b_endpoints: &Path) -> Result<TierDiff, MaterialiseError> {
+    let read_keys = |path: &Path| -> Result<std::collections::BTreeSet<String>, MaterialiseError> {
+        let text = std::fs::read_to_string(path).map_err(MaterialiseError::Io)?;
+        Ok(text
+            .lines()
+            .filter_map(|line| {
+                let method = field(line, "method")?;
+                let host = field(line, "host")?;
+                let path = field(line, "path")?;
+                Some(format!("{method} {host}{path}"))
+            })
+            .collect())
+    };
+    let a = read_keys(a_endpoints)?;
+    let b = read_keys(b_endpoints)?;
+    Ok(TierDiff {
+        only_in_a: a.difference(&b).cloned().collect(),
+        only_in_b: b.difference(&a).cloned().collect(),
+        shared: a.intersection(&b).count(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +388,36 @@ mod tests {
     fn json_escapes_the_unprintable() {
         assert_eq!(json("a\"b\\c\nd\te"), "\"a\\\"b\\\\c\\nd\\te\"");
         assert_eq!(json("\u{1}"), "\"\\u0001\"");
+    }
+
+    #[test]
+    fn the_tier_diff_names_each_sides_private_surface() {
+        let dir = std::env::temp_dir().join(format!("lockgate-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // T0 (anonymous): two endpoints. T1 (registered): one of them plus
+        // an admin-ish one — the diff should name exactly that asymmetry.
+        std::fs::write(
+            dir.join("t0.jsonl"),
+            "{\"method\":\"GET\",\"host\":\"app.example.com\",\"path\":\"/\",\"status\":200,\"mime\":null,\"resp_len\":10,\"last_seen\":1,\"flow_id\":1}\n\
+             {\"method\":\"GET\",\"host\":\"app.example.com\",\"path\":\"/about\",\"status\":200,\"mime\":null,\"resp_len\":10,\"last_seen\":1,\"flow_id\":2}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("t1.jsonl"),
+            "{\"method\":\"GET\",\"host\":\"app.example.com\",\"path\":\"/\",\"status\":200,\"mime\":null,\"resp_len\":10,\"last_seen\":1,\"flow_id\":3}\n\
+             {\"method\":\"POST\",\"host\":\"app.example.com\",\"path\":\"/admin/import\",\"status\":200,\"mime\":null,\"resp_len\":10,\"last_seen\":1,\"flow_id\":4}\n",
+        )
+        .unwrap();
+        let diff = tier_diff(&dir.join("t0.jsonl"), &dir.join("t1.jsonl")).unwrap();
+        assert_eq!(
+            diff.only_in_a,
+            vec!["GET app.example.com/about".to_string()]
+        );
+        assert_eq!(
+            diff.only_in_b,
+            vec!["POST app.example.com/admin/import".to_string()]
+        );
+        assert_eq!(diff.shared, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
