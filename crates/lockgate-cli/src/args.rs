@@ -24,6 +24,9 @@ OPTIONS:
         --mcp-port <PORT>    Port for the MCP server (default 3001; 0 disables)
         --listen <ADDR>      Address to bind both listeners to (default 127.0.0.1)
         --project <NAME>     Open this project directly, skipping the picker
+        --targets <A,B,..>   Run several targets in one server: a proxy each
+                             (base port + 2 per target), one shared MCP and
+                             /status. Excludes --project; implies --no-tui
         --data-dir <PATH>    Where projects live (default ~/.lockgate)
         --export-ca <PATH>   Write the CA certificate here and exit
         --cdp-chrome         Ensure a CDP Chrome (persistent profile, port
@@ -56,6 +59,10 @@ pub struct Args {
     /// and skips it — the scriptable path, and what every non-interactive test
     /// wants so it lands on a known project without a menu waiting on input.
     pub project: Option<String>,
+    /// Several targets in one server. A proxy each, one shared MCP and
+    /// status page. Excludes `--project`; implies headless (a multi-target
+    /// picker is a menu nobody asked for).
+    pub targets: Option<String>,
     /// `None` means the default location, resolved later — the parser does not
     /// touch the filesystem, which is what makes it testable.
     pub data_dir: Option<PathBuf>,
@@ -84,6 +91,7 @@ impl Default for Args {
             port: 3000,
             mcp_port: 3001,
             project: None,
+            targets: None,
             data_dir: None,
             export_ca: None,
             cdp_chrome: false,
@@ -97,10 +105,8 @@ impl Default for Args {
 }
 
 impl Args {
-    pub fn proxy_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.listen, self.port)
-    }
-
+    /// The MCP/status listener. Proxy ports are per target (base + 2×index)
+    /// and are derived where the proxies are spawned.
     pub fn mcp_addr(&self) -> SocketAddr {
         SocketAddr::new(self.listen, self.mcp_port)
     }
@@ -161,6 +167,11 @@ where
                 Ok(_) => return Parsed::Error("--project needs a name".into()),
                 Err(e) => return Parsed::Error(e),
             },
+            "--targets" => match value() {
+                Ok(list) if !list.trim().is_empty() => args.targets = Some(list),
+                Ok(_) => return Parsed::Error("--targets needs a comma-separated list".into()),
+                Err(e) => return Parsed::Error(e),
+            },
             "--data-dir" => match value() {
                 Ok(path) => args.data_dir = Some(PathBuf::from(path)),
                 Err(e) => return Parsed::Error(e),
@@ -194,11 +205,26 @@ where
         }
     }
 
+    // The two targeting modes are exclusive: one name and a list cannot both
+    // be the truth.
+    if args.project.is_some() && args.targets.is_some() {
+        return Parsed::Error(
+            "--project and --targets are exclusive: name one target or several, not both".into(),
+        );
+    }
+    // Multi-target is a server shape: the TUI watches one target, which is
+    // exactly what /status already does better from anywhere.
+    if args.targets.is_some() {
+        args.no_tui = true;
+    }
+
     // The picker is a TUI, so headless mode has no way to choose a project:
     // refusing here beats starting a process that blocks forever on a menu
     // nobody can see.
-    if args.no_tui && args.project.is_none() {
-        return Parsed::Error("--no-tui needs --project: the picker needs a terminal".into());
+    if args.no_tui && args.project.is_none() && args.targets.is_none() {
+        return Parsed::Error(
+            "--no-tui needs --project (or --targets): the picker needs a terminal".into(),
+        );
     }
 
     Parsed::Run(Box::new(args))
@@ -233,7 +259,7 @@ mod tests {
     #[test]
     fn no_arguments_is_the_documented_default() {
         let args = run(&[]);
-        assert_eq!(args.proxy_addr().to_string(), "127.0.0.1:3000");
+        assert_eq!(args.port, 3000);
         assert_eq!(args.mcp_addr().to_string(), "127.0.0.1:3001");
         assert_eq!(args.project, None, "no --project means the picker");
         assert_eq!(args.data_dir, None);
@@ -245,6 +271,22 @@ mod tests {
         assert_eq!(args.port, 8080);
         assert_eq!(args.mcp_port, 8081);
         assert_eq!(args.project.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn targets_parse_and_exclude_project() {
+        let args = run(&["--targets", "acme, acme-eu , other"]);
+        assert_eq!(
+            args.targets.as_deref(),
+            Some("acme, acme-eu , other"),
+            "the list is split later, where names are validated"
+        );
+        assert!(args.no_tui, "multi-target is a server shape");
+
+        let e = error(&["--project", "acme", "--targets", "acme-eu"]);
+        assert!(e.contains("exclusive"), "{e}");
+        let e = error(&["--targets", ""]);
+        assert!(!e.is_empty());
     }
 
     #[test]
@@ -285,7 +327,8 @@ mod tests {
     #[test]
     fn listening_elsewhere_is_allowed_but_not_the_default() {
         let args = run(&["--listen", "0.0.0.0", "--port", "8080"]);
-        assert_eq!(args.proxy_addr().to_string(), "0.0.0.0:8080");
+        assert_eq!(args.listen.to_string(), "0.0.0.0");
+        assert_eq!(args.port, 8080);
         assert_eq!(
             Args::default().listen.to_string(),
             "127.0.0.1",

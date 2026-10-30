@@ -9,7 +9,9 @@ mod syntax;
 mod tui;
 mod vim;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use lockgate_core::model::now_micros;
 use lockgate_core::{Engine, Registry};
@@ -121,40 +123,70 @@ async fn main() -> std::io::Result<()> {
         Registry::open(&data_dir.join("registry.db")).expect("failed to open project registry");
     let projects_dir = startup::projects_dir(&data_dir);
 
-    // Which project? `--project` names one directly (the scriptable path);
-    // otherwise the startup picker opens, and a project only exists once the user
-    // has chosen or created one. `create` is idempotent on the path, so naming a
-    // project both makes a new one and reopens an existing one.
-    let project = match &args.project {
-        Some(name) => registry
-            .create(name, &projects_dir.join(name), now_micros())
-            .expect("failed to open project"),
-        None => match startup::pick(&registry, &projects_dir)? {
-            Some(project) => project,
+    // Which targets? `--targets a,b,c` runs several in one server (a proxy
+    // each); `--project` is the single-target spelling of the same thing;
+    // neither means the startup picker. `create` is idempotent on the path,
+    // so naming a target creates and reopens it in one step.
+    let target_names: Vec<String> = match (&args.project, &args.targets) {
+        (Some(name), None) => vec![name.clone()],
+        (None, Some(list)) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => match startup::pick(&registry, &projects_dir)? {
+            Some(project) => vec![project.name],
             // The user left the picker without opening anything. Nothing has
             // been spawned yet, so this is a clean exit.
             None => return Ok(()),
         },
     };
-    registry
-        .touch(project.id, now_micros())
-        .expect("failed to update project");
+    if target_names.is_empty() {
+        eprintln!("lockgate: --targets named no targets");
+        std::process::exit(2);
+    }
 
-    let engine = Engine::open_project(&project.path).expect("failed to open project");
-    info!(
-        project = %project.name,
-        proxy = %args.proxy_addr(),
-        "started"
-    );
+    // One engine per target, each with its own project database, scope,
+    // policy and identity set. Nothing is shared between targets but this
+    // process and the dashboard.
+    let mut engines: Vec<(String, Arc<Engine>)> = Vec::new();
+    for name in &target_names {
+        let project = registry
+            .create(name, &projects_dir.join(name), now_micros())
+            .expect("failed to open project");
+        registry
+            .touch(project.id, now_micros())
+            .expect("failed to update project");
+        let engine = Engine::open_project(&project.path).expect("failed to open project");
+        engines.push((name.clone(), engine));
+    }
 
-    // Proxy runs in the background; the TUI runs on the main task.
-    let proxy_engine = engine.clone();
-    let proxy_addr = args.proxy_addr();
-    tokio::spawn(async move {
-        if let Err(e) = lockgate_core::serve(proxy_engine, proxy_addr).await {
-            error!(error = %e, "proxy stopped");
+    // Push notifications carry the target name — with several targets in
+    // flight, an untitled buzz is noise.
+    if let Some(url) = &args.ntfy {
+        for (name, engine) in &engines {
+            engine.set_notifier(lockgate_core::Notifier::spawn_prefixed(
+                url.clone(),
+                format!("[{name}] "),
+            ));
         }
-    });
+        info!(url, "push notifications on");
+    }
+
+    // A proxy listener per target: what you point at port N is what gets
+    // captured into target N. Port = base + 2×index, deterministic, and the
+    // first odd gap (base+1) is where the MCP server sits.
+    for (i, (name, engine)) in engines.iter().enumerate() {
+        let proxy_engine = engine.clone();
+        let proxy_addr = SocketAddr::new(args.listen, args.port + (i as u16) * 2);
+        info!(target = %name, %proxy_addr, "proxy listening");
+        tokio::spawn(async move {
+            if let Err(e) = lockgate_core::serve(proxy_engine, proxy_addr).await {
+                error!(error = %e, "proxy stopped");
+            }
+        });
+    }
 
     // MCP server shares the same engine, in-process, so there is one SQLite
     // writer. A failure here (e.g. the port is taken) must not take the proxy or
@@ -162,19 +194,14 @@ async fn main() -> std::io::Result<()> {
     //
     // Port 0 or `--no-mcp` means the operator turned it off — running a second
     // instance otherwise logs a bind failure that looks like a bug.
-    // Headline events go to the operator's phone when asked for. Configured
-    // before anything can file a finding, so the first one is not missed.
-    if let Some(url) = &args.ntfy {
-        engine.set_notifier(lockgate_core::Notifier::spawn(url.clone()));
-        info!(url, "push notifications on");
-    }
-
     if args.mcp_port != 0 && !args.no_mcp {
-        let mcp_engine = engine.clone();
+        let targets = Arc::new(lockgate_mcp::Targets {
+            engines: engines.clone(),
+        });
         let mcp_addr = args.mcp_addr();
         let status_token = args.status_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = lockgate_mcp::serve(mcp_engine, mcp_addr, status_token).await {
+            if let Err(e) = lockgate_mcp::serve(targets, mcp_addr, status_token).await {
                 error!(error = %e, "MCP server stopped");
             }
         });
@@ -192,15 +219,17 @@ async fn main() -> std::io::Result<()> {
         } else {
             String::new()
         };
-        println!(
-            "lockgate — proxy http://{}{mcp} — Ctrl-C to stop",
-            args.proxy_addr()
-        );
+        let mut listing = String::new();
+        for (i, (name, _)) in engines.iter().enumerate() {
+            let port = args.port + (i as u16) * 2;
+            listing.push_str(&format!("\n  {name}: proxy :{port}"));
+        }
+        println!("lockgate —{listing}{mcp} — Ctrl-C to stop",);
         terminate_signal().await;
         Ok(())
     } else {
         tokio::select! {
-            result = tui::run(engine.clone()) => result,
+            result = tui::run(engines[0].1.clone()) => result,
             _ = terminate_signal() => {
                 // The TUI future is dropped here, part-way through its loop, so the
                 // `ratatui::restore()` at the end of `tui::run` never runs. Undo the
@@ -212,10 +241,12 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    if tokio::time::timeout(FLUSH_TIMEOUT, engine.shutdown())
-        .await
-        .is_err()
-    {
+    let mut shutdowns = Vec::new();
+    for (_, engine) in &engines {
+        shutdowns.push(engine.shutdown());
+    }
+    let drain = futures_util::future::join_all(shutdowns);
+    if tokio::time::timeout(FLUSH_TIMEOUT, drain).await.is_err() {
         // Returning here would not actually get us out: dropping the runtime
         // joins blocking tasks, so a wedged writer would hang the process just
         // past the timeout that was supposed to prevent exactly that. Leaving by

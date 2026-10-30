@@ -30,6 +30,18 @@ model churn is not something to fuse into a Rust core. The in-process brain,
 if it ever comes, is a later orchestration layer on top of primitives good
 enough that a dumb agent succeeds.
 
+One server, many targets — the operator's interface:
+
+```
+lockgate serve --targets acme,acme-eu
+  ├─ proxy :3000 → acme      (own project DB, scope, policy, identities)
+  ├─ proxy :3002 → acme-eu
+  ├─ MCP :3001 (shared)      — list_targets / set_target (per agent session);
+  │                            every action tool takes an explicit target that
+  │                            wins, and echoes the target it hit
+  └─ /status (shared)        — sidebar of every target, overview + drilldown
+```
+
 ```
 Program (e.g. a bug-bounty vendor)
   targets[] ── each: a lockgate project + scope + budget + policy

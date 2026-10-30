@@ -66,11 +66,18 @@ impl Notifier {
     /// (e.g. `https://ntfy.sh/my-secret-topic`). Treat the topic as a secret:
     /// anyone who has it can read the run's headlines.
     pub fn spawn(url: String) -> Self {
+        Self::spawn_prefixed(url, String::new())
+    }
+
+    /// Like [`Self::spawn`], with a prefix on every push title — the target
+    /// name, when one server runs several.
+    pub fn spawn_prefixed(url: String, prefix: String) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
         tokio::spawn(async move {
             let client = reqwest::Client::new();
             while let Some(event) = rx.recv().await {
                 let (title, body) = event.headline();
+                let title = format!("{prefix}{title}");
                 let result = client
                     .post(&url)
                     .header("X-Title", &title)

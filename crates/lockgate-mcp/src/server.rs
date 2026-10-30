@@ -313,6 +313,9 @@ pub struct CheckScopeResult {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct SendRequestParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
     /// The request as raw wire text: start line, headers, blank line, body —
     /// the same shape intercept_get returns.
     pub text: String,
@@ -330,6 +333,8 @@ pub struct SendRequestParams {
 
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct SendRequestResult {
+    /// The target this send hit.
+    pub target: String,
     /// The new flow this send was recorded as.
     pub flow_id: i64,
     pub status: u16,
@@ -356,9 +361,44 @@ pub struct FormatMessageResult {
 
 /// The MCP frontend. Holds only an `Engine` handle and its tool table; a fresh
 /// one is built per session by the transport's service factory.
+/// Every target this server instance runs: a name and its live engine. One
+/// process serves all of them; each keeps its own project database, scope,
+/// policy and identity set, so a target's floor never leaks into another's.
 #[derive(Clone)]
+pub struct Targets {
+    pub engines: Vec<(String, Arc<Engine>)>,
+}
+
+impl Targets {
+    /// The single-target shape every pre-multi-target caller means.
+    pub fn single(name: &str, engine: Arc<Engine>) -> Arc<Self> {
+        Arc::new(Self {
+            engines: vec![(name.to_string(), engine)],
+        })
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<Engine>> {
+        self.engines
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| e.clone())
+    }
+
+    pub fn first(&self) -> (String, Arc<Engine>) {
+        self.engines[0].clone()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.engines.iter().map(|(n, _)| n.clone()).collect()
+    }
+}
+
 pub struct ProxyServer {
-    engine: Arc<Engine>,
+    targets: Arc<Targets>,
+    /// This *session's* target. Per session, not global: two agents driving
+    /// the same MCP server can work two targets at once without stomping
+    /// each other. Defaults to the first target.
+    selected: std::sync::Mutex<String>,
     tool_router: ToolRouter<ProxyServer>,
 }
 
@@ -426,6 +466,9 @@ pub struct GetSitemapResult {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ResendFlowParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
     /// The flow to replay. Its request is sent straight at the target and the
     /// fresh response is summarised here; the replay is recorded as a new flow.
     pub id: i64,
@@ -442,6 +485,8 @@ pub struct ResendFlowParams {
 
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct ResendFlowResult {
+    /// The target this replay hit.
+    pub target: String,
     /// The id of the new flow this replay was recorded as (parented to the
     /// original). Fetch it with get_flow to see the full replayed exchange.
     pub replay_flow_id: i64,
@@ -474,6 +519,9 @@ pub struct EvidenceInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateFindingParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
     pub title: String,
     /// info | low | medium | high | critical.
     pub severity: String,
@@ -496,6 +544,7 @@ pub struct CreateFindingParams {
 
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct CreateFindingResult {
+    pub target: String,
     pub id: i64,
 }
 
@@ -637,6 +686,9 @@ pub struct UpdateIdentityParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct AdoptSessionParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
     /// A flow that shows the session — ideally one captured right after login,
     /// so the response's Set-Cookie headers are on it.
     pub flow_id: i64,
@@ -656,6 +708,7 @@ pub struct IdentityIdResult {
 
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct AdoptSessionResult {
+    pub target: String,
     pub identity_id: i64,
     pub cookie_count: i64,
     /// The host the session was captured on — now the identity's binding.
@@ -725,6 +778,9 @@ pub struct PolicyIdResult {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateLeadParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
     /// idor | authz | ratelimit | injection | logic | config | exposure | other
     pub kind: String,
     pub title: String,
@@ -748,8 +804,18 @@ pub struct ListLeadsResult {
     pub leads: Vec<LeadDto>,
 }
 
+/// A lead mutation's echo: which target was hit, and the lead after the write
+/// — so a transcript is self-describing about both.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct LeadMutationResult {
+    pub target: String,
+    #[serde(flatten)]
+    pub lead: LeadDto,
+}
+
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct LeadIdResult {
+    pub target: String,
     pub lead_id: i64,
 }
 
@@ -760,6 +826,9 @@ pub struct LeadIdParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct UpdateLeadParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
     pub lead_id: i64,
     /// proposed | verifying | verified | refuted | reported. Settling on
     /// verified/refuted requires the verdict and control below — a conclusion
@@ -774,11 +843,39 @@ pub struct UpdateLeadParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct AdjudicateLeadParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
     pub lead_id: i64,
     /// admissible | refuted
     pub ruling: String,
     /// Why — a ruling without its why is a vote.
     pub ruling_reason: String,
+}
+
+// --- targets ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct TargetNameParams {
+    /// Exact target name, as list_targets shows.
+    pub name: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct TargetDto {
+    pub name: String,
+    /// True for this session's target.
+    pub active: bool,
+    pub findings: i64,
+    pub critical: i64,
+    pub high: i64,
+    /// Leads in proposed/verifying — work in flight.
+    pub open_leads: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListTargetsResult {
+    pub targets: Vec<TargetDto>,
 }
 
 // --- materialise / report / scan ---
@@ -788,6 +885,9 @@ pub struct MaterialiseParams {
     /// Directory to write the index into. Created if absent; the files it
     /// owns are replaced. Relative paths resolve against the process cwd.
     pub dir: String,
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -805,12 +905,16 @@ pub struct ReportResult {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ScanFlowsParams {
+    /// Which target this call acts on. Wins over this session's set_target;
+    /// omit to use the session's selection. The result echoes the target hit.
+    pub target: Option<String>,
     /// How many of the most recent flows to scan. Default 500, capped 5000.
     pub limit: Option<i64>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct ScanResult {
+    pub target: String,
     pub scanned: i64,
     /// New draft findings filed (deduplicated per rule+host).
     pub filed: i64,
@@ -818,11 +922,109 @@ pub struct ScanResult {
 
 #[tool_router]
 impl ProxyServer {
-    pub fn new(engine: Arc<Engine>) -> Self {
+    pub fn new(targets: Arc<Targets>) -> Self {
+        let selected = targets.first().0;
         Self {
-            engine,
+            targets,
+            selected: std::sync::Mutex::new(selected),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The engine this session is currently working on. A missing selection
+    /// (a target deleted out from under a long session) falls back to the
+    /// first target rather than erroring mid-run.
+    fn engine(&self) -> Arc<Engine> {
+        let name = self.selected.lock().unwrap().clone();
+        self.targets
+            .get(&name)
+            .or_else(|| self.targets.get(&self.targets.first().0))
+            .expect("targets is never empty")
+    }
+
+    fn target_name(&self) -> String {
+        self.selected.lock().unwrap().clone()
+    }
+
+    /// Which target a call lands on: an explicit `target` argument wins, else
+    /// this session's `set_target` selection. Every action tool resolves
+    /// through here and echoes the resolved name in its result, so a
+    /// transcript always says what hit what.
+    fn resolve(&self, explicit: Option<&str>) -> Result<(String, Arc<Engine>), ErrorData> {
+        match explicit {
+            Some(name) => self
+                .targets
+                .get(name)
+                .map(|e| (name.to_string(), e))
+                .ok_or_else(|| {
+                    ErrorData::resource_not_found(
+                        format!(
+                            "no target \u{201c}{name}\u{201d} — list_targets shows what \
+                             this server runs"
+                        ),
+                        None,
+                    )
+                }),
+            None => {
+                let name = self.target_name();
+                let engine = self.engine();
+                Ok((name, engine))
+            }
+        }
+    }
+
+    #[tool(
+        description = "List the targets this lockgate server runs, with per-target counts.                        One is marked active — the one this session's tools operate on.                        Switch with set_target."
+    )]
+    async fn list_targets(&self) -> Result<Json<ListTargetsResult>, ErrorData> {
+        let active = self.target_name();
+        let targets = self
+            .targets
+            .engines
+            .iter()
+            .map(|(name, engine)| {
+                let findings = engine.list_findings();
+                let (critical, high) = findings.iter().fold((0, 0), |(c, h), f| {
+                    (
+                        c + (f.severity == "critical") as i64,
+                        h + (f.severity == "high") as i64,
+                    )
+                });
+                TargetDto {
+                    name: name.clone(),
+                    active: name == &active,
+                    findings: findings.len() as i64,
+                    critical,
+                    high,
+                    open_leads: engine
+                        .leads(None)
+                        .into_iter()
+                        .filter(|l| matches!(l.status.as_str(), "proposed" | "verifying"))
+                        .count() as i64,
+                }
+            })
+            .collect();
+        Ok(Json(ListTargetsResult { targets }))
+    }
+
+    #[tool(
+        description = "Point this session's tools at a target. Per session: another agent                        driving the same server keeps its own selection. The switch is                        remembered for list_flows, send, leads, findings, notes — everything."
+    )]
+    async fn set_target(
+        &self,
+        Parameters(p): Parameters<TargetNameParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        if self.targets.get(&p.name).is_none() {
+            return Err(ErrorData::resource_not_found(
+                format!(
+                    "no target “{}” — list_targets shows what this server runs",
+                    p.name
+                ),
+                None,
+            ));
+        }
+        *self.selected.lock().unwrap() = p.name;
+        Ok(Json(OkResult { ok: true }))
     }
 
     #[tool(
@@ -850,9 +1052,9 @@ impl ProxyServer {
         // CIDR blocks — so the scoped path filters in Rust and pages the
         // results it keeps.
         let rows = if p.in_scope.unwrap_or(false) {
-            self.engine.query_flows_in_scope(&query, offset, limit)
+            self.engine().query_flows_in_scope(&query, offset, limit)
         } else {
-            self.engine.query_flows(&query, offset, limit)
+            self.engine().query_flows(&query, offset, limit)
         };
         let flows: Vec<FlowDto> = rows.into_iter().map(FlowDto::from).collect();
         Ok(Json(ListFlowsResult {
@@ -873,7 +1075,7 @@ impl ProxyServer {
         Parameters(p): Parameters<GetFlowParams>,
     ) -> Result<Json<FlowDetailDto>, ErrorData> {
         let detail = self
-            .engine
+            .engine()
             .flow_detail(p.id)
             .ok_or_else(|| ErrorData::resource_not_found(format!("no flow #{}", p.id), None))?;
 
@@ -919,7 +1121,7 @@ impl ProxyServer {
         let offset = p.offset.unwrap_or(0).max(0);
         let limit = clamp_limit(p.limit, DEFAULT_LIMIT, MAX_LIMIT);
         let nodes = self
-            .engine
+            .engine()
             .sitemap(p.host.as_deref(), offset, limit)
             .into_iter()
             .map(SitemapNodeDto::from)
@@ -936,8 +1138,8 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<ResendFlowParams>,
     ) -> Result<Json<ResendFlowResult>, ErrorData> {
-        let resent = self
-            .engine
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let resent = engine
             .resend_as(p.id as u64, p.as_identity, p.tag)
             .await
             .map_err(resend_error)?;
@@ -949,6 +1151,7 @@ impl ProxyServer {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.split(';').next().unwrap_or(v).trim().to_string());
         Ok(Json(ResendFlowResult {
+            target,
             replay_flow_id: resent.replay_id as i64,
             status: response.status.as_u16(),
             http_version: format!("{:?}", response.version),
@@ -962,7 +1165,7 @@ impl ProxyServer {
         if let Some(id) = given {
             return Ok(id);
         }
-        self.engine.active_scope().map(|s| s.id).ok_or_else(|| {
+        self.engine().active_scope().map(|s| s.id).ok_or_else(|| {
             ErrorData::invalid_params(
                 "no active scope — pass scope_id, or create one with create_scope",
                 None,
@@ -980,7 +1183,7 @@ impl ProxyServer {
         Parameters(p): Parameters<FlowIdParams>,
     ) -> Result<Json<ListWsMessagesResult>, ErrorData> {
         let messages: Vec<WsMessageDto> = self
-            .engine
+            .engine()
             .ws_messages(p.flow_id as u64)
             .into_iter()
             .map(|m| {
@@ -1015,11 +1218,11 @@ impl ProxyServer {
     )]
     async fn list_scopes(&self) -> Result<Json<ListScopesResult>, ErrorData> {
         let scopes = self
-            .engine
+            .engine()
             .scopes()
             .into_iter()
             .map(|s| ScopeDto {
-                rule_count: self.engine.scope_rules(s.id).len() as i64,
+                rule_count: self.engine().scope_rules(s.id).len() as i64,
                 id: s.id,
                 name: s.name,
                 is_active: s.is_active,
@@ -1037,9 +1240,9 @@ impl ProxyServer {
         if name.is_empty() {
             return Err(ErrorData::invalid_params("name must not be empty", None));
         }
-        let id = self.engine.create_scope(name).map_err(scope_error)?;
+        let id = self.engine().create_scope(name).map_err(scope_error)?;
         if p.activate.unwrap_or(false) {
-            self.engine.set_active_scope(id).map_err(scope_error)?;
+            self.engine().set_active_scope(id).map_err(scope_error)?;
         }
         Ok(Json(ScopeIdResult { id }))
     }
@@ -1052,7 +1255,9 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<ScopeIdParams>,
     ) -> Result<Json<OkResult>, ErrorData> {
-        self.engine.delete_scope(p.scope_id).map_err(scope_error)?;
+        self.engine()
+            .delete_scope(p.scope_id)
+            .map_err(scope_error)?;
         Ok(Json(OkResult { ok: true }))
     }
 
@@ -1061,7 +1266,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<ScopeIdParams>,
     ) -> Result<Json<OkResult>, ErrorData> {
-        self.engine
+        self.engine()
             .set_active_scope(p.scope_id)
             .map_err(scope_error)?;
         Ok(Json(OkResult { ok: true }))
@@ -1074,7 +1279,7 @@ impl ProxyServer {
     ) -> Result<Json<ListScopeRulesResult>, ErrorData> {
         let scope_id = self.resolve_scope(p.scope_id)?;
         let rules = self
-            .engine
+            .engine()
             .scope_rules(scope_id)
             .iter()
             .map(rule_dto)
@@ -1129,7 +1334,7 @@ impl ProxyServer {
         }
 
         let id = self
-            .engine
+            .engine()
             .add_scope_rule(scope_id, action, &spec)
             .map_err(scope_error)?;
         Ok(Json(ScopeIdResult { id }))
@@ -1140,7 +1345,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<RuleIdParams>,
     ) -> Result<Json<OkResult>, ErrorData> {
-        self.engine
+        self.engine()
             .delete_scope_rule(p.rule_id)
             .map_err(scope_error)?;
         Ok(Json(OkResult { ok: true }))
@@ -1154,7 +1359,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<SetRuleEnabledParams>,
     ) -> Result<Json<OkResult>, ErrorData> {
-        self.engine
+        self.engine()
             .set_scope_rule_enabled(p.rule_id, p.enabled)
             .map_err(scope_error)?;
         Ok(Json(OkResult { ok: true }))
@@ -1182,7 +1387,7 @@ impl ProxyServer {
         let path = uri.path().to_string();
 
         let in_scope = self
-            .engine
+            .engine()
             .scope_matcher()
             .matches(&lockgate_core::scope::Target {
                 host: &host,
@@ -1194,7 +1399,7 @@ impl ProxyServer {
             host,
             port,
             path,
-            scope: self.engine.active_scope().map(|s| s.name),
+            scope: self.engine().active_scope().map(|s| s.name),
         }))
     }
 
@@ -1216,7 +1421,7 @@ impl ProxyServer {
         let base = match p.base_flow_id {
             Some(id) => {
                 let flow = self
-                    .engine
+                    .engine()
                     .get_flow(id as u64)
                     .ok_or_else(|| ErrorData::resource_not_found(format!("no flow #{id}"), None))?;
                 flow.request
@@ -1241,9 +1446,9 @@ impl ProxyServer {
             ));
         }
 
+        let (target, engine) = self.resolve(p.target.as_deref())?;
         let started = std::time::Instant::now();
-        let sent = self
-            .engine
+        let sent = engine
             .send_request(
                 request,
                 p.base_flow_id.map(|id| id as u64),
@@ -1255,6 +1460,7 @@ impl ProxyServer {
         let millis = started.elapsed().as_millis() as i64;
 
         Ok(Json(SendRequestResult {
+            target,
             flow_id: sent.replay_id as i64,
             status: sent.response.status.as_u16(),
             response_len: sent.response.body.len() as i64,
@@ -1295,7 +1501,8 @@ impl ProxyServer {
                        answered — nothing times out."
     )]
     async fn intercept_status(&self) -> Result<Json<InterceptStatusResult>, ErrorData> {
-        let i = self.engine.intercept();
+        let engine = self.engine();
+        let i = engine.intercept();
         Ok(Json(InterceptStatusResult {
             enabled: i.is_enabled(),
             holds_requests: i.holds_requests(),
@@ -1314,7 +1521,8 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<InterceptSetParams>,
     ) -> Result<Json<InterceptSetResult>, ErrorData> {
-        let i = self.engine.intercept();
+        let engine = self.engine();
+        let i = engine.intercept();
         let mut released = 0usize;
         if let Some(on) = p.hold_requests {
             released += i.set_hold_requests(on);
@@ -1343,7 +1551,8 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<InterceptQueueParams>,
     ) -> Result<Json<InterceptQueueResult>, ErrorData> {
-        let i = self.engine.intercept();
+        let engine = self.engine();
+        let i = engine.intercept();
         let held = match p.leg.as_deref() {
             None => i.queue(),
             Some(leg) => match parse_leg(leg)? {
@@ -1368,7 +1577,7 @@ impl ProxyServer {
         Parameters(p): Parameters<TicketParams>,
     ) -> Result<Json<InterceptGetResult>, ErrorData> {
         let held = self
-            .engine
+            .engine()
             .intercept()
             .get(p.ticket as u64)
             .ok_or_else(|| unknown_ticket(p.ticket))?;
@@ -1396,7 +1605,7 @@ impl ProxyServer {
                 // Reparsed against the original, which supplies what wire text
                 // cannot: the absolute URI behind an origin-form target.
                 let held = self
-                    .engine
+                    .engine()
                     .intercept()
                     .get(ticket)
                     .ok_or_else(|| unknown_ticket(p.ticket))?;
@@ -1406,7 +1615,7 @@ impl ProxyServer {
             }
         };
         Ok(Json(AnsweredResult {
-            answered: self.engine.intercept().forward(ticket, edited),
+            answered: self.engine().intercept().forward(ticket, edited),
         }))
     }
 
@@ -1419,7 +1628,7 @@ impl ProxyServer {
         Parameters(p): Parameters<TicketParams>,
     ) -> Result<Json<AnsweredResult>, ErrorData> {
         Ok(Json(AnsweredResult {
-            answered: self.engine.intercept().discard(p.ticket as u64),
+            answered: self.engine().intercept().discard(p.ticket as u64),
         }))
     }
 
@@ -1432,7 +1641,8 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<InterceptAnswerAllParams>,
     ) -> Result<Json<AnsweredAllResult>, ErrorData> {
-        let i = self.engine.intercept();
+        let engine = self.engine();
+        let i = engine.intercept();
         let answered = match p.verdict.to_ascii_lowercase().as_str() {
             "forward" => i.forward_all(),
             "drop" => i.discard_all(),
@@ -1466,7 +1676,7 @@ impl ProxyServer {
             ));
         }
         let rows = self
-            .engine
+            .engine()
             .annotate_flow(p.id as u64, p.comment, p.highlight)
             .await
             .map_err(write_error)?;
@@ -1493,7 +1703,7 @@ impl ProxyServer {
         // ("the write did not commit"); check existence first for a clear error.
         let evidence = p.evidence.unwrap_or_default();
         for e in &evidence {
-            if self.engine.flow_detail(e.flow_id).is_none() {
+            if self.engine().flow_detail(e.flow_id).is_none() {
                 return Err(ErrorData::invalid_params(
                     format!("evidence flow #{} does not exist", e.flow_id),
                     None,
@@ -1520,18 +1730,15 @@ impl ProxyServer {
             // `workflow` is reserved for what the passive scanner raises.
             origin: "manual".to_string(),
         };
-        let id = self
-            .engine
-            .create_finding(finding)
-            .await
-            .map_err(write_error)?;
-        Ok(Json(CreateFindingResult { id }))
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let id = engine.create_finding(finding).await.map_err(write_error)?;
+        Ok(Json(CreateFindingResult { id, target }))
     }
 
     #[tool(description = "List every finding recorded in this project, newest first.")]
     async fn list_findings(&self) -> Result<Json<ListFindingsResult>, ErrorData> {
         let findings = self
-            .engine
+            .engine()
             .list_findings()
             .into_iter()
             .map(FindingDto::from)
@@ -1544,7 +1751,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<GetFindingParams>,
     ) -> Result<Json<FindingDto>, ErrorData> {
-        self.engine
+        self.engine()
             .get_finding(p.id)
             .map(|f| Json(FindingDto::from(f)))
             .ok_or_else(|| ErrorData::resource_not_found(format!("no finding #{}", p.id), None))
@@ -1614,7 +1821,7 @@ impl ProxyServer {
             ));
         }
 
-        let rows = self.engine.update_finding(p.id, &edit);
+        let rows = self.engine().update_finding(p.id, &edit);
         Ok(Json(RowsChangedResult {
             rows_changed: rows as u64,
         }))
@@ -1634,7 +1841,7 @@ impl ProxyServer {
             return Err(ErrorData::invalid_params("title must not be empty", None));
         }
         let id = self
-            .engine
+            .engine()
             .create_note(lockgate_core::NewNote {
                 title: title.to_string(),
                 body_md: p.body_md.unwrap_or_default(),
@@ -1647,7 +1854,7 @@ impl ProxyServer {
     #[tool(description = "List every note in this project, newest first, with full bodies.")]
     async fn list_notes(&self) -> Result<Json<ListNotesResult>, ErrorData> {
         let notes = self
-            .engine
+            .engine()
             .list_notes()
             .into_iter()
             .map(NoteDto::from)
@@ -1660,7 +1867,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<NoteIdParams>,
     ) -> Result<Json<NoteDto>, ErrorData> {
-        self.engine
+        self.engine()
             .get_note(p.id)
             .map(|n| Json(NoteDto::from(n)))
             .ok_or_else(|| ErrorData::resource_not_found(format!("no note #{}", p.id), None))
@@ -1684,7 +1891,7 @@ impl ProxyServer {
             return Err(ErrorData::invalid_params("title must not be empty", None));
         }
         let rows = self
-            .engine
+            .engine()
             .update_note(p.id, p.title.as_deref(), p.body_md.as_deref());
         Ok(Json(RowsChangedResult {
             rows_changed: rows as u64,
@@ -1696,7 +1903,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<NoteIdParams>,
     ) -> Result<Json<RowsChangedResult>, ErrorData> {
-        let rows = self.engine.delete_note(p.id);
+        let rows = self.engine().delete_note(p.id);
         Ok(Json(RowsChangedResult {
             rows_changed: rows as u64,
         }))
@@ -1715,7 +1922,7 @@ impl ProxyServer {
     )]
     async fn list_identities(&self) -> Result<Json<ListIdentitiesResult>, ErrorData> {
         let identities = self
-            .engine
+            .engine()
             .identities()
             .into_iter()
             .map(IdentityDto::from)
@@ -1749,7 +1956,7 @@ impl ProxyServer {
             cookies,
         };
         let id = self
-            .engine
+            .engine()
             .create_identity(&new)
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         Ok(Json(IdentityIdResult { identity_id: id }))
@@ -1774,7 +1981,7 @@ impl ProxyServer {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         if host.is_none() {
-            host = self.engine.identity(p.identity_id).and_then(|i| i.host);
+            host = self.engine().identity(p.identity_id).and_then(|i| i.host);
         }
         let cookies = match &p.cookies {
             None => None,
@@ -1801,7 +2008,7 @@ impl ProxyServer {
             cookies,
         };
         let rows = self
-            .engine
+            .engine()
             .update_identity(p.identity_id, &edit)
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         if rows == 0 {
@@ -1823,7 +2030,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<IdentityIdParams>,
     ) -> Result<Json<OkResult>, ErrorData> {
-        let rows = self.engine.delete_identity(p.identity_id);
+        let rows = self.engine().delete_identity(p.identity_id);
         if rows == 0 {
             return Err(ErrorData::resource_not_found(
                 format!(
@@ -1851,15 +2058,17 @@ impl ProxyServer {
         if name.is_empty() {
             return Err(ErrorData::invalid_params("name must not be empty", None));
         }
-        let id = self.engine.adopt_identity_from_flow(p.flow_id as u64, name);
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let id = engine.adopt_identity_from_flow(p.flow_id as u64, name);
         match id {
             Ok(id) => {
-                let identity = self.engine.identity(id);
+                let identity = engine.identity(id);
                 let (count, host) = match &identity {
                     Some(i) => (i.cookies.len() as i64, i.host.clone()),
                     None => (0, None),
                 };
                 Ok(Json(AdoptSessionResult {
+                    target,
                     identity_id: id,
                     cookie_count: count,
                     host,
@@ -1920,9 +2129,9 @@ impl ProxyServer {
                        drawing it is how the operator bounds an agent's free hand."
     )]
     async fn get_policy(&self) -> Result<Json<GetPolicyResult>, ErrorData> {
-        let p = self.engine.policy();
+        let p = self.engine().policy();
         let rules = self
-            .engine
+            .engine()
             .policy_rules()
             .into_iter()
             .map(|r| PolicyRuleDto {
@@ -1956,7 +2165,7 @@ impl ProxyServer {
         } else {
             Some(p.per_host_per_sec)
         };
-        self.engine.set_rate_limit(rate);
+        self.engine().set_rate_limit(rate);
         Ok(Json(OkResult { ok: true }))
     }
 
@@ -1975,7 +2184,7 @@ impl ProxyServer {
         }
         let kind = p.kind.as_deref().unwrap_or("forbid_url_regex");
         let id = self
-            .engine
+            .engine()
             .add_policy_rule(kind, pattern, p.note.as_deref())
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         Ok(Json(PolicyIdResult { rule_id: id }))
@@ -1986,7 +2195,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<RuleIdParams>,
     ) -> Result<Json<OkResult>, ErrorData> {
-        let rows = self.engine.delete_policy_rule(p.rule_id);
+        let rows = self.engine().delete_policy_rule(p.rule_id);
         if rows == 0 {
             return Err(ErrorData::resource_not_found(
                 format!(
@@ -2012,8 +2221,8 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<CreateLeadParams>,
     ) -> Result<Json<LeadIdResult>, ErrorData> {
-        let id = self
-            .engine
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let id = engine
             .create_lead(&lockgate_core::NewLead {
                 kind: p.kind,
                 title: p.title,
@@ -2022,7 +2231,10 @@ impl ProxyServer {
                 flow_id: p.flow_id,
             })
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        Ok(Json(LeadIdResult { lead_id: id }))
+        Ok(Json(LeadIdResult {
+            lead_id: id,
+            target,
+        }))
     }
 
     #[tool(
@@ -2035,7 +2247,7 @@ impl ProxyServer {
         Parameters(p): Parameters<ListLeadsParams>,
     ) -> Result<Json<ListLeadsResult>, ErrorData> {
         let leads = self
-            .engine
+            .engine()
             .leads(p.status.as_deref())
             .into_iter()
             .map(LeadDto::from)
@@ -2048,7 +2260,7 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<LeadIdParams>,
     ) -> Result<Json<LeadDto>, ErrorData> {
-        self.engine
+        self.engine()
             .lead(p.lead_id)
             .map(LeadDto::from)
             .map(Json)
@@ -2069,9 +2281,9 @@ impl ProxyServer {
     async fn update_lead(
         &self,
         Parameters(p): Parameters<UpdateLeadParams>,
-    ) -> Result<Json<OkResult>, ErrorData> {
-        let rows = self
-            .engine
+    ) -> Result<Json<LeadMutationResult>, ErrorData> {
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let rows = engine
             .record_lead_verdict(
                 p.lead_id,
                 p.status.as_deref().unwrap_or("verifying"),
@@ -2081,11 +2293,17 @@ impl ProxyServer {
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         if rows == 0 {
             return Err(ErrorData::resource_not_found(
-                format!("no lead #{} — list_leads shows what exists", p.lead_id),
+                format!(
+                    "no lead #{} on target “{target}” — list_leads shows what exists",
+                    p.lead_id
+                ),
                 None,
             ));
         }
-        Ok(Json(OkResult { ok: true }))
+        let lead = engine.lead(p.lead_id).map(LeadDto::from).ok_or_else(|| {
+            ErrorData::internal_error("lead vanished after update".to_string(), None)
+        })?;
+        Ok(Json(LeadMutationResult { target, lead }))
     }
 
     #[tool(
@@ -2097,18 +2315,24 @@ impl ProxyServer {
     async fn adjudicate_lead(
         &self,
         Parameters(p): Parameters<AdjudicateLeadParams>,
-    ) -> Result<Json<OkResult>, ErrorData> {
-        let rows = self
-            .engine
+    ) -> Result<Json<LeadMutationResult>, ErrorData> {
+        let (target, engine) = self.resolve(p.target.as_deref())?;
+        let rows = engine
             .adjudicate_lead(p.lead_id, &p.ruling, &p.ruling_reason)
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         if rows == 0 {
             return Err(ErrorData::resource_not_found(
-                format!("no lead #{} — list_leads shows what exists", p.lead_id),
+                format!(
+                    "no lead #{} on target “{target}” — list_leads shows what exists",
+                    p.lead_id
+                ),
                 None,
             ));
         }
-        Ok(Json(OkResult { ok: true }))
+        let lead = engine.lead(p.lead_id).map(LeadDto::from).ok_or_else(|| {
+            ErrorData::internal_error("lead vanished after adjudication".to_string(), None)
+        })?;
+        Ok(Json(LeadMutationResult { target, lead }))
     }
 
     // --- materialise / report / scan ---
@@ -2124,9 +2348,9 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<MaterialiseParams>,
     ) -> Result<Json<MaterialiseResult>, ErrorData> {
+        let (_target, engine) = self.resolve(p.target.as_deref())?;
         let dir = std::path::PathBuf::from(p.dir);
-        let out = self
-            .engine
+        let out = engine
             .materialise(&dir)
             .map_err(|e| ErrorData::internal_error(format!("materialise failed: {e}"), None))?;
         Ok(Json(MaterialiseResult {
@@ -2150,7 +2374,7 @@ impl ProxyServer {
                        prose is whatever the findings carry."
     )]
     async fn generate_report(&self) -> Result<Json<ReportResult>, ErrorData> {
-        let markdown = self.engine.generate_report().ok_or_else(|| {
+        let markdown = self.engine().generate_report().ok_or_else(|| {
             ErrorData::internal_error("report generation failed".to_string(), None)
         })?;
         Ok(Json(ReportResult { markdown }))
@@ -2167,9 +2391,11 @@ impl ProxyServer {
         &self,
         Parameters(p): Parameters<ScanFlowsParams>,
     ) -> Result<Json<ScanResult>, ErrorData> {
+        let (target, engine) = self.resolve(p.target.as_deref())?;
         let limit = p.limit.unwrap_or(500).clamp(1, 5000) as usize;
-        let out = self.engine.scan_recent(limit).await;
+        let out = engine.scan_recent(limit).await;
         Ok(Json(ScanResult {
+            target,
             scanned: out.scanned as i64,
             filed: out.filed as i64,
         }))
@@ -2190,7 +2416,7 @@ impl ProxyServer {
         };
         let resource_uri = format!("flow://{id}/{side_name}");
 
-        match self.engine.body_slice(id, side, offset, limit) {
+        match self.engine().body_slice(id, side, offset, limit) {
             Some(slice) => {
                 let returned = slice.bytes.len() as i64;
                 let truncated = offset + returned < slice.total_len;
@@ -2243,13 +2469,13 @@ impl ProxyServer {
         })?;
 
         let slice = self
-            .engine
+            .engine()
             .body_slice(id, side, 0, MAX_RESOURCE_BYTES)
             .ok_or_else(|| ErrorData::resource_not_found(format!("no flow #{id}"), None))?;
 
         // Response mime comes from the stored row; requests carry none.
         let mime = match side {
-            Side::Response => self.engine.flow_detail(id).and_then(|d| d.row.mime),
+            Side::Response => self.engine().flow_detail(id).and_then(|d| d.row.mime),
             Side::Request => None,
         };
 
@@ -2573,7 +2799,7 @@ mod tests {
 
     fn setup() -> (Arc<Engine>, ProxyServer) {
         let engine = Engine::new();
-        let server = ProxyServer::new(engine.clone());
+        let server = ProxyServer::new(crate::Targets::single("test", engine.clone()));
         (engine, server)
     }
 
@@ -2890,6 +3116,7 @@ mod tests {
         let (_engine, server) = setup();
         let result = server
             .send_request(Parameters(SendRequestParams {
+                target: None,
                 text: "GET /nowhere HTTP/1.1\n\n".into(),
                 base_flow_id: None,
                 as_identity: None,
@@ -2905,6 +3132,7 @@ mod tests {
         let (_engine, server) = setup();
         let result = server
             .send_request(Parameters(SendRequestParams {
+                target: None,
                 text: "GET / HTTP/1.1\nnot-a-header\n\n".into(),
                 base_flow_id: None,
                 as_identity: None,
@@ -2920,6 +3148,7 @@ mod tests {
         let (_engine, server) = setup();
         let result = server
             .send_request(Parameters(SendRequestParams {
+                target: None,
                 text: "GET /a HTTP/1.1\n\n".into(),
                 base_flow_id: Some(999),
                 as_identity: None,
@@ -3198,6 +3427,7 @@ mod tests {
 
     fn finding_params() -> CreateFindingParams {
         CreateFindingParams {
+            target: None,
             title: "t".into(),
             severity: "low".into(),
             status: None,
@@ -3787,6 +4017,7 @@ mod tests {
 
         let res = server
             .adopt_flow_session(Parameters(AdoptSessionParams {
+                target: None,
                 flow_id: flow_id as i64,
                 name: "me".into(),
             }))
@@ -3809,6 +4040,7 @@ mod tests {
         let plain = record(&engine, "http://example.com/x", "x");
         let err = server
             .adopt_flow_session(Parameters(AdoptSessionParams {
+                target: None,
                 flow_id: plain,
                 name: "empty".into(),
             }))
@@ -3824,6 +4056,7 @@ mod tests {
 
         let id = server
             .create_lead(Parameters(CreateLeadParams {
+                target: None,
                 kind: "idor".into(),
                 title: "Booking ids are sequential".into(),
                 rationale_md: "GET /bookings/4711 returned another tenant's booking.".into(),
@@ -3870,6 +4103,7 @@ mod tests {
         // A conclusion without a control is refused — in code, not in a prompt.
         let err = server
             .update_lead(Parameters(UpdateLeadParams {
+                target: None,
                 lead_id: id,
                 status: Some("verified".into()),
                 verdict: Some("it worked".into()),
@@ -3883,6 +4117,7 @@ mod tests {
         // The control makes the verdict land.
         server
             .update_lead(Parameters(UpdateLeadParams {
+                target: None,
                 lead_id: id,
                 status: Some("verified".into()),
                 verdict: Some("200 with tenant B's id; 403 as tenant A".into()),
@@ -3901,6 +4136,7 @@ mod tests {
         // Adjudication refuses to run before a verdict exists...
         let other = server
             .create_lead(Parameters(CreateLeadParams {
+                target: None,
                 kind: "config".into(),
                 title: "Unprobed guess".into(),
                 rationale_md: "vibes".into(),
@@ -3913,6 +4149,7 @@ mod tests {
             .lead_id;
         let err = server
             .adjudicate_lead(Parameters(AdjudicateLeadParams {
+                target: None,
                 lead_id: other,
                 ruling: "admissible".into(),
                 ruling_reason: "looks fine".into(),
@@ -3925,6 +4162,7 @@ mod tests {
         // ...and on a real verdict, the ruling lands.
         server
             .adjudicate_lead(Parameters(AdjudicateLeadParams {
+                target: None,
                 lead_id: id,
                 ruling: "admissible".into(),
                 ruling_reason: "the control discriminates: same request, different tenant".into(),
@@ -3975,7 +4213,10 @@ mod tests {
 
         // The scanner files draft findings with origin=workflow, deduped.
         let out = server
-            .scan_flows(Parameters(ScanFlowsParams { limit: Some(100) }))
+            .scan_flows(Parameters(ScanFlowsParams {
+                target: None,
+                limit: Some(100),
+            }))
             .await
             .unwrap()
             .0;
@@ -3988,7 +4229,10 @@ mod tests {
 
         // Second run files nothing new — per rule+host dedup.
         let again = server
-            .scan_flows(Parameters(ScanFlowsParams { limit: Some(100) }))
+            .scan_flows(Parameters(ScanFlowsParams {
+                target: None,
+                limit: Some(100),
+            }))
             .await
             .unwrap()
             .0;
@@ -4005,6 +4249,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lockgate-mcp-mat-{}", std::process::id()));
         let out = server
             .materialise(Parameters(MaterialiseParams {
+                target: None,
                 dir: dir.display().to_string(),
             }))
             .await
@@ -4015,6 +4260,96 @@ mod tests {
         let endpoints = std::fs::read_to_string(dir.join("endpoints.jsonl")).unwrap();
         assert!(endpoints.contains("example.com"), "{endpoints}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_call_lands_on_the_target_it_names_not_the_session_default() {
+        let engine_a = Engine::new();
+        let engine_b = Engine::new();
+        let server = ProxyServer::new(Arc::new(crate::Targets {
+            engines: vec![
+                ("a".into(), engine_a.clone()),
+                ("b".into(), engine_b.clone()),
+            ],
+        }));
+
+        // Explicit target wins over the session default (which is "a").
+        let res = server
+            .create_lead(Parameters(CreateLeadParams {
+                target: Some("b".into()),
+                kind: "config".into(),
+                title: "explicit".into(),
+                rationale_md: "r".into(),
+                endpoint: None,
+                flow_id: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res.target, "b");
+        assert_eq!(engine_b.leads(None).len(), 1, "landed in b");
+        assert_eq!(engine_a.leads(None).len(), 0, "and only in b");
+
+        // Session selection: set_target("a"), then an un-named call hits a.
+        server
+            .set_target(Parameters(TargetNameParams { name: "a".into() }))
+            .await
+            .unwrap();
+        let res = server
+            .create_lead(Parameters(CreateLeadParams {
+                target: None,
+                kind: "config".into(),
+                title: "session default".into(),
+                rationale_md: "r".into(),
+                endpoint: None,
+                flow_id: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res.target, "a");
+        assert_eq!(engine_a.leads(None).len(), 1);
+        assert_eq!(engine_b.leads(None).len(), 1, "b untouched");
+
+        // list_targets marks a active for THIS session.
+        let listed = server.list_targets().await.unwrap().0;
+        let a = listed.targets.iter().find(|t| t.name == "a").unwrap();
+        let b = listed.targets.iter().find(|t| t.name == "b").unwrap();
+        assert!(a.active && !b.active);
+
+        // An unknown target is a named error, in both the explicit and the
+        // switch path — the agent always learns before anything happens.
+        let err = server
+            .create_lead(Parameters(CreateLeadParams {
+                target: Some("nope".into()),
+                kind: "config".into(),
+                title: "x".into(),
+                rationale_md: "x".into(),
+                endpoint: None,
+                flow_id: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("no target"), "{}", err.message);
+        let err = server
+            .set_target(Parameters(TargetNameParams {
+                name: "nope".into(),
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("no target"), "{}", err.message);
+        // And the failed switch left the session where it was.
+        let listed = server.list_targets().await.unwrap().0;
+        assert!(
+            listed
+                .targets
+                .iter()
+                .find(|t| t.name == "a")
+                .unwrap()
+                .active
+        );
     }
 
     #[tokio::test]
@@ -4103,6 +4438,7 @@ mod tests {
 
         let err = server
             .resend_flow(Parameters(ResendFlowParams {
+                target: None,
                 id,
                 as_identity: Some(7),
                 tag: None,
@@ -4140,6 +4476,7 @@ mod tests {
 
         let err = server
             .resend_flow(Parameters(ResendFlowParams {
+                target: None,
                 id,
                 as_identity: None,
                 tag: None,
