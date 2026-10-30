@@ -149,12 +149,12 @@ establish controls).
 | 3 | Program layer + port the loop: programs in the registry, materialise, leads ledger, recon → verify over lockgate MCP | **done** (lockgate side) |
 | 4 | Adjudicate + report generation | **done** (lockgate side) |
 | 5 | Passive scanner on capture | **done** |
-| 6 | Self-provisioned identities: mailbox abstraction (Gmail/IMAP backend), engine-side credential custody, registration provenance, provisioning over MCP | **next** |
-| 7 | Goal plane: goal object, four stop states, budgets, OOB canary with nonce → flow correlation | planned |
-| 8 | Long-run mechanics: checkpoint/restore, state-digest relaunch, stall watchdog, burn-rate alarms | planned |
-| 9 | Egress plane: trust classes (trusted/pooled/hostile), per-identity egress pinning, Cloudflare ladder | planned |
-| 10 | Goal-mode loop: tier matrix diff, attack-tree frontier + milestones + dead-ends, strategy scheduler | planned |
-| 11 | First end-to-end run + postmortem cadence | planned |
+| 6 | Self-provisioned identities: mailbox abstraction (Gmail/IMAP backend), engine-side credential custody, registration provenance, provisioning over MCP | **done** (core + MCP; browser playbooks are the next layer) |
+| 7 | Goal plane: goal object, four stop states, budgets, OOB canary with nonce → flow correlation | **done** |
+| 8 | Long-run mechanics: checkpoint/restore, state-digest relaunch, stall watchdog, burn-rate alarms | **done** (records + digest; the watchdog's ntfy alarm rides phase 11) |
+| 9 | Egress plane: trust classes (trusted/pooled/hostile), per-identity egress pinning, Cloudflare ladder | **done** (engine rule + exits; the ladder is skill prose) |
+| 10 | Goal-mode loop: tier matrix diff, attack-tree frontier + milestones + dead-ends, strategy scheduler | **done** (diff + ledger + goal-mode skill; the scheduler is skill discipline) |
+| 11 | First end-to-end run + postmortem cadence | **runbook ready** — `docs/GOAL_RUN.md`; the run itself waits on phase-0 operator setup |
 
 Phases 3–4 live partly outside this repo (the orchestrator harness and its
 prompts) but every capability they need — scope, identities, policy, tagging,

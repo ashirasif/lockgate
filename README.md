@@ -9,7 +9,7 @@ work the same capture, queue and scope you are looking at.
 Two frontends over one engine:
 
 - a **ratatui TUI** with vim editing, for the human
-- an **MCP server** with 51 tools, for an agent
+- an **MCP server** with 71 tools, for an agent
 
 Both hold the same `Arc<Engine>` in one process, so there is one SQLite writer
 and neither can see stale state.
@@ -38,7 +38,7 @@ exists but you will notice what is missing.
 | **Scope** | Named scopes, include/exclude rules where excludes always win, glob/regex/CIDR host matching, filtering across Proxy and Sitemap, bypass toggle |
 | **Editing** | A real vim grammar — counts, operators, text objects, visual mode, undo/redo, registers — plus `$EDITOR` handoff for anything it does not cover |
 | **Display** | HTTP syntax highlighting, syntect for bodies (JSON, HTML, XML, GraphQL, protobuf, JS-in-`<script>`, …), JSON/HTML pretty-printing, OSC 52 clipboard |
-| **MCP** | 51 tools: recon, intercept, scope, send, format, findings, notes, identities, policy, leads, materialise, report, scan. Resources for full bodies |
+| **MCP** | 71 tools: recon, intercept, scope, send, format, findings, notes, identities, policy, leads, materialise, report, scan — and the goal plane: goal + four stop states, canary oracle, frontier/milestones, mailboxes, egress exits, tier diff. Resources for full bodies |
 | **Findings** | File a flow as a finding, triage severity and status by keystroke, retitle, delete. The write-up is edited in place with the same vim buffer the Repeater uses, `^g` to hand it to `$EDITOR` — one markdown document whose `## Reproduction` / `## Impact` / `## Remediation` sections are the prose columns a report is generated from. Saved on the way out. Also over MCP |
 | **Notes** | Project markdown documents in a window of their own (K), edited in place with the same vim buffer the Repeater uses, `^g` to hand one to `$EDITOR`. Saved on the way out — there is no `:w`. Full CRUD over MCP, so an agent's working notes and yours are the same list |
 | **WebSockets** | A window of their own (W), separate from the HTTP history, with the handshake and a live frame transcript per connection. Correlated to the upgrade, also over MCP. Observed, not intercepted |
@@ -150,7 +150,7 @@ with an agent — for Claude Code:
 claude mcp add --transport http lockgate http://127.0.0.1:3001/mcp
 ```
 
-and the agent gets the same 51 tools: survey flows, read full bodies as `flow://`
+and the agent gets the same 71 tools: survey flows, read full bodies as `flow://`
 resources, walk the sitemap and WebSocket frames, replay through scope, file
 findings, and keep notes alongside yours. A bundled skill at
 `.claude/skills/lockgate-recon` teaches the recon loop and the conventions that are judgement rather than mechanics — redact captured
