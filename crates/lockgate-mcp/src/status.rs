@@ -75,10 +75,15 @@ fn check_token(
     Ok(())
 }
 
-fn link_suffix(state: &StatusState, q: &PageQuery) -> String {
-    match (&state.token, &q.token) {
-        (Some(t), _) => format!("?token={t}"),
-        (None, _) => String::new(),
+/// The token's share of a link's query string: `&token=…` when it follows
+/// another parameter, `?token=…` when it is the only one. One helper, so a
+/// link can never grow two `?`s — which reads as "no token given" and turns
+/// every sidebar click into a 401.
+fn token_param(state: &StatusState, leading_param: bool) -> String {
+    match &state.token {
+        Some(t) if leading_param => format!("&token={t}"),
+        Some(t) => format!("?token={t}"),
+        None => String::new(),
     }
 }
 
@@ -154,7 +159,7 @@ fn render_page(
     state: &StatusState,
     q: &PageQuery,
 ) -> String {
-    let suffix = link_suffix(state, q);
+    let _ = q; // the page only re-renders the token it was called with
     let mut out = String::with_capacity(48 * 1024);
     out.push_str("<!doctype html><html><head><meta charset=utf-8>");
     out.push_str("<meta name=viewport content='width=device-width, initial-scale=1'>");
@@ -184,8 +189,9 @@ fn render_page(
     // --- sidebar: every target, plus the overview ---
     out.push_str("<div class=wrap><nav><h1>lockgate</h1>");
     out.push_str(&format!(
-        "<a class='{}' href='status{suffix}'>overview</a>",
+        "<a class='{}' href='status{}'>overview</a>",
         if selected.is_none() { "here" } else { "" },
+        token_param(state, false),
     ));
     for (name, engine) in &targets.engines {
         let open = engine
@@ -198,25 +204,17 @@ fn render_page(
             "<a class='{}' href='status?t={}{}'>{}<span class=cnt>{}</span></a>",
             if here { "here" } else { "" },
             esc(name),
-            suffix,
+            token_param(state, true),
             esc(name),
             open,
         ));
     }
-    let suffix_report = if suffix.is_empty() {
-        match selected {
-            Some(name) => format!("?t={}", esc(name)),
-            None => String::new(),
-        }
-    } else {
-        let t = match selected {
-            Some(name) => format!("&t={}", esc(name)),
-            None => String::new(),
-        };
-        format!("{suffix}{t}")
+    let report_qs = match selected {
+        Some(name) => format!("?t={}{}", esc(name), token_param(state, true)),
+        None => token_param(state, false),
     };
     out.push_str(&format!(
-        "<a href='report{suffix_report}'>full report</a></nav><main>"
+        "<a href='report{report_qs}'>full report</a></nav><main>"
     ));
 
     match selected {
@@ -229,7 +227,8 @@ fn render_page(
         }
         None => {
             out.push_str("<h1>Overview</h1>");
-            out.push_str(&render_overview(targets));
+            let tok = token_param(state, true);
+            out.push_str(&render_overview(targets, &tok));
         }
     }
 
@@ -269,7 +268,7 @@ fn counts(engine: &Arc<Engine>) -> TargetCounts {
     }
 }
 
-fn render_overview(targets: &Arc<crate::Targets>) -> String {
+fn render_overview(targets: &Arc<crate::Targets>, tok: &str) -> String {
     let mut out = String::from(
         "<table><tr><th>target</th><th>findings</th><th>high/crit</th><th>open leads</th><th>last activity</th></tr>",
     );
@@ -279,7 +278,7 @@ fn render_overview(targets: &Arc<crate::Targets>) -> String {
         let c = counts(engine);
         let name_e = esc(name);
         out.push_str(&format!(
-            "<tr><td><a href='status?t={name_e}'>{name_e}</a></td><td>{}</td><td class='{}'>{}/{}<td>{}</td><td>{}</td></tr>",
+            "<tr><td><a href='status?t={name_e}{tok}'>{name_e}</a></td><td>{}</td><td class='{}'>{}/{}<td>{}</td><td>{}</td></tr>",
             c.findings,
             if c.critical > 0 { "sev-critical" } else { "sev-info" },
             c.high,
@@ -495,6 +494,42 @@ mod tests {
             !b_page.contains("Booking ids"),
             "b's page must not show a's leads"
         );
+    }
+
+    #[tokio::test]
+    async fn sidebar_links_carry_the_token_with_a_single_question_mark() {
+        let targets = two_targets().await;
+        let state = StatusState {
+            targets,
+            token: Some("sekrit".into()),
+        };
+        let q = PageQuery {
+            token: Some("sekrit".into()),
+            t: None,
+        };
+        let page = render_page(&state.targets, None, &state, &q);
+
+        // Every href must parse as one query string: t first, then &token=.
+        // A second '?' would swallow the token into t's value and 401 the click.
+        for link in page.match_indices("href='status") {
+            let rest = &page[link.0 + 6..]; // skip `href='`
+            let href = &rest[..rest.find('\'').unwrap()];
+            assert!(href.matches('?').count() <= 1, "double '?' in link: {href}");
+            assert!(
+                href.contains("token=sekrit"),
+                "token missing from link: {href}"
+            );
+        }
+        assert!(page.contains("status?t=a&token=sekrit"), "{page}");
+
+        // And the drilldown page's links keep the same property.
+        let q = PageQuery {
+            token: Some("sekrit".into()),
+            t: Some("a".into()),
+        };
+        let page = render_page(&state.targets, Some("a"), &state, &q);
+        assert!(page.contains("status?t=b&token=sekrit"), "{page}");
+        assert!(page.contains("report?t=a&token=sekrit"), "{page}");
     }
 
     #[tokio::test]
