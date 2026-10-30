@@ -11,6 +11,7 @@ use crate::db::ProjectPaths;
 use crate::finding::{Finding, FindingEdit, NewFinding, WriteUp};
 use crate::identity::{self, Identity, IdentityEdit, NewIdentity};
 use crate::intercept::Intercept;
+use crate::mailbox;
 use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary, now_micros};
 use crate::note::{NewNote, Note};
 use crate::read::{self, BodySlice, FlowDetail, FlowQuery, FlowRow, Side, SitemapNode};
@@ -677,6 +678,57 @@ impl Engine {
     ) -> Result<i64, identity::AdoptError> {
         let conn = self.read_conn().lock().unwrap();
         identity::adopt(&conn, flow_id, name, now_micros())
+    }
+
+    /// The custody password for an identity, when one is stored. The only
+    /// engine read path for it; `identities()`/`identity()` cannot return it.
+    pub fn identity_password(&self, id: i64) -> Option<String> {
+        let conn = self.read_conn().lock().unwrap();
+        identity::password(&conn, id).ok().flatten()
+    }
+
+    // --- mailboxes ---
+    //
+    // Where verification mail is read from (see `mailbox`). The app password
+    // is engine-held: the account reads back without any credential, and the
+    // fetch below snapshots the endpoint under the lock and lets go of it
+    // before any network runs — a two-second IMAP round-trip must never sit
+    // inside the connection mutex.
+
+    pub fn mailbox_accounts(&self) -> Vec<mailbox::MailboxAccount> {
+        self.read(mailbox::list)
+    }
+
+    pub fn add_mailbox_account(
+        &self,
+        new: &mailbox::NewMailboxAccount,
+    ) -> Result<i64, mailbox::MailboxError> {
+        let conn = self.read_conn().lock().unwrap();
+        mailbox::insert(&conn, new, now_micros())
+    }
+
+    pub fn delete_mailbox_account(&self, id: i64) -> usize {
+        self.with_db(|conn| mailbox::delete(conn, id))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    /// One IMAP pass for the newest unseen mail to `to_address`. `None` means
+    /// nothing matched — the caller's poll loop decides whether to try again.
+    /// Blocking by design; the MCP layer parks it on a blocking thread.
+    pub fn fetch_verification_mail(
+        &self,
+        mailbox_id: i64,
+        to_address: &str,
+        sender_contains: Option<&str>,
+    ) -> Result<Option<mailbox::VerificationMail>, mailbox::MailboxError> {
+        let (endpoint, password) = {
+            let conn = self.read_conn().lock().unwrap();
+            mailbox::endpoint_and_password(&conn, mailbox_id)
+                .map_err(mailbox::MailboxError::Db)?
+                .ok_or_else(|| mailbox::MailboxError::Imap(format!("no mailbox #{mailbox_id}")))?
+        };
+        mailbox::fetch_verification(&endpoint, &password, to_address, sender_contains)
     }
 
     // --- policy ---

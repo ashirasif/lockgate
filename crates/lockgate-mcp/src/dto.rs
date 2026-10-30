@@ -267,6 +267,16 @@ pub struct IdentityDto {
     /// The host the session belongs to, when it belongs to one.
     pub host: Option<String>,
     pub has_totp: bool,
+    /// `operator` — adopted or hand-built by the operator — or
+    /// `self_registered` — the agent created the account in a run. The
+    /// report's black-box claim hangs off this value.
+    pub provenance: String,
+    /// The mailbox address that seeded a self-registered identity
+    /// (`probe+t1@gmail.com`): the cleanup registry for a run's accounts.
+    pub seed_account: Option<String>,
+    /// Whether the engine holds a registration password for this identity.
+    /// A flag only — the value never leaves the engine.
+    pub has_password: bool,
     pub note: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -280,6 +290,9 @@ impl From<Identity> for IdentityDto {
             name: i.name,
             host: i.host,
             has_totp: i.totp_secret.is_some(),
+            provenance: i.provenance.as_str().to_string(),
+            seed_account: i.seed_account,
+            has_password: i.password_stored,
             note: i.note,
             created_at: i.created_at,
             updated_at: i.updated_at,
@@ -293,6 +306,56 @@ impl From<Identity> for IdentityDto {
                     value_len: c.value.len() as i64,
                 })
                 .collect(),
+        }
+    }
+}
+
+/// A registered mailbox: where verification mail is read from. The type has
+/// no credential field — an app password cannot leak through a read that has
+/// nowhere to put it.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MailboxAccountDto {
+    pub id: i64,
+    pub address: String,
+    pub imap_host: String,
+    pub imap_port: i64,
+    pub imap_username: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<lockgate_core::MailboxAccount> for MailboxAccountDto {
+    fn from(m: lockgate_core::MailboxAccount) -> Self {
+        Self {
+            id: m.id,
+            address: m.address,
+            imap_host: m.imap_host,
+            imap_port: m.imap_port as i64,
+            imap_username: m.imap_username,
+            note: m.note,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
+
+/// One verification mail, reduced to what registration needs.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct VerificationMailDto {
+    pub from: String,
+    pub subject: String,
+    pub link: Option<String>,
+    pub code: Option<String>,
+}
+
+impl From<lockgate_core::VerificationMail> for VerificationMailDto {
+    fn from(v: lockgate_core::VerificationMail) -> Self {
+        Self {
+            from: v.from,
+            subject: v.subject,
+            link: v.link,
+            code: v.code,
         }
     }
 }

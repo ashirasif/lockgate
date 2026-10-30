@@ -33,8 +33,9 @@ use rmcp::{RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router}
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{
-    BodyPreview, FindingDto, FlowDetailDto, FlowDto, IdentityDto, LeadDto, MaterialisedFileDto,
-    NoteDto, SitemapNodeDto, detail_headers, encode_bytes,
+    BodyPreview, FindingDto, FlowDetailDto, FlowDto, IdentityDto, LeadDto, MailboxAccountDto,
+    MaterialisedFileDto, NoteDto, SitemapNodeDto, VerificationMailDto, detail_headers,
+    encode_bytes,
 };
 
 /// Default and ceiling on how many rows a listing returns. A ceiling matters
@@ -613,6 +614,17 @@ pub struct CreateIdentityParams {
     /// would need to re-derive at re-login. Store the *secret*, not a code.
     pub totp_secret: Option<String>,
     pub note: Option<String>,
+    /// The account's password, when the engine should hold it for re-login.
+    /// Write-only: no read path returns it, and nothing needs to re-read it.
+    pub password: Option<String>,
+    /// `operator` (default — adopted or hand-built) or `self_registered`
+    /// (the agent created the account in a run). The report's black-box claim
+    /// hangs off this, so never claim `self_registered` for a credential the
+    /// operator supplied.
+    pub provenance: Option<String>,
+    /// For a self-registered identity: the mailbox address it was created
+    /// with (`probe+t1@gmail.com`). The cleanup registry for the run.
+    pub seed_account: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -633,6 +645,13 @@ pub struct UpdateIdentityParams {
     pub note: Option<String>,
     /// When given, replaces the whole jar. Omit to leave it alone.
     pub cookies: Option<Vec<CookieInput>>,
+    /// When given, sets the custody password (write-only; never returned).
+    /// An empty string is ignored — a stored password is not cleared by edit.
+    pub password: Option<String>,
+    /// `operator` or `self_registered`. Omit to leave as is.
+    pub provenance: Option<String>,
+    /// Omit to leave as is; "" clears it.
+    pub seed_account: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -660,6 +679,61 @@ pub struct AdoptSessionResult {
     pub cookie_count: i64,
     /// The host the session was captured on — now the identity's binding.
     pub host: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AddMailboxAccountParams {
+    /// The mailbox address (`probe@gmail.com`). Registration aliases
+    /// (`probe+t1@gmail.com`) are awaited with `address` on
+    /// `await_verification_mail`, not by registering more mailboxes.
+    pub address: String,
+    /// The app password (Gmail) or equivalent. Write-only: no read path can
+    /// return it.
+    pub app_password: String,
+    /// IMAP host. Omit for the Gmail default (imap.gmail.com).
+    pub imap_host: Option<String>,
+    /// IMAP port. Omit for 993.
+    pub imap_port: Option<i64>,
+    /// IMAP username, when it differs from the address.
+    pub imap_username: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MailboxIdParams {
+    pub mailbox_id: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AwaitVerificationParams {
+    pub mailbox_id: i64,
+    /// The `To:` address to await — the plus-alias the signup form was given
+    /// (`probe+t1@gmail.com`). Defaults to the mailbox's own address.
+    pub address: Option<String>,
+    /// Only accept mail from a sender containing this (case-insensitive
+    /// substring, e.g. the target's domain). Omit to accept any sender.
+    pub sender_contains: Option<String>,
+    /// How long to keep polling, ms. Default 60s, ceiling 180s. Each poll is
+    /// one IMAP pass; nothing is deleted, the matched mail is marked seen.
+    pub timeout_ms: Option<i64>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ListMailboxAccountsResult {
+    pub mailboxes: Vec<MailboxAccountDto>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MailboxIdResult {
+    pub mailbox_id: i64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct AwaitVerificationResult {
+    /// The mail that matched, reduced to sender, subject, link and code.
+    /// `None` with `timed_out: true` means nothing arrived in the window.
+    pub mail: Option<VerificationMailDto>,
+    pub timed_out: bool,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -1747,6 +1821,13 @@ impl ProxyServer {
             totp_secret: p.totp_secret.clone().filter(|s| !s.is_empty()),
             note: p.note.clone().filter(|s| !s.is_empty()),
             cookies,
+            password: p.password.clone().filter(|s| !s.is_empty()),
+            provenance: parse_provenance(p.provenance.as_deref())?,
+            seed_account: p
+                .seed_account
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         };
         let id = self
             .engine
@@ -1799,6 +1880,13 @@ impl ProxyServer {
             totp_secret: p.totp_secret.clone(),
             note: p.note.clone(),
             cookies,
+            // Empty is "nothing to say", not "clear".
+            password: p.password.clone().filter(|s| !s.is_empty()),
+            provenance: match p.provenance.as_deref() {
+                None => None,
+                Some(s) => Some(parse_provenance(Some(s))?),
+            },
+            seed_account: p.seed_account.clone(),
         };
         let rows = self
             .engine
@@ -1834,6 +1922,172 @@ impl ProxyServer {
             ));
         }
         Ok(Json(OkResult { ok: true }))
+    }
+
+    // --- mailboxes ---
+    //
+    // Where the engine reads verification mail from. The app password is
+    // engine-held custody: registering one takes the credential, and no read
+    // path — here or in the TUI — can give it back, because the read types
+    // have no field for it.
+
+    #[tool(
+        description = "Register a mailbox the engine can read verification mail from — \
+                       a Gmail address and its app password is enough (host/port default \
+                       to imap.gmail.com:993). The app password is stored under engine \
+                       custody and is never returned by any tool. Aliases are awaited \
+                       with await_verification_mail's address parameter; do not register \
+                       one mailbox per plus-alias."
+    )]
+    async fn add_mailbox_account(
+        &self,
+        Parameters(p): Parameters<AddMailboxAccountParams>,
+    ) -> Result<Json<MailboxIdResult>, ErrorData> {
+        let address = p.address.trim().to_string();
+        if address.is_empty() {
+            return Err(ErrorData::invalid_params("address must not be empty", None));
+        }
+        let password = p.app_password.trim().to_string();
+        if password.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "app_password must not be empty",
+                None,
+            ));
+        }
+        let new = lockgate_core::NewMailboxAccount {
+            imap_host: p
+                .imap_host
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| lockgate_core::GMAIL_IMAP_HOST.to_string()),
+            imap_port: p
+                .imap_port
+                .filter(|port| (1..=65535).contains(port))
+                .unwrap_or(lockgate_core::GMAIL_IMAP_PORT as i64) as u16,
+            imap_username: p
+                .imap_username
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| address.clone()),
+            address,
+            app_password: password,
+            note: p.note.clone().filter(|s| !s.is_empty()),
+        };
+        let id = self
+            .engine
+            .add_mailbox_account(&new)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(MailboxIdResult { mailbox_id: id }))
+    }
+
+    #[tool(
+        description = "List registered mailboxes — address and IMAP endpoint only. The \
+                       app password is never returned; delete and re-add to rotate it."
+    )]
+    async fn list_mailbox_accounts(&self) -> Result<Json<ListMailboxAccountsResult>, ErrorData> {
+        let mailboxes = self
+            .engine
+            .mailbox_accounts()
+            .into_iter()
+            .map(MailboxAccountDto::from)
+            .collect();
+        Ok(Json(ListMailboxAccountsResult { mailboxes }))
+    }
+
+    #[tool(description = "Forget a mailbox. Its stored app password goes with it.")]
+    async fn delete_mailbox_account(
+        &self,
+        Parameters(p): Parameters<MailboxIdParams>,
+    ) -> Result<Json<OkResult>, ErrorData> {
+        let rows = self.engine.delete_mailbox_account(p.mailbox_id);
+        if rows == 0 {
+            return Err(ErrorData::resource_not_found(
+                format!(
+                    "no mailbox #{} — list_mailbox_accounts shows what exists",
+                    p.mailbox_id
+                ),
+                None,
+            ));
+        }
+        Ok(Json(OkResult { ok: true }))
+    }
+
+    #[tool(
+        description = "Await a verification mail: polls the mailbox for the newest unseen \
+                       mail to the given address (the plus-alias the signup form was \
+                       given) and returns its confirm link and/or code, marking it seen. \
+                       One IMAP pass per poll, a few seconds apart, within timeout_ms \
+                       (default 60000, ceiling 180000). Returns timed_out: true when \
+                       nothing matched — re-submit the form or widen the sender filter \
+                       rather than looping forever here; the poll is bounded on purpose."
+    )]
+    async fn await_verification_mail(
+        &self,
+        Parameters(p): Parameters<AwaitVerificationParams>,
+    ) -> Result<Json<AwaitVerificationResult>, ErrorData> {
+        let address = {
+            let accounts = self.engine.mailbox_accounts();
+            let account = accounts
+                .into_iter()
+                .find(|m| m.id == p.mailbox_id)
+                .ok_or_else(|| {
+                    ErrorData::resource_not_found(
+                        format!(
+                            "no mailbox #{} — list_mailbox_accounts shows what exists",
+                            p.mailbox_id
+                        ),
+                        None,
+                    )
+                })?;
+            p.address
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(account.address)
+        };
+        const MIN_TIMEOUT_MS: i64 = 1_000;
+        const MAX_TIMEOUT_MS: i64 = 180_000;
+        const POLL_INTERVAL_MS: u64 = 3_000;
+        let timeout_ms = p
+            .timeout_ms
+            .unwrap_or(60_000)
+            .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let sender = p.sender_contains.as_deref().map(str::to_string);
+        loop {
+            // One IMAP pass is blocking network I/O; it must not sit on a
+            // tokio worker, and it must not sit inside the engine's
+            // connection mutex — spawn_blocking gets both.
+            let engine = self.engine.clone();
+            let address = address.clone();
+            let sender = sender.clone();
+            let pass = tokio::task::spawn_blocking(move || {
+                engine.fetch_verification_mail(p.mailbox_id, &address, sender.as_deref())
+            })
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("poll task: {e}"), None))?;
+            let mail = pass.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            match mail {
+                Some(mail) => {
+                    return Ok(Json(AwaitVerificationResult {
+                        mail: Some(VerificationMailDto::from(mail)),
+                        timed_out: false,
+                    }));
+                }
+                None if std::time::Instant::now() >= deadline => {
+                    return Ok(Json(AwaitVerificationResult {
+                        mail: None,
+                        timed_out: true,
+                    }));
+                }
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await
+                }
+            }
+        }
     }
 
     #[tool(
@@ -2536,6 +2790,21 @@ fn resend_error(e: ResendError) -> ErrorData {
 
 /// Turn a wire cookie into a core one, defaulting its domain to the identity's
 /// host and its path to `/` — the two attributes a caller usually means.
+/// `provenance` as the wire takes it: `operator` or `self_registered`,
+/// anything else refused. The report's black-box claim hangs off this column,
+/// so a typo must not silently default the run's story to "operator".
+fn parse_provenance(s: Option<&str>) -> Result<lockgate_core::Provenance, ErrorData> {
+    match s {
+        None => Ok(lockgate_core::Provenance::Operator),
+        Some("operator") => Ok(lockgate_core::Provenance::Operator),
+        Some("self_registered") => Ok(lockgate_core::Provenance::SelfRegistered),
+        Some(other) => Err(ErrorData::invalid_params(
+            format!("provenance must be \"operator\" or \"self_registered\", not {other:?}"),
+            None,
+        )),
+    }
+}
+
 fn cookie_input(host: Option<&str>, c: &CookieInput) -> Result<lockgate_core::Cookie, String> {
     let name = c.name.trim();
     if name.is_empty() {
@@ -3664,6 +3933,9 @@ mod tests {
                 }],
                 totp_secret: Some("JBSWY3DPEHPK3PXP".into()),
                 note: Some("the operator's login".into()),
+                password: None,
+                provenance: None,
+                seed_account: None,
             }))
             .await
             .unwrap()
@@ -3695,6 +3967,9 @@ mod tests {
                 totp_secret: None,
                 note: Some("now noted".into()),
                 cookies: None,
+                password: None,
+                provenance: None,
+                seed_account: None,
             }))
             .await
             .unwrap()
@@ -3718,6 +3993,9 @@ mod tests {
                     domain: None,
                     path: None,
                 }]),
+                password: None,
+                provenance: None,
+                seed_account: None,
             }))
             .await
             .unwrap()
@@ -3736,6 +4014,9 @@ mod tests {
                 cookies: vec![],
                 totp_secret: None,
                 note: None,
+                password: None,
+                provenance: None,
+                seed_account: None,
             }))
             .await
             .map(|_| ())
@@ -3755,6 +4036,139 @@ mod tests {
                 .unwrap()
                 .0
                 .identities
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_self_registered_identity_carries_provenance_and_keeps_its_password() {
+        let (_engine, server) = setup();
+
+        server
+            .create_identity(Parameters(CreateIdentityParams {
+                name: "selfreg:t1:u1".into(),
+                host: Some("app.example.com".into()),
+                cookies: vec![],
+                totp_secret: None,
+                note: None,
+                password: Some("REGISTRATION-PASSWORD".into()),
+                provenance: Some("self_registered".into()),
+                seed_account: Some("probe+t1@gmail.com".into()),
+            }))
+            .await
+            .unwrap();
+
+        let listed = &server.list_identities().await.unwrap().0.identities[0];
+        assert_eq!(listed.provenance, "self_registered");
+        assert_eq!(listed.seed_account.as_deref(), Some("probe+t1@gmail.com"));
+        assert!(listed.has_password, "the flag, never the value");
+        // The transcript never carries the credential.
+        let rendered = serde_json::to_string(&server.list_identities().await.unwrap().0).unwrap();
+        assert!(
+            !rendered.contains("REGISTRATION-PASSWORD"),
+            "a registration password must never reach a transcript: {rendered}"
+        );
+
+        // Provenance is a closed set: a typo is refused, not defaulted — the
+        // report's black-box claim hangs off this column.
+        let err = server
+            .create_identity(Parameters(CreateIdentityParams {
+                name: "typo".into(),
+                host: None,
+                cookies: vec![],
+                totp_secret: None,
+                note: None,
+                password: None,
+                provenance: Some("self-registered".into()),
+                seed_account: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("provenance"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn mailboxes_round_trip_without_their_app_password() {
+        let (_engine, server) = setup();
+
+        let id = server
+            .add_mailbox_account(Parameters(AddMailboxAccountParams {
+                address: "probe@gmail.com".into(),
+                app_password: "APP-PASSWORD-VALUE".into(),
+                imap_host: None,
+                imap_port: None,
+                imap_username: None,
+                note: Some("the operator's throwaway".into()),
+            }))
+            .await
+            .unwrap()
+            .0
+            .mailbox_id;
+
+        let listed = &server.list_mailbox_accounts().await.unwrap().0.mailboxes[0];
+        assert_eq!(listed.id, id);
+        assert_eq!(listed.address, "probe@gmail.com");
+        // Gmail defaults filled in where the caller said nothing.
+        assert_eq!(listed.imap_host, "imap.gmail.com");
+        assert_eq!(listed.imap_port, 993);
+        assert_eq!(listed.imap_username, "probe@gmail.com");
+        let rendered =
+            serde_json::to_string(&server.list_mailbox_accounts().await.unwrap().0).unwrap();
+        assert!(
+            !rendered.contains("APP-PASSWORD-VALUE"),
+            "an app password must never reach a transcript: {rendered}"
+        );
+        assert!(
+            !rendered.contains("app_password"),
+            "not even the field name belongs in a read: {rendered}"
+        );
+
+        // One mailbox per address; duplicates are refused.
+        let err = server
+            .add_mailbox_account(Parameters(AddMailboxAccountParams {
+                address: "probe@gmail.com".into(),
+                app_password: "x".into(),
+                imap_host: None,
+                imap_port: None,
+                imap_username: None,
+                note: None,
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.message.contains("already registered"),
+            "{}",
+            err.message
+        );
+
+        // Awaiting on an unknown mailbox fails before any network happens.
+        let err = server
+            .await_verification_mail(Parameters(AwaitVerificationParams {
+                mailbox_id: 999,
+                address: None,
+                sender_contains: None,
+                timeout_ms: Some(1_000),
+            }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("no mailbox"), "{}", err.message);
+
+        let ok = server
+            .delete_mailbox_account(Parameters(MailboxIdParams { mailbox_id: id }))
+            .await
+            .unwrap()
+            .0;
+        assert!(ok.ok);
+        assert!(
+            server
+                .list_mailbox_accounts()
+                .await
+                .unwrap()
+                .0
+                .mailboxes
                 .is_empty()
         );
     }

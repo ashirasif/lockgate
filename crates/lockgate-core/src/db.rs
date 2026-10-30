@@ -31,7 +31,7 @@ use rusqlite::Connection;
 pub const INLINE_BODY_LIMIT: usize = 5 * 1024 * 1024;
 
 /// Bumped whenever `MIGRATIONS` grows. Persisted in SQLite's `user_version`.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Applied in order, starting from whatever `user_version` the file is at.
 /// Append only — never edit a statement that has already shipped.
@@ -388,6 +388,40 @@ const MIGRATIONS: &[&str] = &[
       updated_at    INTEGER NOT NULL
     );
     CREATE INDEX lead_status ON lead(status);
+    "#,
+    // v7 — self-provisioned identities (phase 6): the agent registers its own
+    // accounts, so the identity record learns where an account came from and
+    // gains custody of the password that created it; and mailboxes become a
+    // stored, engine-held thing, because registration is a
+    // form-fill → verification-mail → adopt loop the agent runs alone.
+    //
+    // `password` is write-only from every read path: it is not in `Identity`,
+    // it is fetched by a dedicated call for the browser re-login flow, and no
+    // list/get can leak what the struct does not carry. `provenance` is the
+    // auditable black-box claim — self-registered vs operator-seeded — and
+    // `seed_account` names the Google account/alias that seeded it, which is
+    // the cleanup registry when the run ends.
+    r#"
+    ALTER TABLE identity ADD COLUMN password TEXT;
+    ALTER TABLE identity ADD COLUMN provenance TEXT NOT NULL DEFAULT 'operator';
+    ALTER TABLE identity ADD COLUMN seed_account TEXT;
+
+    -- A mailbox the engine can read verification mail from. The app password
+    -- lives here and nowhere else — same custody rule as identity passwords
+    -- and TOTP secrets; reads return the account without any credential.
+    CREATE TABLE mailbox_account (
+      id           INTEGER PRIMARY KEY,
+      address      TEXT NOT NULL UNIQUE,
+      -- IMAP endpoint. Defaults in code (imap.gmail.com:993) rather than here,
+      -- so a different provider is an argument, not a migration.
+      imap_host    TEXT NOT NULL,
+      imap_port    INTEGER NOT NULL,
+      imap_username TEXT NOT NULL,
+      app_password TEXT NOT NULL,
+      note         TEXT,
+      created_at   INTEGER NOT NULL,
+      updated_at   INTEGER NOT NULL
+    );
     "#,
 ];
 
