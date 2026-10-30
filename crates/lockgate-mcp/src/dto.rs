@@ -274,9 +274,9 @@ pub struct IdentityDto {
     /// The mailbox address that seeded a self-registered identity
     /// (`probe+t1@gmail.com`): the cleanup registry for a run's accounts.
     pub seed_account: Option<String>,
-    /// Whether the engine holds a registration password for this identity.
-    /// A flag only — the value never leaves the engine.
-    pub has_password: bool,
+    /// Byte-length of the custody password, when the engine holds one for
+    /// re-login. The length, never the value — same rule as cookie jars.
+    pub password_len: Option<i64>,
     pub note: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -292,7 +292,7 @@ impl From<Identity> for IdentityDto {
             has_totp: i.totp_secret.is_some(),
             provenance: i.provenance.as_str().to_string(),
             seed_account: i.seed_account,
-            has_password: i.password_stored,
+            password_len: i.password_len,
             note: i.note,
             created_at: i.created_at,
             updated_at: i.updated_at,

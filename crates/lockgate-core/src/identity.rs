@@ -87,8 +87,8 @@ pub struct NewIdentity {
 
 /// A stored identity, read back with its jar. Deliberately no `password`:
 /// the read type cannot leak a credential it does not hold; the browser
-/// re-login flow fetches it with [`password`]. `password_stored` is the flag
-/// reads carry instead of the value.
+/// re-login flow fetches it with [`password`]. `password_len` is the
+/// byte-length — the same structural redaction the cookie jars read with.
 #[derive(Clone, Debug)]
 pub struct Identity {
     pub id: i64,
@@ -98,7 +98,9 @@ pub struct Identity {
     pub note: Option<String>,
     pub provenance: Provenance,
     pub seed_account: Option<String>,
-    pub password_stored: bool,
+    /// Byte-length of the custody password, when one is stored. `None` means
+    /// no password — the value itself never leaves [`password`].
+    pub password_len: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub cookies: Vec<Cookie>,
@@ -194,7 +196,7 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Identity>> {
     let Some(mut identity) = conn
         .query_row(
             "SELECT id, name, host, totp_secret, note, provenance, seed_account,
-                    password IS NOT NULL, created_at, updated_at
+                    length(password), created_at, updated_at
                FROM identity WHERE id = ?1",
             [id],
             |r| {
@@ -207,7 +209,7 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Identity>> {
                     provenance: Provenance::parse(&r.get::<_, String>(5)?)
                         .unwrap_or(Provenance::Operator),
                     seed_account: r.get(6)?,
-                    password_stored: r.get(7)?,
+                    password_len: r.get(7)?,
                     created_at: r.get(8)?,
                     updated_at: r.get(9)?,
                     cookies: Vec::new(),

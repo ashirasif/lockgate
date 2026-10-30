@@ -4061,7 +4061,8 @@ mod tests {
         let listed = &server.list_identities().await.unwrap().0.identities[0];
         assert_eq!(listed.provenance, "self_registered");
         assert_eq!(listed.seed_account.as_deref(), Some("probe+t1@gmail.com"));
-        assert!(listed.has_password, "the flag, never the value");
+        // The length, never the value.
+        assert_eq!(listed.password_len, Some(21));
         // The transcript never carries the credential.
         let rendered = serde_json::to_string(&server.list_identities().await.unwrap().0).unwrap();
         assert!(
