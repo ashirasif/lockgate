@@ -7,7 +7,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use lockgate_core::{Finding, FlowDetail, FlowRow, Note, SitemapNode};
+use lockgate_core::{Finding, FlowDetail, FlowRow, Identity, Lead, Note, SitemapNode};
 use rmcp::schemars;
 use serde::Serialize;
 
@@ -44,6 +44,9 @@ pub struct FlowDto {
     pub comment: Option<String>,
     pub highlight: Option<String>,
     pub error: Option<String>,
+    /// What put this flow on the wire (`lead:idor-3`), for agent sends. Proxy
+    /// traffic has none.
+    pub tag: Option<String>,
 }
 
 impl From<FlowRow> for FlowDto {
@@ -63,6 +66,7 @@ impl From<FlowRow> for FlowDto {
             comment: r.comment,
             highlight: r.highlight,
             error: r.error,
+            tag: r.tag,
         }
     }
 }
@@ -241,6 +245,105 @@ impl From<Note> for NoteDto {
             updated_at: n.updated_at,
         }
     }
+}
+
+/// A cookie as reported outward. The value is deliberately absent — a
+/// transcript carrying a live session is the one leak this feature must never
+/// cause — so the caller sees the name, where it applies, and how big it is.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct CookieDto {
+    pub name: String,
+    pub domain: String,
+    pub path: String,
+    pub value_len: i64,
+}
+
+/// A named session identity: whose cookies a replay carries when sent
+/// `as_identity`, plus an optional TOTP secret (reported only as a flag).
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct IdentityDto {
+    pub id: i64,
+    pub name: String,
+    /// The host the session belongs to, when it belongs to one.
+    pub host: Option<String>,
+    pub has_totp: bool,
+    pub note: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub cookies: Vec<CookieDto>,
+}
+
+impl From<Identity> for IdentityDto {
+    fn from(i: Identity) -> Self {
+        Self {
+            id: i.id,
+            name: i.name,
+            host: i.host,
+            has_totp: i.totp_secret.is_some(),
+            note: i.note,
+            created_at: i.created_at,
+            updated_at: i.updated_at,
+            cookies: i
+                .cookies
+                .into_iter()
+                .map(|c| CookieDto {
+                    name: c.name,
+                    domain: c.domain,
+                    path: c.path,
+                    value_len: c.value.len() as i64,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A lead: what recon proposed, how verification left it, and the ruling.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct LeadDto {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub rationale_md: String,
+    pub endpoint: Option<String>,
+    /// The flow that inspired the lead, when there was one.
+    pub flow_id: Option<i64>,
+    /// proposed | verifying | verified | refuted | reported
+    pub status: String,
+    pub verdict: Option<String>,
+    pub control: Option<String>,
+    /// admissible | refuted, set by the adjudicator.
+    pub ruling: Option<String>,
+    pub ruling_reason: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<Lead> for LeadDto {
+    fn from(l: Lead) -> Self {
+        Self {
+            id: l.id,
+            kind: l.kind,
+            title: l.title,
+            rationale_md: l.rationale_md,
+            endpoint: l.endpoint,
+            flow_id: l.flow_id,
+            status: l.status,
+            verdict: l.verdict,
+            control: l.control,
+            ruling: l.ruling,
+            ruling_reason: l.ruling_reason,
+            created_at: l.created_at,
+            updated_at: l.updated_at,
+        }
+    }
+}
+
+/// One file the materialise step wrote.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MaterialisedFileDto {
+    pub name: String,
+    pub lines: i64,
+    pub bytes: i64,
 }
 
 /// Decode a body window for JSON: UTF-8 text when it is valid UTF-8 (the common,

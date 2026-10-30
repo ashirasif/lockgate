@@ -32,6 +32,9 @@ pub struct NewFinding {
     /// The captured flows that demonstrate the issue, with an optional label
     /// (e.g. "baseline", "exploited") per flow.
     pub evidence: Vec<(i64, Option<String>)>,
+    /// manual | workflow — "I verified" vs "the tool thinks". The passive
+    /// scanner files `workflow`; everything a human or agent files is `manual`.
+    pub origin: String,
 }
 
 /// A stored finding, read back for listing and detail views.
@@ -240,7 +243,7 @@ pub fn insert(conn: &Connection, f: &NewFinding, now: i64) -> rusqlite::Result<i
             title, severity, status, cvss_vector, cvss_score, cvss_version, cwe,
             description_md, repro_md, impact_md, remediation_md, host, path,
             created_at, updated_at, origin
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,'manual')",
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,?15)",
         params![
             f.title,
             f.severity,
@@ -256,6 +259,7 @@ pub fn insert(conn: &Connection, f: &NewFinding, now: i64) -> rusqlite::Result<i
             f.host,
             f.path,
             now,
+            f.origin,
         ],
     )?;
     let id = conn.last_insert_rowid();

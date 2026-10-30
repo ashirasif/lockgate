@@ -7,6 +7,9 @@
 # runtime log (TUI redirects tracing here)
 lockgate.log
 
+# macOS directory metadata
+.DS_Store
+
 # Claude Code's scratch space, including git worktrees it creates under
 # .claude/worktrees. Those are checkouts of this same repo — committing them
 # would nest the repository inside itself. Ignore everything under .claude

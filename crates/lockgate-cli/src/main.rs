@@ -96,6 +96,26 @@ async fn main() -> std::io::Result<()> {
 
     init_logging();
 
+    // The agent's identity-bearing browser is part of the launch contract when
+    // asked for (`--cdp-chrome`): by the time the agent attaches its browser
+    // client, the endpoint answers. Best-effort — a machine with no Chrome
+    // still runs a useful proxy — and the failure is on the log, not silent.
+    if args.cdp_chrome {
+        let cfg = lockgate_core::browser::CdpConfig {
+            port: args.cdp_port,
+            ..lockgate_core::browser::CdpConfig::default()
+        };
+        match lockgate_core::browser::ensure(&cfg).await {
+            Ok(status) => info!(
+                cdp = %status.cdp_url,
+                spawned = !status.already_running,
+                profile = %status.profile.display(),
+                "CDP Chrome ready"
+            ),
+            Err(e) => warn!(error = %e, "could not ensure CDP Chrome"),
+        }
+    }
+
     let data_dir = args.data_dir.clone().unwrap_or_else(data_dir);
     let registry =
         Registry::open(&data_dir.join("registry.db")).expect("failed to open project registry");
@@ -142,11 +162,19 @@ async fn main() -> std::io::Result<()> {
     //
     // Port 0 or `--no-mcp` means the operator turned it off — running a second
     // instance otherwise logs a bind failure that looks like a bug.
+    // Headline events go to the operator's phone when asked for. Configured
+    // before anything can file a finding, so the first one is not missed.
+    if let Some(url) = &args.ntfy {
+        engine.set_notifier(lockgate_core::Notifier::spawn(url.clone()));
+        info!(url, "push notifications on");
+    }
+
     if args.mcp_port != 0 && !args.no_mcp {
         let mcp_engine = engine.clone();
         let mcp_addr = args.mcp_addr();
+        let status_token = args.status_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = lockgate_mcp::serve(mcp_engine, mcp_addr).await {
+            if let Err(e) = lockgate_mcp::serve(mcp_engine, mcp_addr, status_token).await {
                 error!(error = %e, "MCP server stopped");
             }
         });

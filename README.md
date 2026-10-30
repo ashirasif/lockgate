@@ -9,7 +9,7 @@ work the same capture, queue and scope you are looking at.
 Two frontends over one engine:
 
 - a **ratatui TUI** with vim editing, for the human
-- an **MCP server** with 33 tools, for an agent
+- an **MCP server** with 51 tools, for an agent
 
 Both hold the same `Arc<Engine>` in one process, so there is one SQLite writer
 and neither can see stale state.
@@ -38,11 +38,18 @@ exists but you will notice what is missing.
 | **Scope** | Named scopes, include/exclude rules where excludes always win, glob/regex/CIDR host matching, filtering across Proxy and Sitemap, bypass toggle |
 | **Editing** | A real vim grammar — counts, operators, text objects, visual mode, undo/redo, registers — plus `$EDITOR` handoff for anything it does not cover |
 | **Display** | HTTP syntax highlighting, syntect for bodies (JSON, HTML, XML, GraphQL, protobuf, JS-in-`<script>`, …), JSON/HTML pretty-printing, OSC 52 clipboard |
-| **MCP** | 33 tools: recon, intercept, scope, send, format, findings, notes. Resources for full bodies |
+| **MCP** | 51 tools: recon, intercept, scope, send, format, findings, notes, identities, policy, leads, materialise, report, scan. Resources for full bodies |
 | **Findings** | File a flow as a finding, triage severity and status by keystroke, retitle, delete. The write-up is edited in place with the same vim buffer the Repeater uses, `^g` to hand it to `$EDITOR` — one markdown document whose `## Reproduction` / `## Impact` / `## Remediation` sections are the prose columns a report is generated from. Saved on the way out. Also over MCP |
 | **Notes** | Project markdown documents in a window of their own (K), edited in place with the same vim buffer the Repeater uses, `^g` to hand one to `$EDITOR`. Saved on the way out — there is no `:w`. Full CRUD over MCP, so an agent's working notes and yours are the same list |
 | **WebSockets** | A window of their own (W), separate from the HTTP history, with the handshake and a live frame transcript per connection. Correlated to the upgrade, also over MCP. Observed, not intercepted |
 | **Compressed bodies** | gzip, deflate and brotli decoded for display and over MCP, re-encoded when an intercepted body is edited. Stored bytes are always what arrived |
+| **Identities** | Named session jars (adopted from a captured login, or built by hand) a replay can be sent *as* — `as_identity` on both send tools. Cookie values never leave the engine |
+| **Policy** | Per-host send-rate ceiling and forbidden-URL rules, enforced in the engine's send path. Drawn over MCP; the floor under an agent's free hand |
+| **Send tags** | A send can carry what it was *for* (`lead:idor-3`); `list_flows` filters on it, so evidence groups by the question that produced it |
+| **Leads** | The ledger between recon and verification: propose, settle with a control, adjudicate. Each actor has its own write path, and a verdict without its control is refused in code |
+| **Materialise** | The capture written out as a deterministic JSONL index (`endpoints`, `write-endpoints`, sitemap, findings, leads) for an agent to `rg`/`jq` |
+| **Report** | The whole engagement — findings by severity with evidence, then the leads ledger — as one markdown document, on demand |
+| **Passive scanner** | Header-level rules (CORS wildcard+credentials, cookie flags, HSTS/CSP absence, version banners) filed as `workflow`-origin drafts, deduped per rule+host, at capture and on demand |
 
 ### Partial
 
@@ -143,12 +150,28 @@ with an agent — for Claude Code:
 claude mcp add --transport http lockgate http://127.0.0.1:3001/mcp
 ```
 
-and the agent gets the same 33 tools: survey flows, read full bodies as `flow://`
+and the agent gets the same 51 tools: survey flows, read full bodies as `flow://`
 resources, walk the sitemap and WebSocket frames, replay through scope, file
 findings, and keep notes alongside yours. A bundled skill at
 `.claude/skills/lockgate-recon` teaches the recon loop and the conventions that are judgement rather than mechanics — redact captured
 secrets by default, rate severity against the threat model, set scope before a
 replay.
+
+### 5. Watch it from your phone
+
+An autonomous run should not need you at the keyboard. Two channels:
+
+- **`/status`** on the MCP port (`http://127.0.0.1:3001/status`) — the
+  engagement at a glance, phone-shaped, refreshing every few seconds: the leads
+  ledger, findings by severity, the agent's tagged sends, and its notes (which
+  is where its reasoning lives — notes are the one document agent and operator
+  share). `/status/report` renders the full markdown report. Read-only, and
+  token-gated when you start with `--status-token <T>`. Loopback-bound by
+  default; expose it only over something that authenticates you (Tailscale, an
+  SSH tunnel), then add the token for defense in depth.
+- **`--ntfy <URL>`** pushes the headline events — a finding filed, a lead
+  settled — to any ntfy-compatible topic, so the phone buzzes when the run's
+  story moves rather than when you remember to look.
 
 ---
 
@@ -239,7 +262,7 @@ side is not trusted and a few hundred bytes can claim gigabytes.
 ## Development
 
 ```sh
-cargo test --workspace      # 435 tests
+cargo test --workspace      # 500+ tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```

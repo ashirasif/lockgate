@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use hudsucker::hyper::header::HOST;
 
 use crate::db::ProjectPaths;
 use crate::finding::{Finding, FindingEdit, NewFinding, WriteUp};
+use crate::identity::{self, Identity, IdentityEdit, NewIdentity};
 use crate::intercept::Intercept;
 use crate::model::{CapturedRequest, CapturedResponse, Flow, FlowId, FlowSummary, now_micros};
 use crate::note::{NewNote, Note};
@@ -40,6 +41,19 @@ pub struct Engine {
     /// client address and the server URI. The value is the flow the upgrade
     /// came from, plus a per-socket frame counter.
     sockets: Mutex<HashMap<SocketKey, OpenSocket>>,
+    /// When each host last accepted a send — the state behind the policy
+    /// rate ceiling. In-memory on purpose: a restart forgetting a throttle is
+    /// a shrug, not a correctness problem, and it must never touch the disk.
+    send_lasts: Mutex<HashMap<String, std::time::Instant>>,
+    /// (rule, host) pairs the passive scanner has already filed this run —
+    /// the first line of scanner dedup, so a hundred responses of the same
+    /// host cost one finding even before the database check runs.
+    scanned: Mutex<HashSet<(String, String)>>,
+    /// Where headline events go (phone push), when the operator asked for it.
+    /// `disabled()` by default so no caller ever branches on configuration.
+    /// A mutex because the engine lives in an `Arc` and notifications are
+    /// configured once, after construction, by whoever built it.
+    notifier: std::sync::Mutex<crate::notify::Notifier>,
 }
 
 /// Everything observable about engine state, collapsed to a value that can be
@@ -108,6 +122,22 @@ pub enum ResendError {
     /// puts fresh traffic on the wire — so it is gated on scope even though
     /// merely viewing the flow is not.
     OutOfScope,
+    /// The URL hits an out-of-bounds policy rule. Distinct from scope: scope
+    /// is what the operator is *testing*, policy is what they ruled off-limits
+    /// even in-scope.
+    Forbidden {
+        rule_id: i64,
+        pattern: String,
+        url: String,
+    },
+    /// The policy's per-host send ceiling is engaged. `retry_after_ms` is when
+    /// the next send to this host may go.
+    RateLimited {
+        host: String,
+        retry_after_ms: u64,
+    },
+    /// The replay asked to be sent as an identity that does not exist.
+    IdentityNotFound(i64),
     Http(reqwest::Error),
 }
 
@@ -144,6 +174,9 @@ impl Engine {
             },
             intercept: Intercept::default(),
             sockets: Mutex::new(HashMap::new()),
+            send_lasts: Mutex::new(HashMap::new()),
+            scanned: Mutex::new(HashSet::new()),
+            notifier: std::sync::Mutex::new(crate::notify::Notifier::disabled()),
         })
     }
 
@@ -168,6 +201,9 @@ impl Engine {
             },
             intercept: Intercept::default(),
             sockets: Mutex::new(HashMap::new()),
+            send_lasts: Mutex::new(HashMap::new()),
+            scanned: Mutex::new(HashSet::new()),
+            notifier: std::sync::Mutex::new(crate::notify::Notifier::disabled()),
         }))
     }
 
@@ -175,6 +211,12 @@ impl Engine {
     /// this; the proxy handlers hold traffic on it.
     pub fn intercept(&self) -> &Intercept {
         &self.intercept
+    }
+
+    /// Turn on phone push (see `notify::Notifier`). Called once at startup
+    /// when `--ntfy` is set; off by default.
+    pub fn set_notifier(&self, notifier: crate::notify::Notifier) {
+        *self.notifier.lock().unwrap() = notifier;
     }
 
     // --- capture verbs (called by the proxy handlers) ---
@@ -203,6 +245,7 @@ impl Engine {
             parent_id: None,
             started_at: now_micros(),
             request,
+            tag: None,
         });
     }
 
@@ -211,6 +254,19 @@ impl Engine {
         request: CapturedRequest,
         source: Source,
         parent_id: Option<FlowId>,
+    ) -> FlowId {
+        self.record_tagged(request, source, parent_id, None)
+    }
+
+    /// [`record_request_from`], with the send's purpose attached. The tag is
+    /// part of the same write as the row itself — a replay's label can never
+    /// lag its traffic.
+    fn record_tagged(
+        &self,
+        request: CapturedRequest,
+        source: Source,
+        parent_id: Option<FlowId>,
+        tag: Option<String>,
     ) -> FlowId {
         // Allocated before the row exists on disk: `handle_request` needs the id
         // synchronously to correlate the response that follows.
@@ -222,6 +278,7 @@ impl Engine {
             parent_id,
             started_at,
             request,
+            tag,
         });
         id
     }
@@ -574,14 +631,362 @@ impl Engine {
         self.read(|conn| read::get_flow(conn, &paths, id))
     }
 
+    // --- identities ---
+    //
+    // Same shape as the scope edits: user-initiated writes of a handful of rows
+    // that must be visible the moment the call returns, so they run against the
+    // read connection rather than the capture writer.
+
+    pub fn identities(&self) -> Vec<Identity> {
+        self.read(identity::list)
+    }
+
+    pub fn identity(&self, id: i64) -> Option<Identity> {
+        self.read(|conn| identity::get(conn, id))
+    }
+
+    /// Mint an identity. The name is unique — a duplicate is a caller error,
+    /// reported as such rather than silently suffixing. Synchronous: the caller
+    /// needs to know it landed (and its id) before carrying on.
+    pub fn create_identity(&self, new: &NewIdentity) -> Result<i64, identity::IdentityError> {
+        let conn = self.read_conn().lock().unwrap();
+        identity::insert(&conn, new, now_micros())
+    }
+
+    pub fn update_identity(
+        &self,
+        id: i64,
+        edit: &IdentityEdit,
+    ) -> Result<usize, identity::IdentityError> {
+        let conn = self.read_conn().lock().unwrap();
+        identity::update(&conn, id, edit, now_micros())
+    }
+
+    pub fn delete_identity(&self, id: i64) -> usize {
+        self.with_db(|conn| identity::delete(conn, id))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    /// Mint an identity from a captured flow's session (see
+    /// `identity::adopt`) — the "log in once by hand, then adopt" path.
+    pub fn adopt_identity_from_flow(
+        &self,
+        flow_id: FlowId,
+        name: &str,
+    ) -> Result<i64, identity::AdoptError> {
+        let conn = self.read_conn().lock().unwrap();
+        identity::adopt(&conn, flow_id, name, now_micros())
+    }
+
+    // --- policy ---
+    //
+    // The engagement's guardrails. Reads happen per send inside `send_request`;
+    // these verbs are the operator's (and the MCP's) way of drawing them.
+    // Writes are synchronous like scope: the next send must see them.
+
+    pub fn policy(&self) -> crate::policy::Policy {
+        self.with_db(crate::policy::get)
+            .and_then(|p| p.ok())
+            .unwrap_or(crate::policy::Policy {
+                rate_per_sec: None,
+                note: None,
+            })
+    }
+
+    /// Set the per-host send ceiling. `None` lifts it. Returns rows changed.
+    pub fn set_rate_limit(&self, rate_per_sec: Option<f64>) -> usize {
+        self.with_db(|conn| crate::policy::set_rate(conn, rate_per_sec))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    pub fn set_policy_note(&self, note: Option<&str>) -> usize {
+        self.with_db(|conn| crate::policy::set_note(conn, note))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    pub fn policy_rules(&self) -> Vec<crate::policy::PolicyRule> {
+        self.with_db(crate::policy::rules)
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    }
+
+    pub fn add_policy_rule(
+        &self,
+        kind: &str,
+        pattern: &str,
+        note: Option<&str>,
+    ) -> Result<i64, crate::policy::PolicyError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::policy::add_rule(&conn, kind, pattern, note)
+    }
+
+    pub fn delete_policy_rule(&self, id: i64) -> usize {
+        self.with_db(|conn| crate::policy::delete_rule(conn, id))
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
+    /// The rate half of policy, held in `send_lasts`: one reserved slot per
+    /// host, min-interval `1/rate`. Errors with `retry_after_ms` rather than
+    /// sleeping — a send that must block the TUI or an MCP call for seconds is
+    /// a hang wearing a costume; the caller paces itself instead. Reserving
+    /// happens only after scope and the forbidden list have passed, so a
+    /// refusal never consumes budget.
+    fn enforce_rate_limit(
+        &self,
+        policy: Option<&crate::policy::Policy>,
+        req: &CapturedRequest,
+    ) -> Result<(), ResendError> {
+        let Some(rate) = policy.and_then(|p| p.rate_per_sec).filter(|r| *r > 0.0) else {
+            return Ok(());
+        };
+        let (host, _, _) = request_target(req);
+        let min_interval = std::time::Duration::from_secs_f64(1.0 / rate);
+
+        let mut lasts = self.send_lasts.lock().unwrap();
+        let now = std::time::Instant::now();
+        if let Some(last) = lasts.get(&host) {
+            let elapsed = now.duration_since(*last);
+            if let Some(wait) = min_interval.checked_sub(elapsed) {
+                return Err(ResendError::RateLimited {
+                    host,
+                    retry_after_ms: wait.as_millis() as u64,
+                });
+            }
+        }
+        // The slot is reserved even if the HTTP round trip later fails: the
+        // wire was touched, and pacing exists to pace the wire.
+        lasts.insert(host, now);
+        Ok(())
+    }
+
+    // --- leads: the ledger between the thinking agents and the probing ones ---
+
+    /// Recon proposes. Returns the new lead id.
+    pub fn create_lead(&self, lead: &crate::lead::NewLead) -> Result<i64, crate::lead::LeadError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::lead::propose(&conn, lead, now_micros())
+    }
+
+    /// The ledger, newest first, optionally narrowed to one status.
+    pub fn leads(&self, status: Option<&str>) -> Vec<crate::lead::Lead> {
+        self.read(|conn| crate::lead::list(conn, status))
+    }
+
+    pub fn lead(&self, id: i64) -> Option<crate::lead::Lead> {
+        self.read(|conn| crate::lead::get(conn, id))
+    }
+
+    /// The verifier's word (see `lead::record_verdict`).
+    pub fn record_lead_verdict(
+        &self,
+        id: i64,
+        status: &str,
+        verdict: Option<&str>,
+        control: Option<&str>,
+    ) -> Result<usize, crate::lead::LeadError> {
+        let rows = {
+            let conn = self.read_conn().lock().unwrap();
+            crate::lead::record_verdict(&conn, id, status, verdict, control, now_micros())?
+        };
+        // Only the settlements buzz: proposed→verifying is process, not news.
+        if rows > 0
+            && matches!(status, "verified" | "refuted" | "reported")
+            && let Some(lead) = self.lead(id)
+        {
+            self.notifier
+                .lock()
+                .unwrap()
+                .notify(crate::notify::Event::LeadSettled {
+                    lead_id: id,
+                    title: lead.title,
+                    status: status.to_string(),
+                });
+        }
+        Ok(rows)
+    }
+
+    /// The adjudicator's word — the only path that writes a ruling (see
+    /// `lead::adjudicate`).
+    pub fn adjudicate_lead(
+        &self,
+        id: i64,
+        ruling: &str,
+        reason: &str,
+    ) -> Result<usize, crate::lead::LeadError> {
+        let conn = self.read_conn().lock().unwrap();
+        crate::lead::adjudicate(&conn, id, ruling, reason, now_micros())
+    }
+
+    // --- materialise: the capture as a greppable directory ---
+
+    /// Write the engagement index to `dir` (see `materialise`).
+    pub fn materialise(
+        &self,
+        dir: &Path,
+    ) -> Result<crate::materialise::Materialised, crate::materialise::MaterialiseError> {
+        let conn = self.read_conn().lock().unwrap();
+        let paths = self.paths().clone();
+        crate::materialise::materialise(&conn, &paths, dir)
+    }
+
+    // --- report: findings and leads, assembled ---
+
+    /// The whole engagement as one markdown document.
+    pub fn generate_report(&self) -> Option<String> {
+        self.with_db(|conn| crate::report::generate(conn).ok())
+            .flatten()
+    }
+
+    // --- passive scanner ---
+
+    /// Scan one exchange and file what the rules find, deduped per (rule,
+    /// host). Called from the proxy handler with the bytes already in hand —
+    /// never a re-read, which would race the background writer.
+    ///
+    /// Fails into silence, like every capture-path extra: a scanner problem
+    /// must never cost a captured byte, and a duplicate finding is a triage
+    /// annoyance rather than a correctness break.
+    pub async fn scan_and_file(
+        &self,
+        flow_id: FlowId,
+        scheme: &str,
+        host: &str,
+        res: &CapturedResponse,
+    ) {
+        let mime: Option<String> = res
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(';').next().unwrap_or(v).trim().to_string());
+        for hit in crate::scanner::scan(scheme, &mime, &res.headers) {
+            self.file_scan_hit(flow_id, hit, host).await;
+        }
+    }
+
+    /// One rule hit, through the dedup gates: this run's in-memory set first,
+    /// then the database (so a restart does not re-file old news), then the
+    /// write. Marked seen either way once attempted — a refused write must
+    /// not become a retry storm on the capture path.
+    async fn file_scan_hit(&self, flow_id: FlowId, hit: crate::scanner::ScanHit, host: &str) {
+        if !self
+            .scanned
+            .lock()
+            .unwrap()
+            .insert((hit.rule.to_string(), host.to_string()))
+        {
+            return;
+        }
+        let known = self.with_db(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM finding WHERE title = ?1 AND host IS ?2",
+                rusqlite::params![hit.title, host],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|o| o.is_some())
+            .unwrap_or(true)
+        });
+        let known = known.unwrap_or(true);
+        if known {
+            return;
+        }
+        let finding = crate::finding::NewFinding {
+            title: hit.title.clone(),
+            severity: hit.severity.to_string(),
+            status: "draft".to_string(),
+            cvss_vector: None,
+            cvss_score: None,
+            cvss_version: None,
+            cwe: hit.cwe.map(str::to_string),
+            description_md: hit.description_md.clone(),
+            repro_md: Some(format!(
+                "Observed on flow #{flow_id}. The full exchange is in the history; \
+                 the header line is the evidence."
+            )),
+            impact_md: None,
+            remediation_md: None,
+            host: Some(host.to_string()),
+            path: None,
+            evidence: vec![(flow_id as i64, Some("trigger".into()))],
+            origin: "workflow".to_string(),
+        };
+        // Through the one writer; a dropped reply is a lost draft finding,
+        // which is the correct way for this to fail.
+        let _ = self.create_finding(finding).await;
+    }
+
+    /// Scan the most recent `limit` flows on demand and file what is new.
+    pub async fn scan_recent(&self, limit: usize) -> crate::scanner::ScanOutcome {
+        let summaries = self.list_flows();
+        let ids: Vec<FlowId> = summaries.iter().take(limit).map(|s| s.id).collect();
+        let before = self.list_findings().len();
+        let mut scanned = 0usize;
+        for id in ids {
+            let Some(flow) = self.get_flow(id) else {
+                continue;
+            };
+            let Some(res) = flow.response else {
+                continue;
+            };
+            let host = flow
+                .request
+                .uri
+                .host()
+                .map(str::to_string)
+                .or_else(|| {
+                    flow.request
+                        .headers
+                        .get(HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let scheme = flow.request.uri.scheme_str().unwrap_or("https").to_string();
+            let mime: Option<String> = res
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(';').next().unwrap_or(v).trim().to_string());
+            scanned += 1;
+            for hit in crate::scanner::scan(&scheme, &mime, &res.headers) {
+                self.file_scan_hit(id, hit, &host).await;
+            }
+        }
+        crate::scanner::ScanOutcome {
+            scanned,
+            filed: self.list_findings().len() - before,
+        }
+    }
+
     /// Replay a captured request straight at the target (not back through us),
     /// Burp-Repeater style, and return the fresh response.
     ///
     /// The replay is itself recorded as a new flow carrying `parent_id = id`,
     /// so a send and its origin stay linked instead of the result vanishing.
     pub async fn resend(&self, id: FlowId) -> Result<Resent, ResendError> {
+        self.resend_as(id, None, None).await
+    }
+
+    /// [`Engine::resend`], optionally sent *as* an identity: the identity's
+    /// cookie jar replaces the request's, so the replay is what that session
+    /// would have sent. This is the access-control primitive — replay the same
+    /// request under two identities and diff what answers.
+    ///
+    /// `tag` labels the replay with what it was *for* (`lead:idor-3`), so
+    /// evidence can be filtered by the question that produced it.
+    pub async fn resend_as(
+        &self,
+        id: FlowId,
+        as_identity: Option<i64>,
+        tag: Option<String>,
+    ) -> Result<Resent, ResendError> {
         let flow = self.get_flow(id).ok_or(ResendError::NotFound(id))?;
-        self.send_request(flow.request, Some(id)).await
+        self.send_request(flow.request, Some(id), as_identity, tag)
+            .await
     }
 
     /// Send an arbitrary request — typically one the operator edited in the
@@ -589,11 +994,19 @@ impl Engine {
     ///
     /// `origin` links the send back to the flow it was derived from, so an
     /// edited replay still shows its lineage. `None` for a request composed from
-    /// scratch.
+    /// scratch. `as_identity` sends with that identity's cookie jar replacing
+    /// the request's (see [`Engine::resend_as`]); `tag` labels the flow with
+    /// its purpose.
+    ///
+    /// Every send passes the same gates, in order: scope, policy (forbidden
+    /// URLs then the rate ceiling), identity. A refusal happens before anything
+    /// is recorded — history only ever shows traffic that actually left.
     pub async fn send_request(
         &self,
-        req: CapturedRequest,
+        mut req: CapturedRequest,
         origin: Option<FlowId>,
+        as_identity: Option<i64>,
+        tag: Option<String>,
     ) -> Result<Resent, ResendError> {
         let url = target_url(&req).ok_or(ResendError::NoTarget)?;
 
@@ -612,7 +1025,52 @@ impl Engine {
             }
         }
 
-        let replay_id = self.record_request_from(req.clone(), Source::Repeater, origin);
+        // Policy is the floor under every caller: TUI, MCP, agent verifier
+        // alike. Checked before identity, so a forbidden URL never spends a
+        // rate slot. Rules and ceiling are a handful of rows — cheap against
+        // the cost of the send itself. A read failure degrades to permissive,
+        // matching how every other engine read degrades: the engine still
+        // works, it just does not throttle.
+        let policy = self.with_db(|conn| crate::policy::get(conn).ok()).flatten();
+        let rules = self
+            .with_db(|conn| crate::policy::rules(conn).ok())
+            .flatten();
+        if let Some(rule) = rules
+            .as_deref()
+            .and_then(|r| crate::policy::violation(r, &url))
+        {
+            return Err(ResendError::Forbidden {
+                rule_id: rule.id,
+                pattern: rule.pattern,
+                url,
+            });
+        }
+        self.enforce_rate_limit(policy.as_ref(), &req)?;
+
+        // Applied before the replay is recorded, so history shows the request
+        // exactly as it went on the wire — the evidence must carry the identity.
+        if let Some(identity_id) = as_identity {
+            let identity = self
+                .identity(identity_id)
+                .ok_or(ResendError::IdentityNotFound(identity_id))?;
+            let path = req
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let host = match req.uri.host() {
+                Some(h) => h.to_string(),
+                None => req
+                    .headers
+                    .get(HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            identity::apply(&mut req.headers, &identity.cookies, &host, &path);
+        }
+
+        let replay_id = self.record_tagged(req.clone(), Source::Repeater, origin, tag);
 
         let resp = self
             .http
@@ -724,10 +1182,21 @@ impl Engine {
     pub async fn create_finding(&self, finding: NewFinding) -> Result<i64, WriteError> {
         let (reply, rx) = oneshot::channel();
         self.write(WriteEvent::CreateFinding {
-            finding: Box::new(finding),
+            finding: Box::new(finding.clone()),
             reply,
         });
-        rx.await.map_err(|_| WriteError::Dropped)
+        let id = rx.await.map_err(|_| WriteError::Dropped)?;
+        if finding.status != "false_positive" {
+            self.notifier
+                .lock()
+                .unwrap()
+                .notify(crate::notify::Event::Finding {
+                    severity: finding.severity.clone(),
+                    title: finding.title.clone(),
+                    host: finding.host.clone(),
+                });
+        }
+        Ok(id)
     }
 
     /// Start a note, returning its new id once the row is durably committed.

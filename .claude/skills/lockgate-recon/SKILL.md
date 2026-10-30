@@ -73,6 +73,26 @@ host isn't in scope, the replay is refused (a guardrail against hitting out-of-s
 hosts). Set it up first — `create_scope`, `add_scope_rule` for the in-scope host(s),
 `set_active_scope` — then replay. `check_scope` tells you whether a host would pass.
 
+**Check policy and pace yourself.** `get_policy` shows the per-host send ceiling
+and the forbidden-URL rules; both are enforced by the engine on every send. If a
+send comes back `rate limit`, wait the stated `retry_after_ms` rather than
+hammering — the ceiling is the program's, not a bug. A `policy forbids` refusal is
+the operator's out-of-bounds list: do not route around it.
+
+**Work leads, not vibes.** File attack hypotheses with `create_lead` as you recon;
+settle each with `update_lead` — a `verified`/`refuted` verdict requires a
+**control** (the baseline-vs-exploit check that discriminates bug from behaviour)
+or the ledger refuses it. `adjudicate_lead` is a separate epistemics pass: read
+the verdict and control, rule `admissible`/`refuted`, and say why. The report
+(`generate_report`) and the write-ups hang off this ledger, so file as you go.
+
+**Let the machine write the index.** `materialise <dir>` writes a deterministic
+JSONL index of the capture (endpoints, mutating subset, sitemap, findings, leads)
+— grep it instead of paging `list_flows`, and fetch full bodies via `flow://`
+resources. `scan_flows` runs the passive header rules and files drafts
+(`origin: workflow`); triage them, don't trust them — the scanner observes, it
+never verifies.
+
 ## Filing a finding
 
 `create_finding` requires `title`, `severity`, `description_md`. Strongly prefer to

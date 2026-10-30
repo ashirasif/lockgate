@@ -207,6 +207,7 @@ impl App {
             host: flow.request.uri.host().map(str::to_string),
             path: Some(flow.request.uri.path().to_string()),
             evidence: vec![(flow.id as i64, Some("observed".to_string()))],
+            origin: "manual".to_string(),
         };
 
         let engine = self.engine.clone();
@@ -646,7 +647,7 @@ impl App {
             // Timed here rather than in the engine: this is a property of this
             // send, not of the flow it records.
             let started = std::time::Instant::now();
-            let outcome = engine.send_request(request, origin).await;
+            let outcome = engine.send_request(request, origin, None, None).await;
             let millis = started.elapsed().as_millis();
 
             let (result, message) = match outcome {
@@ -986,7 +987,9 @@ impl App {
         // ask for that.
         self.flows_stale = true;
         self.refresh();
-        self.note(&format!("{n} hidden — :unhide restores; nothing was deleted"));
+        self.note(&format!(
+            "{n} hidden — :unhide restores; nothing was deleted"
+        ));
     }
 
     /// `:unhide` — bring back everything hidden this session.

@@ -26,6 +26,15 @@ OPTIONS:
         --project <NAME>     Open this project directly, skipping the picker
         --data-dir <PATH>    Where projects live (default ~/.lockgate)
         --export-ca <PATH>   Write the CA certificate here and exit
+        --cdp-chrome         Ensure a CDP Chrome (persistent profile, port
+                             --cdp-port) is running at startup, so an agent's
+                             browser client can attach without a launch script
+        --cdp-port <PORT>    Port for CDP Chrome (default 9222)
+        --ntfy <URL>         Push headline events (findings, settled leads) to
+                             an ntfy-compatible topic, e.g.
+                             https://ntfy.sh/my-secret-topic
+        --status-token <T>   Require ?token=<T> on the /status dashboard —
+                             set it before exposing the port beyond loopback
         --no-tui             Run without the terminal UI (proxy + MCP only;
                              needs --project, since the picker needs a terminal)
         --no-mcp             Run without the MCP server (TUI + proxy only)
@@ -51,6 +60,14 @@ pub struct Args {
     /// touch the filesystem, which is what makes it testable.
     pub data_dir: Option<PathBuf>,
     pub export_ca: Option<PathBuf>,
+    /// Ensure a CDP Chrome is up before anything else starts — the agent's
+    /// identity-bearing browser, attachable at `--cdp-port`.
+    pub cdp_chrome: bool,
+    pub cdp_port: u16,
+    /// ntfy-compatible topic URL for push notifications, when asked for.
+    pub ntfy: Option<String>,
+    /// Required `?token=` on the /status dashboard, when asked for.
+    pub status_token: Option<String>,
     /// Run the proxy and MCP server without taking over the terminal — the
     /// headless shape a server or container wants, where an agent drives
     /// everything through the MCP.
@@ -69,6 +86,10 @@ impl Default for Args {
             project: None,
             data_dir: None,
             export_ca: None,
+            cdp_chrome: false,
+            cdp_port: lockgate_core::browser::CdpConfig::default().port,
+            ntfy: None,
+            status_token: None,
             no_tui: false,
             no_mcp: false,
         }
@@ -148,6 +169,23 @@ where
                 Ok(path) => args.export_ca = Some(PathBuf::from(path)),
                 Err(e) => return Parsed::Error(e),
             },
+            "--cdp-chrome" => args.cdp_chrome = true,
+            "--cdp-port" => match value().and_then(parse_port) {
+                Ok(port) => args.cdp_port = port,
+                Err(e) => return Parsed::Error(e),
+            },
+            "--ntfy" => match value() {
+                Ok(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                    args.ntfy = Some(url)
+                }
+                Ok(_) => return Parsed::Error("--ntfy needs an http(s) topic URL".into()),
+                Err(e) => return Parsed::Error(e),
+            },
+            "--status-token" => match value() {
+                Ok(t) if !t.trim().is_empty() => args.status_token = Some(t),
+                Ok(_) => return Parsed::Error("--status-token needs a value".into()),
+                Err(e) => return Parsed::Error(e),
+            },
             "--no-tui" => args.no_tui = true,
             "--no-mcp" => args.no_mcp = true,
             other => {
@@ -207,6 +245,24 @@ mod tests {
         assert_eq!(args.port, 8080);
         assert_eq!(args.mcp_port, 8081);
         assert_eq!(args.project.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn ntfy_and_status_token_parse() {
+        let args = run(&[
+            "--ntfy",
+            "https://ntfy.sh/my-topic",
+            "--status-token",
+            "sekrit",
+        ]);
+        assert_eq!(args.ntfy.as_deref(), Some("https://ntfy.sh/my-topic"));
+        assert_eq!(args.status_token.as_deref(), Some("sekrit"));
+
+        // A non-http topic is a typo, not a silently dead push.
+        let e = error(&["--ntfy", "my-topic"]);
+        assert!(e.contains("http"), "{e}");
+        let e = error(&["--status-token", ""]);
+        assert!(!e.is_empty());
     }
 
     /// People type both forms without thinking about it.

@@ -126,6 +126,28 @@ fn switching_protocols() -> CapturedResponse {
 pub struct ProxyHandler {
     engine: Arc<Engine>,
     pending: VecDeque<FlowId>,
+    /// Per-connection FIFO, paired with `pending`: the host and scheme the
+    /// response's request went to, remembered here because the passive
+    /// scanner needs them and `handle_response` sees only the response.
+    pending_meta: VecDeque<(String, String)>,
+}
+
+/// The host and scheme a request is headed for, from the (possibly edited)
+/// request the proxy actually forwarded.
+fn meta_of(req: &CapturedRequest) -> (String, String) {
+    let host = req
+        .uri
+        .host()
+        .map(str::to_string)
+        .or_else(|| {
+            req.headers
+                .get(hudsucker::hyper::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let scheme = req.uri.scheme_str().unwrap_or("https").to_string();
+    (host, scheme)
 }
 
 impl ProxyHandler {
@@ -133,6 +155,7 @@ impl ProxyHandler {
         Self {
             engine,
             pending: VecDeque::new(),
+            pending_meta: VecDeque::new(),
         }
     }
 }
@@ -227,7 +250,9 @@ impl HttpHandler for ProxyHandler {
         };
 
         self.engine.record_request_as(id, req.clone());
+        let meta = meta_of(&req);
         self.pending.push_back(id);
+        self.pending_meta.push_back(meta);
 
         // Rebuild from the (possibly edited) request so edits reach the target.
         let mut out = Request::builder()
@@ -276,11 +301,20 @@ impl HttpHandler for ProxyHandler {
             },
             Verdict::Drop => {
                 self.engine.record_response(id, captured);
+                self.pending_meta.pop_front();
                 return dropped_response();
             }
         };
 
         self.engine.record_response(id, res.clone());
+
+        // The scanner runs against bytes already in hand and files through
+        // the writer; awaited here so clones of this handler never share a
+        // half-updated dedup set. Header checks only — nothing that could
+        // measure in the response's latency budget.
+        if let Some((host, scheme)) = self.pending_meta.pop_front() {
+            self.engine.scan_and_file(id, &scheme, &host, &res).await;
+        }
 
         let mut out = Response::builder().status(res.status).version(res.version);
         if let Some(headers) = out.headers_mut() {
